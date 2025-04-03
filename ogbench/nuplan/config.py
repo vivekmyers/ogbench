@@ -1,8 +1,9 @@
-from typing import Dict, Any
+from typing import Any, Dict
+
 
 def get_nuplan_config() -> Dict[str, Any]:
     """Get default configuration for the nuplan environment.
-    
+
     Returns:
         Dictionary containing configuration parameters
     """
@@ -12,23 +13,19 @@ def get_nuplan_config() -> Dict[str, Any]:
         'frame_stack': 1,
         'action_repeat': 1,
         'seed': 0,
-        
         # Dataset parameters
         'batch_size': 256,
         'num_trajectories': 1000,
         'max_trajectory_length': 1000,
-        
         # Training parameters
         'train_steps': 1000000,
         'log_interval': 1000,
         'eval_interval': 10000,
         'save_interval': 100000,
-        
         # Evaluation parameters
         'eval_tasks': None,  # None means evaluate all tasks
         'eval_episodes': 50,
         'video_episodes': 1,
-        
         # CRL-specific parameters
         'agent_name': 'crl',
         'learning_rate': 3e-4,
@@ -64,4 +61,4 @@ def get_nuplan_config() -> Dict[str, Any]:
         'bc_use_finetune': False,
         'bc_use_ensemble': False,
         'bc_use_bootstrap': False,
-    } 
+    }
