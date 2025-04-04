@@ -1,9 +1,9 @@
 from gymnasium.envs.registration import register
 
-from env import NuplanEnv
-from config import get_nuplan_config
-from dataset import NuplanDataset
-from loader import NuplanLoader
+from .env import NuplanEnv
+from .config import get_nuplan_config
+from .dataset import NuplanDataset
+from .loader import NuplanLoader
 
 # Register nuplan environment
 register(
