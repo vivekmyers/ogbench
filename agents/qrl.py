@@ -1,71 +1,87 @@
-import copy
 from typing import Any
 
 import flax
 import jax
 import jax.numpy as jnp
 import ml_collections
+import numpy as np
 import optax
-from utils.encoders import GCEncoder, encoder_modules
-from utils.flax_utils import ModuleDict, TrainState, nonpytree_field
-from utils.networks import GCActor, GCDiscreteActor, GCDiscreteCritic, GCValue
+from impls.utils.encoders import GCEncoder, encoder_modules
+from impls.utils.flax_utils import ModuleDict, TrainState, nonpytree_field
+from impls.utils.networks import MLP, GCActor, GCDiscreteActor, GCIQEValue, GCMRNValue, LogParam
 
 
-class GCIQLAgent(flax.struct.PyTreeNode):
-    """Goal-conditioned implicit Q-learning (GCIQL) agent.
+class QRLAgent(flax.struct.PyTreeNode):
+    """Quasimetric RL (QRL) agent.
 
-    This implementation supports both AWR (actor_loss='awr') and DDPG+BC (actor_loss='ddpgbc') for the actor loss.
+    This implementation supports the following variants:
+    (1) Value parameterizations: IQE (quasimetric_type='iqe') and MRN (quasimetric_type='mrn').
+    (2) Actor losses: AWR (actor_loss='awr') and latent dynamics-based DDPG+BC (actor_loss='ddpgbc').
+
+    QRL with AWR only fits a quasimetric value function and an actor network. QRL with DDPG+BC fits a quasimetric value
+    function, an actor network, and a latent dynamics model. The latent dynamics model is used to compute
+    reparameterized gradients for the actor loss. The original implementation of QRL uses IQE and DDPG+BC.
     """
 
     rng: Any
     network: Any
     config: Any = nonpytree_field()
 
-    @staticmethod
-    def expectile_loss(adv, diff, expectile):
-        """Compute the expectile loss."""
-        weight = jnp.where(adv >= 0, expectile, (1 - expectile))
-        return weight * (diff**2)
-
     def value_loss(self, batch, grad_params):
-        """Compute the IQL value loss."""
-        q1, q2 = self.network.select('target_critic')(batch['observations'], batch['value_goals'], batch['actions'])
-        q = jnp.minimum(q1, q2)
-        v = self.network.select('value')(batch['observations'], batch['value_goals'], params=grad_params)
-        value_loss = self.expectile_loss(q - v, q - v, self.config['expectile']).mean()
+        """Compute the QRL value loss."""
+        d_neg = self.network.select('value')(batch['observations'], batch['value_goals'], params=grad_params)
+        d_pos = self.network.select('value')(batch['observations'], batch['next_observations'], params=grad_params)
+        lam = self.network.select('lam')(params=grad_params)
 
-        return value_loss, {
+        # Apply loss shaping following the original implementation.
+        d_neg_loss = (100 * jax.nn.softplus(5 - d_neg / 100)).mean()
+        d_pos_loss = (jax.nn.relu(d_pos - 1) ** 2).mean()
+
+        value_loss = d_neg_loss + d_pos_loss * jax.lax.stop_gradient(lam)
+        lam_loss = lam * (self.config['eps'] - jax.lax.stop_gradient(d_pos_loss))
+
+        total_loss = value_loss + lam_loss
+
+        return total_loss, {
+            'total_loss': total_loss,
             'value_loss': value_loss,
-            'v_mean': v.mean(),
-            'v_max': v.max(),
-            'v_min': v.min(),
+            'lam_loss': lam_loss,
+            'd_neg_loss': d_neg_loss,
+            'd_neg_mean': d_neg.mean(),
+            'd_neg_max': d_neg.max(),
+            'd_neg_min': d_neg.min(),
+            'd_pos_loss': d_pos_loss,
+            'd_pos_mean': d_pos.mean(),
+            'd_pos_max': d_pos.max(),
+            'd_pos_min': d_pos.min(),
+            'lam': lam,
         }
 
-    def critic_loss(self, batch, grad_params):
-        """Compute the IQL critic loss."""
-        next_v = self.network.select('value')(batch['next_observations'], batch['value_goals'])
-        q = batch['rewards'] + self.config['discount'] * batch['masks'] * next_v
-
-        q1, q2 = self.network.select('critic')(
-            batch['observations'], batch['value_goals'], batch['actions'], params=grad_params
+    def dynamics_loss(self, batch, grad_params):
+        """Compute the dynamics loss."""
+        _, ob_reps, next_ob_reps = self.network.select('value')(
+            batch['observations'], batch['next_observations'], info=True, params=grad_params
         )
-        critic_loss = ((q1 - q) ** 2 + (q2 - q) ** 2).mean()
+        # Dynamics model predicts the delta of the next observation.
+        pred_next_ob_reps = ob_reps + self.network.select('dynamics')(
+            jnp.concatenate([ob_reps, batch['actions']], axis=-1), params=grad_params
+        )
 
-        return critic_loss, {
-            'critic_loss': critic_loss,
-            'q_mean': q.mean(),
-            'q_max': q.max(),
-            'q_min': q.min(),
+        dist1 = self.network.select('value')(next_ob_reps, pred_next_ob_reps, is_phi=True, params=grad_params)
+        dist2 = self.network.select('value')(pred_next_ob_reps, next_ob_reps, is_phi=True, params=grad_params)
+        dynamics_loss = (dist1 + dist2).mean() / 2
+
+        return dynamics_loss, {
+            'dynamics_loss': dynamics_loss,
         }
 
     def actor_loss(self, batch, grad_params, rng=None):
         """Compute the actor loss (AWR or DDPG+BC)."""
         if self.config['actor_loss'] == 'awr':
-            # AWR loss.
-            v = self.network.select('value')(batch['observations'], batch['actor_goals'])
-            q1, q2 = self.network.select('critic')(batch['observations'], batch['actor_goals'], batch['actions'])
-            q = jnp.minimum(q1, q2)
-            adv = q - v
+            # Compute AWR loss based on V(s', g) - V(s, g).
+            v = -self.network.select('value')(batch['observations'], batch['actor_goals'])
+            nv = -self.network.select('value')(batch['next_observations'], batch['actor_goals'])
+            adv = nv - v
 
             exp_a = jnp.exp(adv * self.config['alpha'])
             exp_a = jnp.minimum(exp_a, 100.0)
@@ -90,7 +106,7 @@ class GCIQLAgent(flax.struct.PyTreeNode):
 
             return actor_loss, actor_info
         elif self.config['actor_loss'] == 'ddpgbc':
-            # DDPG+BC loss.
+            # Compute DDPG+BC loss based on latent dynamics model.
             assert not self.config['discrete']
 
             dist = self.network.select('actor')(batch['observations'], batch['actor_goals'], params=grad_params)
@@ -98,8 +114,12 @@ class GCIQLAgent(flax.struct.PyTreeNode):
                 q_actions = jnp.clip(dist.mode(), -1, 1)
             else:
                 q_actions = jnp.clip(dist.sample(seed=rng), -1, 1)
-            q1, q2 = self.network.select('critic')(batch['observations'], batch['actor_goals'], q_actions)
-            q = jnp.minimum(q1, q2)
+
+            _, ob_reps, goal_reps = self.network.select('value')(batch['observations'], batch['actor_goals'], info=True)
+            pred_next_ob_reps = ob_reps + self.network.select('dynamics')(
+                jnp.concatenate([ob_reps, q_actions], axis=-1)
+            )
+            q = -self.network.select('value')(pred_next_ob_reps, goal_reps, is_phi=True)
 
             # Normalize Q values by the absolute mean to make the loss scale invariant.
             q_loss = -q.mean() / jax.lax.stop_gradient(jnp.abs(q).mean() + 1e-6)
@@ -132,26 +152,20 @@ class GCIQLAgent(flax.struct.PyTreeNode):
         for k, v in value_info.items():
             info[f'value/{k}'] = v
 
-        critic_loss, critic_info = self.critic_loss(batch, grad_params)
-        for k, v in critic_info.items():
-            info[f'critic/{k}'] = v
+        if self.config['actor_loss'] == 'ddpgbc':
+            dynamics_loss, dynamics_info = self.dynamics_loss(batch, grad_params)
+            for k, v in dynamics_info.items():
+                info[f'dynamics/{k}'] = v
+        else:
+            dynamics_loss = 0.0
 
         rng, actor_rng = jax.random.split(rng)
         actor_loss, actor_info = self.actor_loss(batch, grad_params, actor_rng)
         for k, v in actor_info.items():
             info[f'actor/{k}'] = v
 
-        loss = value_loss + critic_loss + actor_loss
+        loss = value_loss + dynamics_loss + actor_loss
         return loss, info
-
-    def target_update(self, network, module_name):
-        """Update the target network."""
-        new_target_params = jax.tree_util.tree_map(
-            lambda p, tp: p * self.config['tau'] + tp * (1 - self.config['tau']),
-            self.network.params[f'modules_{module_name}'],
-            self.network.params[f'modules_target_{module_name}'],
-        )
-        network.params[f'modules_target_{module_name}'] = new_target_params
 
     @jax.jit
     def update(self, batch):
@@ -162,7 +176,6 @@ class GCIQLAgent(flax.struct.PyTreeNode):
             return self.total_loss(batch, grad_params, rng=rng)
 
         new_network, info = self.network.apply_loss_fn(loss_fn=loss_fn)
-        self.target_update(new_network, 'critic')
 
         return self.replace(network=new_network, rng=new_rng), info
 
@@ -201,6 +214,7 @@ class GCIQLAgent(flax.struct.PyTreeNode):
         rng, init_rng = jax.random.split(rng, 2)
 
         ex_goals = ex_observations
+        ex_latents = np.zeros((ex_observations.shape[0], config['latent_dim']), dtype=np.float32)
         if config['discrete']:
             action_dim = ex_actions.max() + 1
         else:
@@ -210,32 +224,33 @@ class GCIQLAgent(flax.struct.PyTreeNode):
         encoders = dict()
         if config['encoder'] is not None:
             encoder_module = encoder_modules[config['encoder']]
-            encoders['value'] = GCEncoder(concat_encoder=encoder_module())
-            encoders['critic'] = GCEncoder(concat_encoder=encoder_module())
+            encoders['value'] = encoder_module()
             encoders['actor'] = GCEncoder(concat_encoder=encoder_module())
 
         # Define value and actor networks.
-        value_def = GCValue(
-            hidden_dims=config['value_hidden_dims'],
-            layer_norm=config['layer_norm'],
-            ensemble=False,
-            gc_encoder=encoders.get('value'),
-        )
-
-        if config['discrete']:
-            critic_def = GCDiscreteCritic(
+        if config['quasimetric_type'] == 'mrn':
+            value_def = GCMRNValue(
                 hidden_dims=config['value_hidden_dims'],
+                latent_dim=config['latent_dim'],
                 layer_norm=config['layer_norm'],
-                ensemble=True,
-                gc_encoder=encoders.get('critic'),
-                action_dim=action_dim,
+                encoder=encoders.get('value'),
+            )
+        elif config['quasimetric_type'] == 'iqe':
+            value_def = GCIQEValue(
+                hidden_dims=config['value_hidden_dims'],
+                latent_dim=config['latent_dim'],
+                dim_per_component=8,
+                layer_norm=config['layer_norm'],
+                encoder=encoders.get('value'),
             )
         else:
-            critic_def = GCValue(
-                hidden_dims=config['value_hidden_dims'],
+            raise ValueError(f'Unsupported quasimetric type: {config["quasimetric_type"]}')
+
+        if config['actor_loss'] == 'ddpgbc':
+            # DDPG+BC requires a latent dynamics model.
+            dynamics_def = MLP(
+                hidden_dims=(*config['value_hidden_dims'], config['latent_dim']),
                 layer_norm=config['layer_norm'],
-                ensemble=True,
-                gc_encoder=encoders.get('critic'),
             )
 
         if config['discrete']:
@@ -253,12 +268,18 @@ class GCIQLAgent(flax.struct.PyTreeNode):
                 gc_encoder=encoders.get('actor'),
             )
 
+        # Define the dual lambda variable.
+        lam_def = LogParam()
+
         network_info = dict(
             value=(value_def, (ex_observations, ex_goals)),
-            critic=(critic_def, (ex_observations, ex_goals, ex_actions)),
-            target_critic=(copy.deepcopy(critic_def), (ex_observations, ex_goals, ex_actions)),
             actor=(actor_def, (ex_observations, ex_goals)),
+            lam=(lam_def, ()),
         )
+        if config['actor_loss'] == 'ddpgbc':
+            network_info.update(
+                dynamics=(dynamics_def, np.concatenate([ex_latents, ex_actions], axis=-1)),
+            )
         networks = {k: v[0] for k, v in network_info.items()}
         network_args = {k: v[1] for k, v in network_info.items()}
 
@@ -267,9 +288,6 @@ class GCIQLAgent(flax.struct.PyTreeNode):
         network_params = network_def.init(init_rng, **network_args)['params']
         network = TrainState.create(network_def, network_params, tx=network_tx)
 
-        params = network_params
-        params['modules_target_critic'] = params['modules_critic']
-
         return cls(rng, network=network, config=flax.core.FrozenDict(**config))
 
 
@@ -277,31 +295,32 @@ def get_config():
     config = ml_collections.ConfigDict(
         dict(
             # Agent hyperparameters.
-            agent_name='gciql',  # Agent name.
+            agent_name='qrl',  # Agent name.
             lr=3e-4,  # Learning rate.
             batch_size=1024,  # Batch size.
             actor_hidden_dims=(512, 512, 512),  # Actor network hidden dimensions.
             value_hidden_dims=(512, 512, 512),  # Value network hidden dimensions.
+            quasimetric_type='iqe',  # Quasimetric parameterization type ('iqe' or 'mrn').
+            latent_dim=512,  # Latent dimension for the quasimetric value function.
             layer_norm=True,  # Whether to use layer normalization.
-            discount=0.99,  # Discount factor.
-            tau=0.005,  # Target network update rate.
-            expectile=0.9,  # IQL expectile.
+            discount=0.99,  # Discount factor (unused by default; can be used for geometric goal sampling in GCDataset).
+            eps=0.05,  # Margin for the dual lambda loss.
             actor_loss='ddpgbc',  # Actor loss type ('awr' or 'ddpgbc').
-            alpha=0.3,  # Temperature in AWR or BC coefficient in DDPG+BC.
+            alpha=0.003,  # Temperature in AWR or BC coefficient in DDPG+BC.
             const_std=True,  # Whether to use constant standard deviation for the actor.
             discrete=False,  # Whether the action space is discrete.
             encoder=ml_collections.config_dict.placeholder(str),  # Visual encoder name (None, 'impala_small', etc.).
             # Dataset hyperparameters.
             dataset_class='GCDataset',  # Dataset class name.
-            value_p_curgoal=0.2,  # Probability of using the current state as the value goal.
-            value_p_trajgoal=0.5,  # Probability of using a future state in the same trajectory as the value goal.
-            value_p_randomgoal=0.3,  # Probability of using a random state as the value goal.
+            value_p_curgoal=0.0,  # Probability of using the current state as the value goal.
+            value_p_trajgoal=0.0,  # Probability of using a future state in the same trajectory as the value goal.
+            value_p_randomgoal=1.0,  # Probability of using a random state as the value goal.
             value_geom_sample=True,  # Whether to use geometric sampling for future value goals.
             actor_p_curgoal=0.0,  # Probability of using the current state as the actor goal.
             actor_p_trajgoal=1.0,  # Probability of using a future state in the same trajectory as the actor goal.
             actor_p_randomgoal=0.0,  # Probability of using a random state as the actor goal.
             actor_geom_sample=False,  # Whether to use geometric sampling for future actor goals.
-            gc_negative=True,  # Whether to use '0 if s == g else -1' (True) or '1 if s == g else 0' (False) as reward.
+            gc_negative=False,  # Unused (defined for compatibility with GCDataset).
             p_aug=0.0,  # Probability of applying image augmentation.
             frame_stack=ml_collections.config_dict.placeholder(int),  # Number of frames to stack.
         )
