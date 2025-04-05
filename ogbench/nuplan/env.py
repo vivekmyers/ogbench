@@ -35,6 +35,10 @@ class NuPlanEnv(gymnasium.Env):
             dataset = NuPlanDataset(dataset_path)
             self.data = dataset.data
             
+            # Use current observations as goals to avoid dimension mismatch
+            self.data['value_goals'] = self.data['observations'].copy()
+            self.data['actor_goals'] = self.data['observations'].copy()
+            
             # Set up observation and action spaces based on data
             obs_shape = self.data['observations'].shape[1:]  # Remove batch dim
             action_shape = self.data['actions'].shape[1:]
