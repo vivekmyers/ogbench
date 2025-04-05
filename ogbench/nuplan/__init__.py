@@ -2,10 +2,10 @@
 
 import gymnasium
 from gymnasium.envs.registration import register
+from .env import NuPlanEnv
 
 # Import the environment class directly
 from .env import NuPlanEnv
-from .dataset import NuPlanDataset
 
 # Register the NuPlan environment
 try:
@@ -19,4 +19,4 @@ except gymnasium.error.Error:
     pass
 
 # Export the classes
-__all__ = ['NuPlanEnv', 'NuPlanDataset']
+__all__ = ['NuPlanEnv']
