@@ -40,7 +40,7 @@ class NuplanEnv(gym.Env):
         self._np_random = None
 
         # Set up observation and action spaces based on dataset inspection
-        single_obs_shape = (6,)  # Base observation shape
+        single_obs_shape = (12,)  # Updated to match network's expected input size
         if isinstance(self.frame_stack, (int, float)) and self.frame_stack > 1:
             self.observation_space = Box(
                 low=-np.inf, high=np.inf, shape=(single_obs_shape[0] * self.frame_stack,), dtype=np.float32
