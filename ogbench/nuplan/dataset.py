@@ -3,52 +3,38 @@ from typing import Any, Dict, Optional
 import numpy as np
 
 
-class NuplanDataset:
-    """Handler for nuplan dataset.
+class NuPlanDataset:
+    """Minimal NuPlan dataset handler that just adds goal fields."""
 
-    This class manages loading and accessing the nuplan dataset.
-    """
-
-    def __init__(
-        self,
-        data: Dict[str, np.ndarray],
-        config: Optional[Dict[str, Any]] = None,
-    ):
-        """Initialize the dataset.
+    def __init__(self, data_path):
+        """Load data and add required goal fields.
 
         Args:
-            data: Dictionary containing the dataset arrays
-            config: Configuration dictionary
+            data_path: Path to the .npz file containing the dataset
         """
+        # Load raw data
+        data = dict(np.load(data_path))
+        
+        # Add goal fields (using next_observations for both)
+        data['value_goals'] = data['next_observations'].copy()
+        data['actor_goals'] = data['next_observations'].copy()
+        
         self.data = data
-        self.config = config or {}
-
-        # Validate required keys
-        required_keys = ['observations', 'actions', 'terminals']
-        for key in required_keys:
-            if key not in self.data:
-                raise ValueError(f'Missing required key in dataset: {key}')
-
-        # Process data
-        self._process_data()
-
-        # Initialize episode boundaries
-        self._init_episode_boundaries()
 
     def _process_data(self) -> None:
-        """Process the dataset arrays."""
-        # Ensure arrays are float32
+        """Process the dataset arrays to provide exactly what main.py needs."""
+        # Convert everything to float32
         self.data['observations'] = self.data['observations'].astype(np.float32)
         self.data['actions'] = self.data['actions'].astype(np.float32)
 
-        # Add rewards if not present
+        # Add rewards if not present (using zeros)
         if 'rewards' not in self.data:
             self.data['rewards'] = np.zeros(len(self.data['observations']), dtype=np.float32)
 
-        # Compute next observations
+        # Compute next observations (roll the observations array)
         self.data['next_observations'] = np.roll(self.data['observations'], -1, axis=0)
 
-        # For CRL, we use next observations as both value and actor goals
+        # For CRL, use next observations as goals
         self.data['value_goals'] = self.data['next_observations'].copy()
         self.data['actor_goals'] = self.data['next_observations'].copy()
 
@@ -58,35 +44,10 @@ class NuplanDataset:
         self.data['value_goals'][terminal_mask] = 0.0
         self.data['actor_goals'][terminal_mask] = 0.0
 
-    def _init_episode_boundaries(self) -> None:
-        """Initialize episode boundaries."""
-        # Find indices where episodes start
-        self.episode_starts = np.where(self.data['terminals'])[0] + 1
-        self.episode_starts = np.concatenate([[0], self.episode_starts])
-
-        # Find indices where episodes end
-        self.episode_ends = np.where(self.data['terminals'])[0]
-
-        # Number of episodes
-        self.num_episodes = len(self.episode_starts)
-
     @classmethod
-    def load(
-        cls,
-        path: str,
-        config: Optional[Dict[str, Any]] = None,
-    ) -> 'NuplanDataset':
-        """Load dataset from file.
-
-        Args:
-            path: Path to the dataset file
-            config: Configuration dictionary
-
-        Returns:
-            NuplanDataset instance
-        """
-        data = np.load(path)
-        return cls(dict(data), config)
+    def load(cls, path: str, config: Optional[Dict[str, Any]] = None) -> 'NuPlanDataset':
+        """Load dataset from file."""
+        return cls(path)
 
     def save(self, path: str) -> None:
         """Save dataset to file.
@@ -96,17 +57,17 @@ class NuplanDataset:
         """
         np.savez(path, **self.data)
 
-    def get_subset(self, indices: np.ndarray) -> 'NuplanDataset':
+    def get_subset(self, indices: np.ndarray) -> 'NuPlanDataset':
         """Get a subset of the dataset.
 
         Args:
             indices: Indices to select
 
         Returns:
-            New NuplanDataset instance with selected data
+            New NuPlanDataset instance with selected data
         """
         subset_data = {k: v[indices] for k, v in self.data.items()}
-        return NuplanDataset(subset_data, self.config)
+        return NuPlanDataset(subset_data)
 
     def sample(self, batch_size: int) -> Dict[str, np.ndarray]:
         """Sample a batch of transitions.
