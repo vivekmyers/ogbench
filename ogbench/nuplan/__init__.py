@@ -2,7 +2,10 @@
 
 import gymnasium
 from gymnasium.envs.registration import register
-from .env import NuPlanEnv
+
+# Import the environment class directly
+from ogbench.nuplan.env import NuPlanEnv
+from ogbench.nuplan.dataset import NuPlanDataset
 
 # Register the NuPlan environment
 try:
@@ -15,4 +18,5 @@ except gymnasium.error.Error:
     # Environment already registered
     pass
 
-__all__ = ['NuPlanEnv']
+# Export the classes
+__all__ = ['NuPlanEnv', 'NuPlanDataset']

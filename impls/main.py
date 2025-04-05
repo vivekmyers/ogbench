@@ -19,8 +19,7 @@ from agents import agents
 
 # Import and register the NuPlan environment
 import gymnasium
-from ogbench.nuplan import NuPlanEnv
-from ogbench.nuplan.dataset import NuPlanDataset
+from ogbench.nuplan import NuPlanEnv, NuPlanDataset
 
 FLAGS = flags.FLAGS
 
