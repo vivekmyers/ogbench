@@ -2,7 +2,8 @@ from typing import Any, Dict, Optional, Tuple
 
 import gymnasium as gym
 import numpy as np
-from gymnasium.spaces import Box
+from gymnasium.spaces import Box, Discrete
+from PIL import Image
 
 from ogbench.nuplan.dataset import NuplanDataset
 
@@ -38,41 +39,12 @@ class NuplanEnv(gym.Env):
         self.frame_stack = self.config.get('frame_stack', 1)
         self._stacked_obs = None
         self._np_random = None
+        self.render_mode = render_mode
 
-        # Load dataset first to get dimensions
+        # Load dataset if path is provided
         self.dataset = None
         if dataset_path is not None:
             self.dataset = NuplanDataset.load(dataset_path, config)
-            # Get observation shape from actual data
-            single_obs_shape = self.dataset.data['observations'].shape[1:]
-            action_shape = self.dataset.data['actions'].shape[1:]
-        else:
-            # Default shapes if no dataset provided
-            single_obs_shape = (8,)
-            action_shape = (2,)
-
-        # Set up observation and action spaces based on actual data dimensions
-        if isinstance(self.frame_stack, (int, float)) and self.frame_stack > 1:
-            self.observation_space = Box(
-                low=-np.inf, high=np.inf, 
-                shape=(single_obs_shape[0] * self.frame_stack,), 
-                dtype=np.float32
-            )
-        else:
-            self.observation_space = Box(
-                low=-np.inf, high=np.inf, 
-                shape=single_obs_shape, 
-                dtype=np.float32
-            )
-
-        self.action_space = Box(
-            low=-1.0,
-            high=1.0,
-            shape=action_shape,
-            dtype=np.float32,
-        )
-
-        self.render_mode = render_mode
 
         # Initialize state
         self._current_observation = None

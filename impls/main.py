@@ -79,6 +79,8 @@ def create_nuplan_env_and_datasets(dataset_path, frame_stack=None, config=None):
         'rewards': data['rewards'],
         'next_observations': data['next_observations'],
         'terminals': data['terminals'],
+        'value_goals': data['value_goals'],
+        'actor_goals': data['actor_goals'],
     }
     
     val_dataset = train_dataset.copy()
@@ -190,8 +192,8 @@ def main(_):
                 'rewards': train_dataset['rewards'][indices],
                 'next_observations': train_dataset['next_observations'][indices],
                 'terminals': train_dataset['terminals'][indices],
-                'value_goals': train_dataset['next_observations'][indices],  # Use next states as goals for value function
-                'actor_goals': train_dataset['next_observations'][indices],  # Use next states as goals for actor
+                'value_goals': train_dataset['value_goals'][indices],
+                'actor_goals': train_dataset['actor_goals'][indices],
             }
         else:
             # Standard dataset sampling
@@ -214,8 +216,8 @@ def main(_):
                         'rewards': val_dataset['rewards'][val_indices],
                         'next_observations': val_dataset['next_observations'][val_indices],
                         'terminals': val_dataset['terminals'][val_indices],
-                        'value_goals': val_dataset['next_observations'][val_indices],  # Use next states as goals for value function
-                        'actor_goals': val_dataset['next_observations'][val_indices],  # Use next states as goals for actor
+                        'value_goals': val_dataset['value_goals'][val_indices],
+                        'actor_goals': val_dataset['actor_goals'][val_indices],
                     }
                 else:
                     # Standard validation dataset sampling

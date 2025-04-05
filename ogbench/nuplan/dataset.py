@@ -38,13 +38,8 @@ class NuplanDataset:
     def _process_data(self) -> None:
         """Process the dataset arrays."""
         # Ensure arrays are float32
-        observations = self.data['observations'].astype(np.float32)
-        print(f"Original observation shape: {observations.shape}")
-        
-        # Keep original dimensions, no padding needed
-        self.data['observations'] = observations
+        self.data['observations'] = self.data['observations'].astype(np.float32)
         self.data['actions'] = self.data['actions'].astype(np.float32)
-        print(f"Action shape: {self.data['actions'].shape}")
 
         # Add rewards if not present
         if 'rewards' not in self.data:
@@ -53,9 +48,15 @@ class NuplanDataset:
         # Compute next observations
         self.data['next_observations'] = np.roll(self.data['observations'], -1, axis=0)
 
+        # For CRL, we use next observations as both value and actor goals
+        self.data['value_goals'] = self.data['next_observations'].copy()
+        self.data['actor_goals'] = self.data['next_observations'].copy()
+
         # Handle terminal states
         terminal_mask = self.data['terminals'].astype(bool)
         self.data['next_observations'][terminal_mask] = 0.0
+        self.data['value_goals'][terminal_mask] = 0.0
+        self.data['actor_goals'][terminal_mask] = 0.0
 
     def _init_episode_boundaries(self) -> None:
         """Initialize episode boundaries."""
