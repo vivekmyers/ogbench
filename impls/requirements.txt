@@ -6,3 +6,6 @@ ml_collections
 matplotlib
 moviepy
 wandb
+opencv-python  # For video rendering
+gymnasium  # For environment interface
+numpy  # For numerical operations

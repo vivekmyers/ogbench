@@ -1,12 +1,11 @@
 from gymnasium.envs.registration import register
-from ogbench.nuplan.env import NuPlanEnv
-from ogbench.nuplan.process_data import process_nuplan_data
+from .env import NuPlanEnv
 
-# Register the environment
+# Register nuplan environment
 register(
     id='nuplan-v0',
     entry_point='ogbench.nuplan.env:NuPlanEnv',
-    max_episode_steps=100,
+    max_episode_steps=1000,
 )
 
-__all__ = ['NuPlanEnv', 'process_nuplan_data']
+__all__ = ['NuPlanEnv']

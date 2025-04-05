@@ -1,21 +1,19 @@
-from agents.crl import CRLAgent
-from agents.gcbc import GCBCAgent
-from agents.gciql import GCIQLAgent
-from agents.hiql import HIQLAgent
-from agents.ppo import PPOAgent
-from agents.qrl import QRLAgent
-from agents.sac import SACAgent
-from agents.cmd import CMDAgent
-from agents.tra import TRAAgent
+from .crl import CRLAgent
+from .gcbc import GCBCAgent
+from .gciql import GCIQLAgent
+from .hiql import HIQLAgent
+from .qrl import QRLAgent
+from .sac import SACAgent
+from .cmd import CMDAgent
+from .gcivl import GCIVLAgent
 
 agents = dict(
     crl=CRLAgent,
     gcbc=GCBCAgent,
     gciql=GCIQLAgent,
     hiql=HIQLAgent,
-    ppo=PPOAgent,
     qrl=QRLAgent,
     sac=SACAgent,
     cmd=CMDAgent,
-    tra=TRAAgent,
-)
+    gcivl=GCIVLAgent,
+) 
