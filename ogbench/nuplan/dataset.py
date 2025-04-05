@@ -38,8 +38,13 @@ class NuplanDataset:
     def _process_data(self) -> None:
         """Process the dataset arrays."""
         # Ensure arrays are float32
-        self.data['observations'] = self.data['observations'].astype(np.float32)
+        observations = self.data['observations'].astype(np.float32)
+        print(f"Original observation shape: {observations.shape}")
+        
+        # Keep original dimensions, no padding needed
+        self.data['observations'] = observations
         self.data['actions'] = self.data['actions'].astype(np.float32)
+        print(f"Action shape: {self.data['actions'].shape}")
 
         # Add rewards if not present
         if 'rewards' not in self.data:

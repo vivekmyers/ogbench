@@ -39,28 +39,40 @@ class NuplanEnv(gym.Env):
         self._stacked_obs = None
         self._np_random = None
 
-        # Set up observation and action spaces based on dataset inspection
-        single_obs_shape = (12,)  # Updated to match network's expected input size
+        # Load dataset first to get dimensions
+        self.dataset = None
+        if dataset_path is not None:
+            self.dataset = NuplanDataset.load(dataset_path, config)
+            # Get observation shape from actual data
+            single_obs_shape = self.dataset.data['observations'].shape[1:]
+            action_shape = self.dataset.data['actions'].shape[1:]
+        else:
+            # Default shapes if no dataset provided
+            single_obs_shape = (8,)
+            action_shape = (2,)
+
+        # Set up observation and action spaces based on actual data dimensions
         if isinstance(self.frame_stack, (int, float)) and self.frame_stack > 1:
             self.observation_space = Box(
-                low=-np.inf, high=np.inf, shape=(single_obs_shape[0] * self.frame_stack,), dtype=np.float32
+                low=-np.inf, high=np.inf, 
+                shape=(single_obs_shape[0] * self.frame_stack,), 
+                dtype=np.float32
             )
         else:
-            self.observation_space = Box(low=-np.inf, high=np.inf, shape=single_obs_shape, dtype=np.float32)
+            self.observation_space = Box(
+                low=-np.inf, high=np.inf, 
+                shape=single_obs_shape, 
+                dtype=np.float32
+            )
 
         self.action_space = Box(
             low=-1.0,
             high=1.0,
-            shape=(2,),  # Based on dataset inspection
+            shape=action_shape,
             dtype=np.float32,
         )
 
         self.render_mode = render_mode
-
-        # Load dataset if path is provided
-        self.dataset = None
-        if dataset_path is not None:
-            self.dataset = NuplanDataset.load(dataset_path, config)
 
         # Initialize state
         self._current_observation = None
