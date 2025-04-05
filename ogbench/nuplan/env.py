@@ -2,7 +2,6 @@ import gymnasium
 import numpy as np
 from gymnasium.spaces import Box, Discrete
 from PIL import Image
-from abc import ABC, abstractmethod
 
 
 class NuPlanEnv(gymnasium.Env):
