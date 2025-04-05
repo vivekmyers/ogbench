@@ -5,9 +5,9 @@ import jax
 import jax.numpy as jnp
 import ml_collections
 import optax
-from impls.utils.encoders import GCEncoder, encoder_modules
-from impls.utils.flax_utils import ModuleDict, TrainState, nonpytree_field
-from impls.utils.networks import GCActor, GCBilinearValue, GCDiscreteActor, GCDiscreteBilinearCritic
+from ogbench.impls.utils.encoders import GCEncoder, encoder_modules
+from ogbench.impls.utils.flax_utils import ModuleDict, TrainState, nonpytree_field
+from ogbench.impls.utils.networks import GCActor, GCBilinearValue, GCDiscreteActor, GCDiscreteBilinearCritic
 
 
 class CRLAgent(flax.struct.PyTreeNode):
