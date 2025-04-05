@@ -18,7 +18,7 @@ from utils.log_utils import CsvLogger, get_exp_name, get_flag_dict, get_wandb_vi
 from agents import agents
 
 # Import the NuPlan environment
-from ogbench.nuplan import NuplanEnv, NuplanLoader
+from ogbench.nuplan import NuplanEnv
 
 FLAGS = flags.FLAGS
 
