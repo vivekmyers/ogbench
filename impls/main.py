@@ -190,6 +190,8 @@ def main(_):
                 'rewards': train_dataset['rewards'][indices],
                 'next_observations': train_dataset['next_observations'][indices],
                 'terminals': train_dataset['terminals'][indices],
+                'value_goals': train_dataset['next_observations'][indices],  # Use next states as goals for value function
+                'actor_goals': train_dataset['next_observations'][indices],  # Use next states as goals for actor
             }
         else:
             # Standard dataset sampling
@@ -212,6 +214,8 @@ def main(_):
                         'rewards': val_dataset['rewards'][val_indices],
                         'next_observations': val_dataset['next_observations'][val_indices],
                         'terminals': val_dataset['terminals'][val_indices],
+                        'value_goals': val_dataset['next_observations'][val_indices],  # Use next states as goals for value function
+                        'actor_goals': val_dataset['next_observations'][val_indices],  # Use next states as goals for actor
                     }
                 else:
                     # Standard validation dataset sampling
