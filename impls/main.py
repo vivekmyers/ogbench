@@ -9,30 +9,22 @@ import numpy as np
 import tqdm
 import wandb
 from absl import app, flags
+from agents import agents
 from ml_collections import config_flags
 from utils.datasets import Dataset, GCDataset, HGCDataset
 from utils.env_utils import make_env_and_datasets
 from utils.evaluation import evaluate
 from utils.flax_utils import restore_agent, save_agent
 from utils.log_utils import CsvLogger, get_exp_name, get_flag_dict, get_wandb_video, setup_wandb
-from agents import agents
-
-# Import and register the NuPlan environment
-import gymnasium
-from ogbench.nuplan import NuPlanEnv, NuPlanDataset
 
 FLAGS = flags.FLAGS
 
 flags.DEFINE_string('run_group', 'Debug', 'Run group.')
 flags.DEFINE_integer('seed', 0, 'Random seed.')
-flags.DEFINE_string('env_name', 'nuplan-v0', 'Environment (dataset) name.')
+flags.DEFINE_string('env_name', 'antmaze-large-navigate-v0', 'Environment (dataset) name.')
 flags.DEFINE_string('save_dir', 'exp/', 'Save directory.')
 flags.DEFINE_string('restore_path', None, 'Restore path.')
 flags.DEFINE_integer('restore_epoch', None, 'Restore epoch.')
-
-# Add NuPlan-specific flags
-flags.DEFINE_string('dataset_path', None, 'Path to the NuPlan dataset.')
-flags.DEFINE_string('render_mode', 'rgb_array', 'Rendering mode for NuPlan environment.')
 
 flags.DEFINE_integer('train_steps', 1000000, 'Number of training steps.')
 flags.DEFINE_integer('log_interval', 5000, 'Logging interval.')
@@ -50,54 +42,6 @@ flags.DEFINE_integer('eval_on_cpu', 1, 'Whether to evaluate on CPU.')
 config_flags.DEFINE_config_file('agent', 'agents/gciql.py', lock_config=False)
 
 
-def create_nuplan_env_and_datasets(dataset_path, frame_stack=None, config=None):
-    """Create NuPlan environment and datasets.
-    
-    Args:
-        dataset_path: Path to the NuPlan dataset.
-        frame_stack: Number of frames to stack.
-        config: Configuration dictionary.
-        
-    Returns:
-        A tuple of the environment, training dataset, and validation dataset.
-    """
-    # Create the environment
-    env = NuPlanEnv(
-        dataset_path=dataset_path, 
-        render_mode=FLAGS.render_mode, 
-        config=config
-    )
-    
-    # Load the dataset
-    dataset = NuPlanDataset(dataset_path)
-    data = dataset.data
-    
-    # Create training and validation datasets
-    # For simplicity, we'll use the same data for both
-    # In a real scenario, you would split the data
-    train_dataset = {
-        'observations': data['observations'],
-        'actions': data['actions'],
-        'rewards': data['rewards'],
-        'next_observations': data['next_observations'],
-        'terminals': data['terminals'],
-        'value_goals': data['value_goals'],
-        'actor_goals': data['actor_goals'],
-    }
-    
-    val_dataset = train_dataset.copy()
-    
-    # Apply frame stacking if requested
-    if frame_stack is not None and frame_stack > 1:
-        from utils.env_utils import FrameStackWrapper
-        env = FrameStackWrapper(env, frame_stack)
-    
-    # Reset the environment
-    env.reset()
-    
-    return env, train_dataset, val_dataset
-
-
 def main(_):
     # Set up logger.
     exp_name = get_exp_name(FLAGS.seed)
@@ -105,61 +49,27 @@ def main(_):
 
     FLAGS.save_dir = os.path.join(FLAGS.save_dir, wandb.run.project, FLAGS.run_group, exp_name)
     os.makedirs(FLAGS.save_dir, exist_ok=True)
-    
-    # Get flag dict and filter out non-serializable values
     flag_dict = get_flag_dict()
-    # Remove the agent config which might contain non-serializable objects
-    if 'agent' in flag_dict:
-        del flag_dict['agent']
-    
     with open(os.path.join(FLAGS.save_dir, 'flags.json'), 'w') as f:
         json.dump(flag_dict, f)
 
     # Set up environment and dataset.
     config = FLAGS.agent
-    
-    # Special handling for NuPlan environment
-    if FLAGS.env_name == 'nuplan-v0':
-        # Check if dataset path is provided
-        if FLAGS.dataset_path is None:
-            # Use default path
-            data_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'data', 'nuplan')
-            dataset_path = os.path.join(data_dir, 'nuplan_dataset.npz')
-        else:
-            dataset_path = FLAGS.dataset_path
-        
-        # Create environment and datasets
-        print(f"Creating NuPlan environment and datasets from {dataset_path}...")
-        env, train_dataset, val_dataset = create_nuplan_env_and_datasets(
-            dataset_path, 
-            frame_stack=config['frame_stack'],
-            config=config
-        )
-    else:
-        # Standard environment creation
-        env, train_dataset, val_dataset = make_env_and_datasets(FLAGS.env_name, frame_stack=config['frame_stack'])
+    env, train_dataset, val_dataset = make_env_and_datasets(FLAGS.env_name, frame_stack=config['frame_stack'])
 
-        dataset_class = {
-            'GCDataset': GCDataset,
-            'HGCDataset': HGCDataset,
-        }[config['dataset_class']]
-        train_dataset = dataset_class(Dataset.create(**train_dataset), config)
-        if val_dataset is not None:
-            val_dataset = dataset_class(Dataset.create(**val_dataset), config)
+    dataset_class = {
+        'GCDataset': GCDataset,
+        'HGCDataset': HGCDataset,
+    }[config['dataset_class']]
+    train_dataset = dataset_class(Dataset.create(**train_dataset), config)
+    if val_dataset is not None:
+        val_dataset = dataset_class(Dataset.create(**val_dataset), config)
 
     # Initialize agent.
     random.seed(FLAGS.seed)
     np.random.seed(FLAGS.seed)
 
-    # Handle different dataset formats
-    if FLAGS.env_name == 'nuplan-v0':
-        example_batch = {
-            'observations': train_dataset['observations'][:1],
-            'actions': train_dataset['actions'][:1],
-        }
-    else:
-        example_batch = train_dataset.sample(1)
-        
+    example_batch = train_dataset.sample(1)
     if config['discrete']:
         # Fill with the maximum action to let the agent know the action space size.
         example_batch['actions'] = np.full_like(example_batch['actions'], env.action_space.n - 1)
@@ -183,48 +93,14 @@ def main(_):
     last_time = time.time()
     for i in tqdm.tqdm(range(1, FLAGS.train_steps + 1), smoothing=0.1, dynamic_ncols=True):
         # Update agent.
-        if FLAGS.env_name == 'nuplan-v0':
-            # Sample from NuPlan dataset
-            batch_size = min(config['batch_size'], len(train_dataset['observations']))
-            indices = np.random.randint(0, len(train_dataset['observations']), size=batch_size)
-            
-            batch = {
-                'observations': train_dataset['observations'][indices],
-                'actions': train_dataset['actions'][indices],
-                'rewards': train_dataset['rewards'][indices],
-                'next_observations': train_dataset['next_observations'][indices],
-                'terminals': train_dataset['terminals'][indices],
-                'value_goals': train_dataset['value_goals'][indices],
-                'actor_goals': train_dataset['actor_goals'][indices],
-            }
-        else:
-            # Standard dataset sampling
-            batch = train_dataset.sample(config['batch_size'])
-            
+        batch = train_dataset.sample(config['batch_size'])
         agent, update_info = agent.update(batch)
 
         # Log metrics.
         if i % FLAGS.log_interval == 0:
             train_metrics = {f'training/{k}': v for k, v in update_info.items()}
             if val_dataset is not None:
-                if FLAGS.env_name == 'nuplan-v0':
-                    # Sample from NuPlan validation dataset
-                    val_batch_size = min(config['batch_size'], len(val_dataset['observations']))
-                    val_indices = np.random.randint(0, len(val_dataset['observations']), size=val_batch_size)
-                    
-                    val_batch = {
-                        'observations': val_dataset['observations'][val_indices],
-                        'actions': val_dataset['actions'][val_indices],
-                        'rewards': val_dataset['rewards'][val_indices],
-                        'next_observations': val_dataset['next_observations'][val_indices],
-                        'terminals': val_dataset['terminals'][val_indices],
-                        'value_goals': val_dataset['value_goals'][val_indices],
-                        'actor_goals': val_dataset['actor_goals'][val_indices],
-                    }
-                else:
-                    # Standard validation dataset sampling
-                    val_batch = val_dataset.sample(config['batch_size'])
-                    
+                val_batch = val_dataset.sample(config['batch_size'])
                 _, val_info = agent.total_loss(val_batch, grad_params=None)
                 train_metrics.update({f'validation/{k}': v for k, v in val_info.items()})
             train_metrics['time/epoch_time'] = (time.time() - last_time) / FLAGS.log_interval

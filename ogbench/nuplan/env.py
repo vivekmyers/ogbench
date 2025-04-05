@@ -67,21 +67,6 @@ class NuPlanEnv(gymnasium.Env):
         self._episode_length = 0
         self._max_episode_steps = self.config.get('max_episode_steps', 100)
         
-    def _get_stacked_obs(self, obs):
-        """Stack observations if frame_stack is enabled.
-        
-        Args:
-            obs: Single observation to potentially stack
-            
-        Returns:
-            Original or stacked observation depending on config
-        """
-        frame_stack = self.config.get('frame_stack', None)
-        if frame_stack is not None and frame_stack > 1:
-            # Repeat the observation frame_stack times along last axis
-            return np.tile(obs, frame_stack)
-        return obs
-        
     def reset(self, seed=None, options=None):
         """Reset environment to start new episode.
         
