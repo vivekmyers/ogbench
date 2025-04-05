@@ -41,7 +41,7 @@ class NuplanEnv(gym.Env):
 
         # Set up observation and action spaces based on dataset inspection
         single_obs_shape = (6,)  # Base observation shape
-        if self.frame_stack > 1:
+        if isinstance(self.frame_stack, (int, float)) and self.frame_stack > 1:
             self.observation_space = Box(
                 low=-np.inf, high=np.inf, shape=(single_obs_shape[0] * self.frame_stack,), dtype=np.float32
             )
