@@ -101,7 +101,13 @@ def main(_):
 
     FLAGS.save_dir = os.path.join(FLAGS.save_dir, wandb.run.project, FLAGS.run_group, exp_name)
     os.makedirs(FLAGS.save_dir, exist_ok=True)
+    
+    # Get flag dict and filter out non-serializable values
     flag_dict = get_flag_dict()
+    # Remove the agent config which might contain non-serializable objects
+    if 'agent' in flag_dict:
+        del flag_dict['agent']
+    
     with open(os.path.join(FLAGS.save_dir, 'flags.json'), 'w') as f:
         json.dump(flag_dict, f)
 
