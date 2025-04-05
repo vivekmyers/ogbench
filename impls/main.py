@@ -17,8 +17,9 @@ from utils.flax_utils import restore_agent, save_agent
 from utils.log_utils import CsvLogger, get_exp_name, get_flag_dict, get_wandb_video, setup_wandb
 from agents import agents
 
-# Import the NuPlan environment
+# Import the NuPlan environment and dataset
 from ogbench.nuplan import NuPlanEnv
+from ogbench.nuplan.dataset import NuPlanDataset
 
 FLAGS = flags.FLAGS
 
@@ -61,14 +62,15 @@ def create_nuplan_env_and_datasets(dataset_path, frame_stack=None, config=None):
         A tuple of the environment, training dataset, and validation dataset.
     """
     # Create the environment
-    env = NuplanEnv(dataset_path=dataset_path, render_mode=FLAGS.render_mode, config=config)
-    
-    # Create a loader for visualization
-    data_dir = os.path.dirname(dataset_path)
-    loader = NuplanLoader(data_dir, config)
+    env = NuPlanEnv(
+        dataset_path=dataset_path, 
+        render_mode=FLAGS.render_mode, 
+        config=config
+    )
     
     # Load the dataset
-    data = loader.load_dataset(os.path.basename(dataset_path))
+    dataset = NuPlanDataset(dataset_path)
+    data = dataset.data
     
     # Create training and validation datasets
     # For simplicity, we'll use the same data for both

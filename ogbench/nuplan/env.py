@@ -1,34 +1,39 @@
 from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
+import gymnasium
 from gymnasium.spaces import Box
+from ogbench.nuplan.dataset import NuPlanDataset
 
-class NuPlanEnv:
+class NuPlanEnv(gymnasium.Env):
     """Minimal NuPlan environment that provides exactly what main.py needs."""
     
-    def __init__(self, dataset_path=None, config=None):
+    metadata = {
+        'render_modes': ['rgb_array'],
+        'render_fps': 30,
+    }
+    
+    def __init__(self, dataset_path=None, render_mode=None, config=None):
         """Initialize environment with dataset and config.
         
         Args:
             dataset_path: Path to .npz dataset file
+            render_mode: Rendering mode ('rgb_array' or None)
             config: Optional configuration dict
         """
+        super().__init__()
+        
         # Store config and initialize random state
         self.config = config or {}
+        self.render_mode = render_mode
         self._np_random = None
         
         # Load dataset if path provided
         self.data = None
         if dataset_path is not None:
-            # Load raw data
-            raw_data = dict(np.load(dataset_path))
-            
-            # Add goal fields as copies of next_observations
-            raw_data['value_goals'] = raw_data['next_observations'].copy()
-            raw_data['actor_goals'] = raw_data['next_observations'].copy()
-            
-            # Store processed data
-            self.data = {k: v.astype(np.float32) for k, v in raw_data.items()}
+            # Load dataset using NuPlanDataset
+            dataset = NuPlanDataset(dataset_path)
+            self.data = dataset.data
             
             # Set up observation and action spaces based on data
             obs_shape = self.data['observations'].shape[1:]  # Remove batch dim
@@ -46,8 +51,8 @@ class NuPlanEnv:
                 dtype=np.float32
             )
             self.action_space = Box(
-                low=-np.inf, 
-                high=np.inf, 
+                low=-1.0,  # Normalized action space
+                high=1.0,
                 shape=action_shape, 
                 dtype=np.float32
             )
@@ -56,6 +61,7 @@ class NuPlanEnv:
         self._current_idx = None  # Index in dataset for current episode
         self._current_observation = None
         self._episode_length = 0
+        self._max_episode_steps = self.config.get('max_episode_steps', 100)
         
     def _get_stacked_obs(self, obs):
         """Stack observations if frame_stack is enabled.
@@ -72,13 +78,20 @@ class NuPlanEnv:
             return np.tile(obs, frame_stack)
         return obs
         
-    def reset(self):
+    def reset(self, seed=None, options=None):
         """Reset environment to start new episode.
         
+        Args:
+            seed: Random seed (unused)
+            options: Optional dict with settings (unused)
+            
         Returns:
             observation: Initial observation
-            info: Empty dict (no special info needed)
+            info: Empty dict
         """
+        if self.data is None:
+            raise RuntimeError("Dataset not loaded")
+            
         # Sample random episode start from dataset
         self._current_idx = np.random.randint(len(self.data['observations']))
         self._current_observation = self._get_stacked_obs(
@@ -92,31 +105,53 @@ class NuPlanEnv:
         """Take step in environment using action.
         
         Args:
-            action: Action to take
+            action: Action to take (should be in [-1, 1])
             
         Returns:
             observation: Next observation
-            reward: Reward (0 for now since we're just doing imitation)
+            reward: Reward from dataset
             terminated: Whether episode ended naturally 
             truncated: Whether episode was artificially truncated
-            info: Empty dict (no special info needed)
+            info: Dict with episode information
         """
-        # Get next observation from dataset
+        if self.data is None:
+            raise RuntimeError("Dataset not loaded")
+            
+        # Get next observation and reward from dataset
         next_idx = (self._current_idx + 1) % len(self.data['observations'])
         next_observation = self._get_stacked_obs(
             self.data['observations'][next_idx]
         )
+        reward = float(self.data['rewards'][self._current_idx])
         
         # Update state
         self._current_idx = next_idx
         self._current_observation = next_observation
         self._episode_length += 1
         
-        # Simple episode termination after 100 steps
-        terminated = self.data['terminals'][self._current_idx]
-        truncated = self._episode_length >= 100
+        # Episode termination conditions
+        terminated = bool(self.data['terminals'][self._current_idx])
+        truncated = self._episode_length >= self._max_episode_steps
         
-        return next_observation, 0.0, terminated, truncated, {}
+        # Info dict with episode stats
+        info = {
+            'episode_length': self._episode_length,
+            'success': terminated,  # In NuPlan, terminal usually means success
+        }
+        
+        return next_observation, reward, terminated, truncated, info
+    
+    def render(self):
+        """Render the current environment state.
+        
+        Returns:
+            If render_mode is 'rgb_array', returns a numpy array of the rendered frame.
+            Otherwise returns None.
+        """
+        if self.render_mode == 'rgb_array':
+            # For now, just return a blank frame since we don't have visualization yet
+            return np.zeros((480, 640, 3), dtype=np.uint8)
+        return None
     
     @property 
     def task_infos(self):
@@ -125,4 +160,8 @@ class NuPlanEnv:
         Returns:
             List containing single task info dict
         """
-        return [{'task_name': 'nuplan', 'task_id': 1}]
+        return [{
+            'task_name': 'nuplan',
+            'task_id': 1,
+            'max_episode_steps': self._max_episode_steps,
+        }]
