@@ -87,14 +87,20 @@ class NuplanEnv(gym.Env):
 
     def _get_stacked_obs(self, obs):
         """Stack observations."""
-        if self.frame_stack == 1:
+        # If frame_stack is None or 1, return the observation as is
+        if not isinstance(self.frame_stack, (int, float)) or self.frame_stack <= 1:
             return obs
 
+        # Convert obs to numpy array if it isn't already
+        obs = np.asarray(obs)
+
         if self._stacked_obs is None:
-            self._stacked_obs = np.tile(obs, (self.frame_stack,))
+            # Create initial stacked observation by repeating the first observation
+            self._stacked_obs = np.concatenate([obs for _ in range(self.frame_stack)])
         else:
+            # Roll the stacked observations and update the latest frame
             self._stacked_obs = np.roll(self._stacked_obs, -obs.shape[0])
-            self._stacked_obs[-obs.shape[0] :] = obs
+            self._stacked_obs[-obs.shape[0]:] = obs
 
         return self._stacked_obs.copy()
 
