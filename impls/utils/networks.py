@@ -192,18 +192,10 @@ class GCActor(nn.Module):
         if self.gc_encoder is not None:
             inputs = self.gc_encoder(observations, goals, goal_encoded=goal_encoded)
         else:
-            # Ensure observations are properly shaped
-            if len(observations.shape) == 1:
-                observations = observations.reshape(1, -1)
-            
             inputs = [observations]
             if goals is not None:
-                # Ensure goals are properly shaped
-                if len(goals.shape) == 1:
-                    goals = goals.reshape(1, -1)
                 inputs.append(goals)
             inputs = jnp.concatenate(inputs, axis=-1)
-            
         outputs = self.actor_net(inputs)
 
         means = self.mean_net(outputs)
