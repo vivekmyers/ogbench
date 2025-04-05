@@ -4,8 +4,8 @@ import gymnasium
 from gymnasium.envs.registration import register
 
 # Import the environment class directly
-from ogbench.nuplan.env import NuPlanEnv
-from ogbench.nuplan.dataset import NuPlanDataset
+from .env import NuPlanEnv
+from .dataset import NuPlanDataset
 
 # Register the NuPlan environment
 try:
