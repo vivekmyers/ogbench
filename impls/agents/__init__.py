@@ -1,11 +1,11 @@
-from impls.agents.crl import CRLAgent
-from impls.agents.gcbc import GCBCAgent
-from impls.agents.gciql import GCIQLAgent
-from impls.agents.hiql import HIQLAgent
+from .crl import CRLAgent
+from .gcbc import GCBCAgent
+from .gciql import GCIQLAgent
+from .hiql import HIQLAgent
 #from impls.agents.ppo import PPOAgent
-from impls.agents.qrl import QRLAgent
-from impls.agents.sac import SACAgent
-from impls.agents.cmd import CMDAgent
+from .qrl import QRLAgent
+from .sac import SACAgent
+from .cmd import CMDAgent
 #from impls.agents.tra import TRAAgent
 
 agents = dict(
