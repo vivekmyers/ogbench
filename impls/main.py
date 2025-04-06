@@ -9,7 +9,7 @@ import numpy as np
 import tqdm
 import wandb
 from absl import app, flags
-from impls.agents import agents
+from agents import agents
 from ml_collections import config_flags
 from utils.datasets import Dataset, GCDataset, HGCDataset
 from utils.env_utils import make_env_and_datasets

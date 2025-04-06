@@ -5,7 +5,7 @@ from collections import defaultdict
 import gymnasium
 import numpy as np
 from absl import app, flags
-from agents import SACAgent
+from impls.agents import SACAgent
 from tqdm import trange
 from utils.evaluation import supply_rng
 from utils.flax_utils import restore_agent
