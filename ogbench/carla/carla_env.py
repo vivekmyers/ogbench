@@ -12,19 +12,24 @@ from gym import Env
 import gym.spaces as spaces
 from collections import deque
 
+# Save the original sys.path
+original_path = list(sys.path)
 
+# Add the CARLA paths
 try:
     sys.path.append(glob.glob('../carla/dist/carla-*%d.%d-%s.egg' % (
         sys.version_info.major,
         sys.version_info.minor,
         'win-amd64' if os.name == 'nt' else 'linux-x86_64'))[0])
-except IndexError:
-    pass
-
-import carla
-import math
-
-from dotmap import DotMap
+    sys.path.append('/carla/carla/Carla-0.10.0-Linux-Shipping/PythonAPI/carla/agents/navigation')
+    
+    # Import what we need
+    import carla
+    from global_route_planner import GlobalRoutePlanner
+    from global_route_planner_dao import GlobalRoutePlannerDAO
+finally:
+    # Restore original path
+    sys.path = original_path
 
 try:
     import pygame
@@ -40,8 +45,6 @@ try:
     import queue
 except ImportError:
     import Queue as queue
-
-from carla.agents.navigation import GlobalRoutePlanner
 
 def is_within_distance(target_location, current_location, orientation, max_distance, d_angle_th_up, d_angle_th_low=0):
     """
