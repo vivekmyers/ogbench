@@ -41,7 +41,7 @@ try:
 except ImportError:
     import Queue as queue
 
-from carla import GlobalRoutePlanner
+from carla.agents.navigation import GlobalRoutePlanner
 
 def is_within_distance(target_location, current_location, orientation, max_distance, d_angle_th_up, d_angle_th_low=0):
     """
