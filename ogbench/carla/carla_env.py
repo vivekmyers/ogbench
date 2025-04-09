@@ -12,21 +12,24 @@ from gym import Env
 import gym.spaces as spaces
 from collections import deque
 
-#from . import proxy_env
-from d4rl.offline_env import OfflineEnv
+# Save the original sys.path
+original_path = list(sys.path)
 
+# Add the CARLA paths
 try:
     sys.path.append(glob.glob('../carla/dist/carla-*%d.%d-%s.egg' % (
         sys.version_info.major,
         sys.version_info.minor,
         'win-amd64' if os.name == 'nt' else 'linux-x86_64'))[0])
-except IndexError:
-    pass
-
-import carla
-import math
-
-from dotmap import DotMap
+    sys.path.append('/carla/carla/Carla-0.10.0-Linux-Shipping/PythonAPI/carla/agents/navigation')
+    
+    # Import what we need
+    import carla
+    from global_route_planner import GlobalRoutePlanner
+    from global_route_planner_dao import GlobalRoutePlannerDAO
+finally:
+    # Restore original path
+    sys.path = original_path
 
 try:
     import pygame
@@ -1037,11 +1040,10 @@ class CarlaEnv(gym.Env):
             (current_loc.y - self.target_location.y) ** 2
         )
 
-class CarlaObsDictEnv(OfflineEnv):
+class CarlaObsDictEnv(gym.Env):
     def __init__(self, carla_args=None, carla_port=2000, reward_type='lane_follow', render_images=False, **kwargs):
         self._wrapped_env = CarlaEnv(carla_port=carla_port, args=carla_args, reward_type=reward_type, record_vision=render_images)
         print('[CarlaObsDictEnv] render_images:', render_images)
-        self._wrapped_env = CarlaEnv(carla_port=carla_port, args=carla_args, record_vision=render_images)
         self.action_space = self._wrapped_env.action_space
         self.observation_space = self._wrapped_env.observation_space
 
@@ -1050,8 +1052,6 @@ class CarlaObsDictEnv(OfflineEnv):
         self.observation_space = spaces.Dict({
             'image':spaces.Box(low=np.array([0.0] * self.observation_size), high=np.array([256.0,] * self.observation_size))
         })
-        print (self.observation_space)
-        super(CarlaObsDictEnv, self).__init__(**kwargs)
 
     @property
     def wrapped_env(self):
@@ -1061,17 +1061,13 @@ class CarlaObsDictEnv(OfflineEnv):
         self._wrapped_env.reset_init()
         obs = (self._wrapped_env.reset(**kwargs))
         obs_dict = dict()
-        # Also normalize obs
         obs_dict['image'] = (obs.astype(np.float32) / 255.0).flatten()
         return obs_dict
 
     def step(self, action):
-        #print ('Action: ', action)
         next_obs, reward, done, info = self._wrapped_env.step(action)
         next_obs_dict = dict()
         next_obs_dict['image'] = (next_obs.astype(np.float32) / 255.0).flatten()
-        # print ('Reward: ', reward)
-        # print ('Done dict: ', info)
         return next_obs_dict, reward, done, info
 
     def render(self, *args, **kwargs):
@@ -1091,13 +1087,6 @@ class CarlaObsDictEnv(OfflineEnv):
         return getattr(self._wrapped_env, attr)
 
     def __getstate__(self):
-        """
-        This is useful to override in case the wrapped env has some funky
-        __getstate__ that doesn't play well with overriding __getattr__.
-
-        The main problematic case is/was gym's EzPickle serialization scheme.
-        :return:
-        """
         return self.__dict__
 
     def __setstate__(self, state):
@@ -1107,17 +1096,13 @@ class CarlaObsDictEnv(OfflineEnv):
         return '{}({})'.format(type(self).__name__, self.wrapped_env)
 
 
-class CarlaObsEnv(OfflineEnv):
+class CarlaObsEnv(gym.Env):
     def __init__(self, carla_args=None, carla_port=2000, reward_type='lane_follow', render_images=False, **kwargs):
         self._wrapped_env = CarlaEnv(carla_port=carla_port, args=carla_args, reward_type=reward_type, record_vision=render_images)
         self.action_space = self._wrapped_env.action_space
         self.observation_space = self._wrapped_env.observation_space
         self.observation_size = int(np.prod(self._wrapped_env.observation_space.shape))
         self.observation_space = spaces.Box(low=np.array([0.0] * self.observation_size), high=np.array([256.0,] * self.observation_size))
-        #self.observation_space = spaces.Dict({
-        #    'image':spaces.Box(low=np.array([0.0] * self.observation_size), high=np.array([256.0,] * self.observation_size))
-        #})
-        super(CarlaObsEnv, self).__init__(**kwargs)
 
     @property
     def wrapped_env(self):
@@ -1126,19 +1111,12 @@ class CarlaObsEnv(OfflineEnv):
     def reset(self, **kwargs):
         self._wrapped_env.reset_init()
         obs = (self._wrapped_env.reset(**kwargs))
-        obs_dict = dict()
-        # Also normalize obs
         obs_dict = (obs.astype(np.float32) / 255.0).flatten()
         return obs_dict
 
     def step(self, action):
-        #print ('Action: ', action)
         next_obs, reward, done, info = self._wrapped_env.step(action)
-        #next_obs_dict = dict()
-        #next_obs_dict['image'] = (next_obs.astype(np.float32) / 255.0).flatten()
         next_obs_dict = (next_obs.astype(np.float32) / 255.0).flatten()
-        # print ('Reward: ', reward)
-        # print ('Done dict: ', info)
         return next_obs_dict, reward, done, info
 
     def render(self, *args, **kwargs):
@@ -1158,13 +1136,6 @@ class CarlaObsEnv(OfflineEnv):
         return getattr(self._wrapped_env, attr)
 
     def __getstate__(self):
-        """
-        This is useful to override in case the wrapped env has some funky
-        __getstate__ that doesn't play well with overriding __getattr__.
-
-        The main problematic case is/was gym's EzPickle serialization scheme.
-        :return:
-        """
         return self.__dict__
 
     def __setstate__(self, state):
