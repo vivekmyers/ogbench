@@ -6,31 +6,23 @@ import os
 from absl import app, flags
 from ml_collections import config_flags
 
-# Import the main training function
-from main import main as train_main
+# Import the main training function and its flags
+from main import main as train_main, FLAGS
 
-FLAGS = flags.FLAGS
-
-# Override default flags for CARLA
-flags.DEFINE_string('env_name', 'carla-offline-v0', 'Environment name.')
-flags.DEFINE_string('run_group', 'CARLA-CRL', 'Run group name.')
-flags.DEFINE_integer('train_steps', 500000, 'Number of training steps.')
-flags.DEFINE_integer('eval_interval', 10000, 'Evaluation interval.')
-flags.DEFINE_integer('save_interval', 50000, 'Save interval.')
-flags.DEFINE_integer('log_interval', 1000, 'Log interval.')
-flags.DEFINE_integer('eval_episodes', 5, 'Number of evaluation episodes.')
-flags.DEFINE_integer('video_episodes', 2, 'Number of video episodes to record.')
+# Define CARLA-specific flags
 flags.DEFINE_string('dataset_path', None, 'Path to the offline dataset.')
 
-# CRL specific configuration
-config_flags.DEFINE_config_file(
-    'agent',
-    None,
-    'Agent configuration file.',
-    lock_config=False,
-)
-
 def main(_):
+    # Set CARLA-specific default values for existing flags
+    FLAGS.env_name = 'carla-offline-v0'
+    FLAGS.run_group = 'CARLA-CRL'
+    FLAGS.train_steps = 500000
+    FLAGS.eval_interval = 10000
+    FLAGS.save_interval = 50000
+    FLAGS.log_interval = 1000
+    FLAGS.eval_episodes = 5
+    FLAGS.video_episodes = 2
+
     # Ensure dataset path is provided
     if FLAGS.dataset_path is None:
         raise ValueError("Please provide --dataset_path")
