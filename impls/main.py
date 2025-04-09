@@ -50,8 +50,12 @@ def main(_):
     FLAGS.save_dir = os.path.join(FLAGS.save_dir, wandb.run.project, FLAGS.run_group, exp_name)
     os.makedirs(FLAGS.save_dir, exist_ok=True)
     flag_dict = get_flag_dict()
+    
+    # Filter out non-serializable entries
+    serializable_flag_dict = {k: v for k, v in flag_dict.items() if isinstance(v, (str, int, float, bool, list, dict))}
+    
     with open(os.path.join(FLAGS.save_dir, 'flags.json'), 'w') as f:
-        json.dump(flag_dict, f)
+        json.dump(serializable_flag_dict, f)
 
     # Set up environment and dataset.
     config = FLAGS.agent
