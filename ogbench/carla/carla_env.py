@@ -41,6 +41,8 @@ try:
 except ImportError:
     import Queue as queue
 
+from carla import GlobalRoutePlanner
+
 def is_within_distance(target_location, current_location, orientation, max_distance, d_angle_th_up, d_angle_th_low=0):
     """
     Check if a target object is within a certain distance from a reference object.
