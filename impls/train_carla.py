@@ -8,6 +8,7 @@ from ml_collections import config_flags
 
 # Import the main training function and its flags
 from main import main as train_main, FLAGS
+import ogbench.carla
 
 # Define CARLA-specific flags
 flags.DEFINE_string('dataset_path', None, 'Path to the offline dataset.')
