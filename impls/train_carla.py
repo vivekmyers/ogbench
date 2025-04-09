@@ -14,14 +14,14 @@ flags.DEFINE_string('dataset_path', None, 'Path to the offline dataset.')
 
 def main(_):
     # Set CARLA-specific default values for existing flags
-    FLAGS.env_name = 'carla-offline-v0'
-    FLAGS.run_group = 'CARLA-CRL'
-    FLAGS.train_steps = 500000
-    FLAGS.eval_interval = 10000
-    FLAGS.save_interval = 50000
-    FLAGS.log_interval = 1000
-    FLAGS.eval_episodes = 5
-    FLAGS.video_episodes = 2
+    FLAGS.set_default('env_name', 'carla-offline-v0')
+    FLAGS.set_default('run_group', 'CARLA-CRL')
+    FLAGS.set_default('train_steps', 500000)
+    FLAGS.set_default('eval_interval', 10000)
+    FLAGS.set_default('save_interval', 50000)
+    FLAGS.set_default('log_interval', 1000)
+    FLAGS.set_default('eval_episodes', 5)
+    FLAGS.set_default('video_episodes', 2)
 
     # Ensure dataset path is provided
     if FLAGS.dataset_path is None:
