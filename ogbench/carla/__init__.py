@@ -4,7 +4,7 @@ from gym.envs.registration import register
 # Register the CARLA environment for offline RL
 try:
     register(
-        id='carla-offline-v0',
+        id='CarlaOfflineV0',
         entry_point='ogbench.carla:CarlaEnv',
         max_episode_steps=1000,
         kwargs={

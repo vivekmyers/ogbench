@@ -14,7 +14,7 @@ flags.DEFINE_string('dataset_path', None, 'Path to the offline dataset.')
 
 def main(_):
     # Set CARLA-specific default values for existing flags
-    FLAGS.set_default('env_name', 'carla-offline-v0')
+    FLAGS.set_default('env_name', 'CarlaOfflineV0')
     FLAGS.set_default('run_group', 'CARLA-CRL')
     FLAGS.set_default('train_steps', 500000)
     FLAGS.set_default('eval_interval', 10000)
