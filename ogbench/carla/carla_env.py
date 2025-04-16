@@ -12,24 +12,10 @@ from gym import Env
 import gym.spaces as spaces
 from collections import deque
 
-# Save the original sys.path
-original_path = list(sys.path)
+import carla
+import math
 
-# Add the CARLA paths
-try:
-    sys.path.append(glob.glob('../carla/dist/carla-*%d.%d-%s.egg' % (
-        sys.version_info.major,
-        sys.version_info.minor,
-        'win-amd64' if os.name == 'nt' else 'linux-x86_64'))[0])
-    sys.path.append('/carla/carla/Carla-0.10.0-Linux-Shipping/PythonAPI/carla/agents/navigation')
-    
-    # Import what we need
-    import carla
-    from global_route_planner import GlobalRoutePlanner
-    from global_route_planner_dao import GlobalRoutePlannerDAO
-finally:
-    # Restore original path
-    sys.path = original_path
+from dotmap import DotMap
 
 try:
     import pygame
@@ -45,6 +31,18 @@ try:
     import queue
 except ImportError:
     import Queue as queue
+
+from .global_route_planner import GlobalRoutePlanner
+
+def get_font():
+    """Initialize and return a pygame font for rendering text."""
+    try:
+        pygame.font.init()
+        font = pygame.font.Font(pygame.font.get_default_font(), 20)
+        return font
+    except Exception as e:
+        print("Could not create font:", e)
+        return None
 
 def is_within_distance(target_location, current_location, orientation, max_distance, d_angle_th_up, d_angle_th_low=0):
     """
@@ -87,9 +85,6 @@ def compute_distance(location_1, location_2):
 
 
 class CustomGlobalRoutePlanner(GlobalRoutePlanner):
-    def __init__(self, dao):
-        super(CustomGlobalRoutePlanner, self).__init__(dao=dao)
-
     def compute_direction_velocities(self, origin, velocity, destination):
         node_list = super(CustomGlobalRoutePlanner, self)._path_search(origin=origin, destination=destination)
 
@@ -278,6 +273,7 @@ class CarlaEnv(gym.Env):
         self.follow_traffic_lights = args['lights']
         if self.record_display:
             assert self.render_display
+        self.latest_obs = None
 
         self.actor_list = []
 
@@ -537,8 +533,11 @@ class CarlaEnv(gym.Env):
                 break
         return next_obs, np.mean(rewards), done, info
         """
+        traffic_light_hazard, _, traffic_light = self._is_light_red(self.vehicle)
+        traffic_light_color = 'RED' if traffic_light_hazard else 'GREEN'
         return self._simulator_step(action, traffic_light_color)
     
+
     def _is_vehicle_hazard(self, vehicle, vehicle_list):
         """
         :param vehicle_list: list of potential obstacle to check
@@ -562,9 +561,12 @@ class CarlaEnv(gym.Env):
                     target_vehicle_waypoint.lane_id != ego_vehicle_waypoint.lane_id:
                 continue
 
-            if is_within_distance_ahead(target_vehicle.get_transform(),
-                                        vehicle.get_transform(),
-                                        self._proximity_threshold/10.0):
+        if is_within_distance(target_vehicle.get_location(),
+                            vehicle.get_location(),
+                            vehicle.get_transform().rotation.yaw,
+                            self._proximity_threshold/10.0,
+                            90.0,  # upper angle threshold of 90 degrees
+                            0.0):  # lower angle threshold of 0 degrees
                 return (True, -1.0, target_vehicle)
 
         return (False, 0.0,  None)
@@ -592,10 +594,13 @@ class CarlaEnv(gym.Env):
                     target_vehicle_waypoint.lane_id != ego_vehicle_waypoint.lane_id:
                 continue
 
-            if is_within_distance_ahead(target_vehicle.get_transform(),
-                                        vehicle.get_transform(),
-                                        self._proximity_threshold/40.0):
-                return (True, -1.0, target_vehicle)
+        if is_within_distance(target_vehicle.get_location(),
+                            vehicle.get_location(),
+                            vehicle.get_transform().rotation.yaw,
+                            self._proximity_threshold/40.0,
+                            90.0,  # upper angle threshold of 90 degrees
+                            0.0):  # lower angle threshold of 0 degrees
+            return (True, -1.0, target_vehicle)
 
         return (False, 0.0,  None)
 
@@ -627,11 +632,14 @@ class CarlaEnv(gym.Env):
             if dot_ve_wp < 0:
                 continue
 
-            if is_within_distance_ahead(object_waypoint.transform,
-                                        vehicle.get_transform(),
-                                        self._traffic_light_threshold):
-                if traffic_light.state == carla.TrafficLightState.Red:
-                    return (True, -0.1, traffic_light)
+        if is_within_distance(object_waypoint.transform.location,
+                            vehicle.get_location(),
+                            vehicle.get_transform().rotation.yaw,
+                            self._traffic_light_threshold,
+                            90.0,  # upper angle threshold of 90 degrees
+                            0.0):  # lower angle threshold of 0 degrees
+            if traffic_light.state == carla.TrafficLightState.Red:
+                return (True, -0.1, traffic_light)
 
         return (False, 0.0, None)
 
@@ -936,21 +944,6 @@ class CarlaEnv(gym.Env):
             metadata.add_text("settings_multiagent", str(self.multiagent))
             # traffic lights
             metadata.add_text("traffic_lights_color", "UNLABELED")
-            metadata.add_text("reward", str(reward))
-
-            ## Add in reward dict
-            for key in reward_dict:
-                metadata.add_text("reward_" + str(key), str(reward_dict[key]))
-            
-            for key in done_dict:
-                metadata.add_text("done_" + str(key), str(done_dict[key]))
-
-            ## Save the target location as well
-            metadata.add_text('target_location_x', str(self.target_location.x))
-            metadata.add_text('target_location_y', str(self.target_location.y))
-            metadata.add_text('target_location_z', str(self.target_location.z))
-
-            im.save(image_name, "PNG", pnginfo=metadata)
 
         self.count += 1
 
@@ -966,12 +959,35 @@ class CarlaEnv(gym.Env):
             reward, reward_dict, done_dict = self.goal_reaching_reward(self.vehicle)
         else:
             raise ValueError('unknown reward type:', self.reward_type)
+        
+        metadata.add_text("reward", str(reward))
+
+        ## Add in reward dict
+        for key in reward_dict:
+            metadata.add_text("reward_" + str(key), str(reward_dict[key]))
+            
+        for key in done_dict:
+            metadata.add_text("done_" + str(key), str(done_dict[key]))
+
+            ## Save the target location as well
+        metadata.add_text('target_location_x', str(self.target_location.x))
+        metadata.add_text('target_location_y', str(self.target_location.y))
+        metadata.add_text('target_location_z', str(self.target_location.z))
+
+        im.save(image_name, "PNG", pnginfo=metadata)
 
         info = reward_dict
         info.update(done_dict)
         done = False
         for key in done_dict:
             done = (done or done_dict[key])
+
+        # Format rl image
+        bgra = np.array(vision_image.raw_data).reshape(self.vision_size, self.vision_size, 4)
+        bgr = bgra[:, :, :3]  # BGR format (84 x 84 x 3)
+        rgb = np.flip(bgr, axis=2)  # RGB format (84 x 84 x 3)
+    
+        self.latest_obs = rgb  # Store the latest observation
         #if done:
         #    print('done_dict:', done_dict, 'r:', reward)
         return next_obs, reward, done, info
@@ -993,7 +1009,7 @@ class CarlaEnv(gym.Env):
     def _get_obs(self):
         # Your existing observation gathering code
         return {
-            'image': vision_image,
+            'image': self.latest_obs,
             'vehicle_state': np.array([
                 self.vehicle.get_transform().location.x,
                 self.vehicle.get_transform().location.y,
@@ -1157,4 +1173,3 @@ if __name__ == '__main__':
     variant['record_dir'] = None
 
     env = CarlaEnv(args=variant)
-    carla_gym_env = proxy_env.ProxyEnv(env)
