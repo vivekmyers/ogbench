@@ -384,8 +384,7 @@ class CarlaEnv(gym.Env):
         self.object_list = self.actor_list.filter("*traffic.*")
 
         # town nav
-        self.route_planner_dao = GlobalRoutePlannerDAO(self.map, sampling_resolution=0.1) 
-        self.route_planner = CustomGlobalRoutePlanner(self.route_planner_dao)
+        self.route_planner = CustomGlobalRoutePlanner(self.map)
         self.route_planner.setup()
         self.target_location = carla.Location(x=-13.473097, y=134.311234, z=-0.010433)
 
