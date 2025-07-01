@@ -121,7 +121,7 @@ def load_dataset(path: str | Path, frame_stack: int = 1) -> Dict[str, jnp.ndarra
     return dataset
 
 
-def sample_batch(dataset: Dict[str, jnp.ndarray], *, batch_size: int, key: jax.random.PRNGKey) -> tuple[Dict[str, jnp.ndarray], jax.random.PRNGKey]:
+def sample_batch(dataset: Dict[str, jnp.ndarray], *, batch_size: int, key: jax.random.PRNGKey, frame_stack: int = 1) -> tuple[Dict[str, jnp.ndarray], jax.random.PRNGKey]:
     """Minimal trajectory-aware sampler for CRL."""
     n = dataset["observations"].shape[0]
     key, subkey = jax.random.split(key)
@@ -151,7 +151,7 @@ def sample_batch(dataset: Dict[str, jnp.ndarray], *, batch_size: int, key: jax.r
     
     # Add goals (using future states in the same trajectory 50% of the time)
     key, goal_key = jax.random.split(key)
-    use_future = jax.random.uniform(goal_key, (batch_size,)) < 0.5
+    use_future = jax.random.uniform(goal_key, (batch_size,)) < 0.1
     
     # For each index, find the nearest terminal
     traj_ends = jnp.searchsorted(terminal_indices, idx)
@@ -163,9 +163,15 @@ def sample_batch(dataset: Dict[str, jnp.ndarray], *, batch_size: int, key: jax.r
     
     # Combine
     goal_idx = jnp.where(use_future, future_idx, random_idx)
-    batch["value_goals"] = dataset["observations"][goal_idx]
-    batch["actor_goals"] = dataset["observations"][goal_idx]
+    #batch["value_goals"] = dataset["observations"][goal_idx]
+    #batch["actor_goals"] = dataset["observations"][goal_idx]
     
+    base_goals = dataset["observations"][goal_idx][:, :, :, :3]  # Get the first frame from each stack, shape [B, 48, 48, 3]
+    # Stack the same frame 4 times along the channel axis
+    goal_stack = jnp.concatenate([base_goals] * frame_stack, axis=-1)  # [B, 48, 48, 12]
+    batch["value_goals"] = goal_stack
+    batch["actor_goals"] = goal_stack
+
     # Goal-conditioned rewards
     batch["rewards"] = jnp.full((batch_size,), -1.0)  # -1 everywhere except at goal
     batch["masks"] = jnp.ones((batch_size,))          # 1 everywhere except at goal
@@ -181,7 +187,7 @@ def sample_batch(dataset: Dict[str, jnp.ndarray], *, batch_size: int, key: jax.r
         
         # Use percentile-based threshold instead of fixed threshold
         # Sort distances to find the threshold value at a given percentile (lowest 5%)
-        target_goal_rate = 0.05  # Target 5% of states as goals
+        target_goal_rate = 0.5  # Target 50% of states as goals (overly easy for debugging)
         
         # Sort distances and find threshold
         sorted_distances = jnp.sort(distances)
@@ -228,7 +234,7 @@ def sample_batch(dataset: Dict[str, jnp.ndarray], *, batch_size: int, key: jax.r
     
     # Set mask to 0 for transitions that reach the goal (terminal)
     batch["masks"] = jnp.where(is_at_goal, 0.0, batch["masks"])
-    
+    # batch = {k: jnp.array(v) for k, v in batch.items()}
     return batch, key
 
 
@@ -301,7 +307,7 @@ def main(args: argparse.Namespace) -> None:
     
     for step in progress:
         rng, batch_key = jax.random.split(rng)
-        batch, rng = sample_batch(dataset, batch_size=cfg.batch_size, key=batch_key)
+        batch, rng = sample_batch(dataset, batch_size=cfg.batch_size, key=batch_key, frame_stack=args.frame_stack)
         
         # Save stats about the batch for debugging
         reward_stats.append({
@@ -359,7 +365,11 @@ def main(args: argparse.Namespace) -> None:
             ckpt_path = ckpt_dir / f"agent_step{step}.pkl"
             with ckpt_path.open("wb") as f:
                 f.write(fxs.to_bytes(agent))
+
+        if step % 500 == 0:
+            print(f"Step {step}: At-goal rate = {float(jnp.mean(batch['masks'] == 0.0)):.4f}")
     
+
     # Save final model
     final_model_path = ckpt_dir / "final_model.pkl"
     print(f"Saving final model to {final_model_path}")
@@ -376,7 +386,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Minimal CRL offline training script")
     parser.add_argument("--dataset_path", type=str, required=True, help="Path to .npz offline dataset")
     parser.add_argument("--steps", type=int, default=700_000, help="Total gradient steps")
-    parser.add_argument("--batch_size", type=int, default=1024)
+    parser.add_argument("--batch_size", type=int, default=256)
     parser.add_argument("--actor_loss", choices=["awr", "ddpgbc"], default="ddpgbc")
     parser.add_argument("--project", default="crl_offline")
     parser.add_argument("--seed", type=int, default=0)
