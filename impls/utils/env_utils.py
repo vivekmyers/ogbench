@@ -38,11 +38,6 @@ class EpisodeMonitor(gymnasium.Wrapper):
             info['episode']['length'] = self.episode_length
             info['episode']['duration'] = time.time() - self.start_time
 
-            if hasattr(self.unwrapped, 'get_normalized_score'):
-                info['episode']['normalized_return'] = (
-                    self.unwrapped.get_normalized_score(info['episode']['return']) * 100.0
-                )
-
         return observation, reward, terminated, truncated, info
 
     def reset(self, *args, **kwargs):
@@ -76,20 +71,9 @@ class FrameStackWrapper(gymnasium.Wrapper):
         return self.get_observation(), info
 
     def step(self, action):
-        observation, reward, terminated, truncated, info = self.env.step(action)
-        self.frames.append(observation)
+        ob, reward, terminated, truncated, info = self.env.step(action)
+        self.frames.append(ob)
         return self.get_observation(), reward, terminated, truncated, info
-
-
-def setup_egl():
-    """Set up EGL for rendering."""
-    if 'mac' in platform.platform():
-        # macOS doesn't support EGL.
-        pass
-    else:
-        os.environ['MUJOCO_GL'] = 'egl'
-        if 'SLURM_STEP_GPUS' in os.environ:
-            os.environ['EGL_DEVICE_ID'] = os.environ['SLURM_STEP_GPUS']
 
 
 def make_env_and_datasets(dataset_name, frame_stack=None):
@@ -102,8 +86,6 @@ def make_env_and_datasets(dataset_name, frame_stack=None):
     Returns:
         A tuple of the environment, training dataset, and validation dataset.
     """
-    setup_egl()
-
     # Use compact dataset to save memory.
     env, train_dataset, val_dataset = ogbench.make_env_and_datasets(dataset_name, compact_dataset=True)
     train_dataset = Dataset.create(**train_dataset)

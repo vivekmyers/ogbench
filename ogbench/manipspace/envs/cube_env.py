@@ -34,6 +34,8 @@ class CubeEnv(ManipSpaceEnv):
             self._num_cubes = 3
         elif self._env_type == 'quadruple':
             self._num_cubes = 4
+        elif self._env_type == 'octuple':
+            self._num_cubes = 8
         else:
             raise ValueError(f'Invalid env_type: {env_type}')
 
@@ -46,6 +48,10 @@ class CubeEnv(ManipSpaceEnv):
                 self._colors['blue'],
                 self._colors['orange'],
                 self._colors['green'],
+                self._colors['purple'],
+                self._colors['yellow'],
+                self._colors['magenta'],
+                self._colors['gray'],
             ]
         )
         self._cube_success_colors = np.array(
@@ -54,6 +60,10 @@ class CubeEnv(ManipSpaceEnv):
                 self._colors['lightblue'],
                 self._colors['lightorange'],
                 self._colors['lightgreen'],
+                self._colors['lightpurple'],
+                self._colors['lightyellow'],
+                self._colors['lightmagenta'],
+                self._colors['white'],
             ]
         )
 
@@ -355,6 +365,147 @@ class CubeEnv(ManipSpaceEnv):
                     ),
                 ),
             ]
+        elif self._env_type == 'octuple':
+            self.task_infos = [
+                dict(
+                    task_name='task1_quadruple_pnp',
+                    init_xyzs=np.array(
+                        [
+                            [0.325, -0.15, 0.02],
+                            [0.425, -0.15, 0.02],
+                            [0.425, -0.05, 0.02],
+                            [0.525, -0.05, 0.02],
+                            [0.325, 0.05, 0.02],
+                            [0.425, 0.05, 0.02],
+                            [0.425, 0.15, 0.02],
+                            [0.525, 0.15, 0.02],
+                        ]
+                    ),
+                    goal_xyzs=np.array(
+                        [
+                            [0.525, 0.05, 0.02],
+                            [0.425, -0.15, 0.02],
+                            [0.425, -0.05, 0.02],
+                            [0.325, 0.15, 0.02],
+                            [0.525, -0.15, 0.02],
+                            [0.425, 0.05, 0.02],
+                            [0.425, 0.15, 0.02],
+                            [0.325, -0.05, 0.02],
+                        ]
+                    ),
+                ),
+                dict(
+                    task_name='task2_octuple_pnp1',
+                    init_xyzs=np.array(
+                        [
+                            [0.40, -0.15, 0.02],
+                            [0.40, -0.05, 0.02],
+                            [0.40, 0.05, 0.02],
+                            [0.40, 0.15, 0.02],
+                            [0.45, -0.15, 0.02],
+                            [0.45, -0.05, 0.02],
+                            [0.45, 0.05, 0.02],
+                            [0.45, 0.15, 0.02],
+                        ]
+                    ),
+                    goal_xyzs=np.array(
+                        [
+                            [0.525, 0.2, 0.02],
+                            [0.525, 0.0, 0.02],
+                            [0.525, -0.2, 0.02],
+                            [0.425, -0.2, 0.02],
+                            [0.325, -0.2, 0.02],
+                            [0.325, 0.0, 0.02],
+                            [0.325, 0.2, 0.02],
+                            [0.425, 0.2, 0.02],
+                        ]
+                    ),
+                ),
+                dict(
+                    task_name='task3_octuple_pnp2',
+                    init_xyzs=np.array(
+                        [
+                            [0.32, -0.15, 0.02],
+                            [0.32, 0.05, 0.02],
+                            [0.39, -0.05, 0.02],
+                            [0.39, 0.15, 0.02],
+                            [0.46, -0.15, 0.02],
+                            [0.46, 0.05, 0.02],
+                            [0.53, -0.05, 0.02],
+                            [0.53, 0.15, 0.02],
+                        ]
+                    ),
+                    goal_xyzs=np.array(
+                        [
+                            [0.32, 0.15, 0.02],
+                            [0.46, 0.15, 0.02],
+                            [0.39, 0.05, 0.02],
+                            [0.53, 0.05, 0.02],
+                            [0.32, -0.05, 0.02],
+                            [0.46, -0.05, 0.02],
+                            [0.39, -0.15, 0.02],
+                            [0.53, -0.15, 0.02],
+                        ]
+                    ),
+                ),
+                dict(
+                    task_name='task4_stack1',
+                    init_xyzs=np.array(
+                        [
+                            [0.40, -0.025, 0.02],
+                            [0.40, -0.025, 0.06],
+                            [0.40, 0.025, 0.02],
+                            [0.40, 0.025, 0.06],
+                            [0.45, -0.025, 0.02],
+                            [0.45, -0.025, 0.06],
+                            [0.45, 0.025, 0.02],
+                            [0.45, 0.025, 0.06],
+                        ]
+                    ),
+                    goal_xyzs=np.array(
+                        [
+                            [0.525, 0.05, 0.02],
+                            [0.525, -0.05, 0.02],
+                            [0.425, -0.15, 0.06],
+                            [0.425, -0.15, 0.02],
+                            [0.425, 0.15, 0.06],
+                            [0.425, 0.15, 0.02],
+                            [0.325, -0.05, 0.02],
+                            [0.325, 0.05, 0.02],
+                        ]
+                    ),
+                ),
+                dict(
+                    task_name='task5_stack2',
+                    init_xyzs=np.array(
+                        [
+                            [0.50, 0.2, 0.06],
+                            [0.50, 0.2, 0.02],
+                            [0.50, -0.2, 0.06],
+                            [0.50, -0.2, 0.02],
+                            [0.35, -0.2, 0.06],
+                            [0.35, -0.2, 0.02],
+                            [0.35, 0.2, 0.06],
+                            [0.35, 0.2, 0.02],
+                        ]
+                    ),
+                    goal_xyzs=np.array(
+                        [
+                            [0.325, 0.0, 0.02],
+                            [0.325, 0.0, 0.06],
+                            [0.425, 0.2, 0.02],
+                            [0.425, 0.2, 0.06],
+                            [0.525, 0.0, 0.02],
+                            [0.525, 0.0, 0.06],
+                            [0.425, -0.2, 0.02],
+                            [0.425, -0.2, 0.06],
+                        ]
+                    ),
+                ),
+            ]
+
+        if self._reward_task_id == 0:
+            self._reward_task_id = 2  # Default task.
 
     def add_objects(self, arena_mjcf):
         # Add cube scene.
@@ -463,7 +614,9 @@ class CubeEnv(ManipSpaceEnv):
                 self.step(self.action_space.sample())
 
             # Save the goal observation.
-            self._cur_goal_ob = self.compute_observation()
+            self._cur_goal_ob = (
+                self.compute_oracle_observation() if self._use_oracle_rep else self.compute_observation()
+            )
             if self._render_goal:
                 self._cur_goal_rendered = self.render()
             else:
@@ -553,8 +706,8 @@ class CubeEnv(ManipSpaceEnv):
         if return_info:
             return self.compute_observation(), self.get_reset_info()
 
-    def post_step(self):
-        # Check if the cubes are in the target positions.
+    def _compute_successes(self):
+        """Compute object successes."""
         cube_successes = []
         for i in range(self._num_cubes):
             obj_pos = self._data.joint(f'object_joint_{i}').qpos[:3]
@@ -564,6 +717,11 @@ class CubeEnv(ManipSpaceEnv):
             else:
                 cube_successes.append(False)
 
+        return cube_successes
+
+    def post_step(self):
+        # Check if the cubes are in the target positions.
+        cube_successes = self._compute_successes()
         if self._mode == 'data_collection':
             self._success = cube_successes[self._target_block]
         else:
@@ -634,3 +792,24 @@ class CubeEnv(ManipSpaceEnv):
                 )
 
             return np.concatenate(ob)
+
+    def compute_oracle_observation(self):
+        """Return the oracle goal representation of the current state."""
+        xyz_center = np.array([0.425, 0.0, 0.0])
+        xyz_scaler = 10.0
+
+        ob_info = self.compute_ob_info()
+        ob = []
+        for i in range(self._num_cubes):
+            ob.append((ob_info[f'privileged/block_{i}_pos'] - xyz_center) * xyz_scaler)
+
+        return np.concatenate(ob)
+
+    def compute_reward(self, ob, action):
+        if self._reward_task_id is None:
+            return super().compute_reward(ob, action)
+
+        # Compute the reward based on the task.
+        successes = self._compute_successes()
+        reward = float(sum(successes) - len(successes))
+        return reward

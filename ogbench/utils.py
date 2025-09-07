@@ -5,11 +5,13 @@ import gymnasium
 import numpy as np
 from tqdm import tqdm
 
+from ogbench.relabel_utils import add_oracle_reps, relabel_dataset
+
 DEFAULT_DATASET_DIR = '~/.ogbench/data'
 DATASET_URL = 'https://rail.eecs.berkeley.edu/datasets/ogbench'
 
 
-def load_dataset(dataset_path, ob_dtype=np.float32, action_dtype=np.float32, compact_dataset=False):
+def load_dataset(dataset_path, ob_dtype=np.float32, action_dtype=np.float32, compact_dataset=False, add_info=False):
     """Load OGBench dataset.
 
     Args:
@@ -18,10 +20,12 @@ def load_dataset(dataset_path, ob_dtype=np.float32, action_dtype=np.float32, com
         action_dtype: dtype for actions.
         compact_dataset: Whether to return a compact dataset (True, without 'next_observations') or a regular dataset
             (False, with 'next_observations').
+        add_info: Whether to add observation information ('qpos', 'qvel', and 'button_states') to the dataset.
 
     Returns:
         Dictionary containing the dataset. The dictionary contains the following keys: 'observations', 'actions',
         'terminals', and 'next_observations' (if `compact_dataset` is False) or 'valids' (if `compact_dataset` is True).
+        If `add_info` is True, the dictionary may also contain additional keys for observation information.
     """
     file = np.load(dataset_path)
 
@@ -33,7 +37,15 @@ def load_dataset(dataset_path, ob_dtype=np.float32, action_dtype=np.float32, com
             dtype = action_dtype
         else:
             dtype = np.float32
-        dataset[k] = file[k][...].astype(dtype)
+        dataset[k] = file[k][...].astype(dtype, copy=False)
+
+    if add_info:
+        # Read observation information.
+        info_keys = []
+        for k in ['qpos', 'qvel', 'button_states']:
+            if k in file:
+                dataset[k] = file[k][...]
+                info_keys.append(k)
 
     # Example:
     # Assume each trajectory has length 4, and (s0, a0, s1), (s1, a1, s2), (s2, a2, s3), (s3, a3, s4) are transition
@@ -77,6 +89,10 @@ def load_dataset(dataset_path, ob_dtype=np.float32, action_dtype=np.float32, com
         new_terminals = np.concatenate([dataset['terminals'][1:], [1.0]])
         dataset['terminals'] = new_terminals[ob_mask].astype(np.float32)
 
+        if add_info:
+            for k in info_keys:
+                dataset[k] = dataset[k][ob_mask]
+
     return dataset
 
 
@@ -118,33 +134,66 @@ def download_datasets(dataset_names, dataset_dir=DEFAULT_DATASET_DIR):
 def make_env_and_datasets(
     dataset_name,
     dataset_dir=DEFAULT_DATASET_DIR,
+    dataset_path=None,
     compact_dataset=False,
     env_only=False,
+    dataset_only=False,
+    cur_env=None,
+    add_info=False,
     **env_kwargs,
 ):
     """Make OGBench environment and load datasets.
 
     Args:
         dataset_name: Dataset name.
-        dataset_dir: Directory to save the datasets.
+        dataset_dir: Directory to save/load the datasets.
+        dataset_path: (Optional) Path to the dataset file.
         compact_dataset: Whether to return a compact dataset (True, without 'next_observations') or a regular dataset
             (False, with 'next_observations').
         env_only: Whether to return only the environment.
+        dataset_only: Whether to return only the datasets.
+        cur_env: Current environment (only used when `dataset_only` is True).
+        add_info: Whether to add observation information ('qpos', 'qvel', and 'button_states') to the datasets.
         **env_kwargs: Keyword arguments to pass to the environment.
     """
     # Make environment.
     splits = dataset_name.split('-')
-    env_name = '-'.join(splits[:-2] + splits[-1:])  # Remove the dataset type.
-    env = gymnasium.make(env_name, **env_kwargs)
+    dataset_add_info = add_info
+    env = cur_env
+    if 'singletask' in splits:
+        # Single-task environment.
+        pos = splits.index('singletask')
+        env_name = '-'.join(splits[: pos - 1] + splits[pos:])  # Remove the dataset type.
+        if not dataset_only:
+            env = gymnasium.make(env_name, **env_kwargs)
+        dataset_name = '-'.join(splits[:pos] + splits[-1:])  # Remove the words 'singletask' and 'task\d' (if exists).
+        dataset_add_info = True
+    elif 'oraclerep' in splits:
+        # Environment with oracle goal representations.
+        env_name = '-'.join(splits[:-3] + splits[-1:])  # Remove the dataset type and the word 'oraclerep'.
+        if not dataset_only:
+            env = gymnasium.make(env_name, use_oracle_rep=True, **env_kwargs)
+        dataset_name = '-'.join(splits[:-2] + splits[-1:])  # Remove the word 'oraclerep'.
+        dataset_add_info = True
+    else:
+        # Original, goal-conditioned environment.
+        env_name = '-'.join(splits[:-2] + splits[-1:])  # Remove the dataset type.
+        if not dataset_only:
+            env = gymnasium.make(env_name, **env_kwargs)
 
     if env_only:
         return env
 
     # Load datasets.
-    dataset_dir = os.path.expanduser(dataset_dir)
-    download_datasets([dataset_name], dataset_dir)
-    train_dataset_path = os.path.join(dataset_dir, f'{dataset_name}.npz')
-    val_dataset_path = os.path.join(dataset_dir, f'{dataset_name}-val.npz')
+    if dataset_path is None:
+        dataset_dir = os.path.expanduser(dataset_dir)
+        download_datasets([dataset_name], dataset_dir)
+        train_dataset_path = os.path.join(dataset_dir, f'{dataset_name}.npz')
+        val_dataset_path = os.path.join(dataset_dir, f'{dataset_name}-val.npz')
+    else:
+        train_dataset_path = dataset_path
+        val_dataset_path = dataset_path.replace('.npz', '-val.npz')
+
     ob_dtype = np.uint8 if ('visual' in env_name or 'powderworld' in env_name) else np.float32
     action_dtype = np.int32 if 'powderworld' in env_name else np.float32
     train_dataset = load_dataset(
@@ -152,12 +201,35 @@ def make_env_and_datasets(
         ob_dtype=ob_dtype,
         action_dtype=action_dtype,
         compact_dataset=compact_dataset,
+        add_info=dataset_add_info,
     )
     val_dataset = load_dataset(
         val_dataset_path,
         ob_dtype=ob_dtype,
         action_dtype=action_dtype,
         compact_dataset=compact_dataset,
+        add_info=dataset_add_info,
     )
 
-    return env, train_dataset, val_dataset
+    if 'singletask' in splits:
+        # Add reward information to the datasets.
+        relabel_dataset(env_name, env, train_dataset)
+        relabel_dataset(env_name, env, val_dataset)
+
+    if 'oraclerep' in splits:
+        # Add oracle goal representations to the datasets.
+        add_oracle_reps(env_name, env, train_dataset)
+        add_oracle_reps(env_name, env, val_dataset)
+
+    if not add_info:
+        # Remove information keys.
+        for k in ['qpos', 'qvel', 'button_states']:
+            if k in train_dataset:
+                del train_dataset[k]
+            if k in val_dataset:
+                del val_dataset[k]
+
+    if dataset_only:
+        return train_dataset, val_dataset
+    else:
+        return env, train_dataset, val_dataset

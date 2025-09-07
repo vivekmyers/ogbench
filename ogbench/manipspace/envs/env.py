@@ -229,6 +229,7 @@ class CustomMuJoCoEnv(gym.Env, abc.ABC):
         """
         if self._reset_next_step:
             return self.reset()
+        action = np.array(action)
         self.set_control(action)
         self.pre_step()
         mujoco.mj_step(self._model, self._data, nstep=self._n_steps)

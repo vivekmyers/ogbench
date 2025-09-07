@@ -1,5 +1,6 @@
 import os
 
+import gymnasium
 import numpy as np
 from gymnasium import utils
 from gymnasium.envs.mujoco import MujocoEnv
@@ -20,13 +21,11 @@ class AntEnv(MujocoEnv, utils.EzPickle):
 
     xml_file = os.path.join(os.path.dirname(__file__), 'assets', 'ant.xml')
     metadata = {
-        'render_modes': [
-            'human',
-            'rgb_array',
-            'depth_array',
-        ],
+        'render_modes': ['human', 'rgb_array', 'depth_array'],
         'render_fps': 10,
     }
+    if gymnasium.__version__ >= '1.1.0':
+        metadata['render_modes'] += ['rgbd_tuple']
 
     def __init__(
         self,

@@ -1,5 +1,5 @@
 import gymnasium
-from utils.env_utils import EpisodeMonitor, setup_egl
+from utils.env_utils import EpisodeMonitor
 
 
 def make_online_env(env_name):
@@ -12,8 +12,6 @@ def make_online_env(env_name):
         env_name: Name of the environment.
     """
     import ogbench.online_locomotion  # noqa
-
-    setup_egl()
 
     # Manually recognize the '-xy' suffix, which indicates that the environment should be wrapped with a directional
     # locomotion wrapper.

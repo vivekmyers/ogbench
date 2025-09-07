@@ -69,7 +69,7 @@ class Dataset(FrozenDict):
         else:
             return np.random.randint(self.size, size=num_idxs)
 
-    def sample(self, batch_size: int, idxs=None):
+    def sample(self, batch_size, idxs=None):
         """Sample a batch of transitions."""
         if idxs is None:
             idxs = self.get_random_idxs(batch_size)
@@ -202,7 +202,7 @@ class GCDataset:
                 stacked_observations = self.get_stacked_observations(np.arange(self.size))
                 self.dataset = Dataset(self.dataset.copy(dict(observations=stacked_observations)))
 
-    def sample(self, batch_size: int, idxs=None, evaluation=False):
+    def sample(self, batch_size, idxs=None, evaluation=False):
         """Sample a batch of transitions with goals.
 
         This method samples a batch of transitions with goals (value_goals and actor_goals) from the dataset. They are
@@ -261,19 +261,22 @@ class GCDataset:
         if geom_sample:
             # Geometric sampling.
             offsets = np.random.geometric(p=1 - self.config['discount'], size=batch_size)  # in [1, inf)
-            middle_goal_idxs = np.minimum(idxs + offsets, final_state_idxs)
+            traj_goal_idxs = np.minimum(idxs + offsets, final_state_idxs)
         else:
             # Uniform sampling.
             distances = np.random.rand(batch_size)  # in [0, 1)
-            middle_goal_idxs = np.round(
+            traj_goal_idxs = np.round(
                 (np.minimum(idxs + 1, final_state_idxs) * distances + final_state_idxs * (1 - distances))
             ).astype(int)
-        goal_idxs = np.where(
-            np.random.rand(batch_size) < p_trajgoal / (1.0 - p_curgoal + 1e-6), middle_goal_idxs, random_goal_idxs
-        )
+        if p_curgoal == 1.0:
+            goal_idxs = idxs
+        else:
+            goal_idxs = np.where(
+                np.random.rand(batch_size) < p_trajgoal / (1.0 - p_curgoal), traj_goal_idxs, random_goal_idxs
+            )
 
-        # Goals at the current state.
-        goal_idxs = np.where(np.random.rand(batch_size) < p_curgoal, idxs, goal_idxs)
+            # Goals at the current state.
+            goal_idxs = np.where(np.random.rand(batch_size) < p_curgoal, idxs, goal_idxs)
 
         return goal_idxs
 
@@ -315,7 +318,7 @@ class HGCDataset(GCDataset):
     - subgoal_steps: Subgoal steps (i.e., the number of steps to reach the low-level goal).
     """
 
-    def sample(self, batch_size: int, idxs=None, evaluation=False):
+    def sample(self, batch_size, idxs=None, evaluation=False):
         """Sample a batch of transitions with goals.
 
         This method samples a batch of transitions with goals from the dataset. The goals are stored in the keys

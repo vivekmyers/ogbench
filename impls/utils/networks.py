@@ -353,7 +353,7 @@ class GCBilinearValue(nn.Module):
     state_encoder: nn.Module = None
     goal_encoder: nn.Module = None
 
-    def setup(self) -> None:
+    def setup(self):
         mlp_module = MLP
         if self.ensemble:
             mlp_module = ensemblize(mlp_module, 2)
@@ -424,7 +424,7 @@ class GCMRNValue(nn.Module):
     value_exp: bool = False
     encoder: nn.Module = None
 
-    def setup(self) -> None:
+    def setup(self):
         self.phi = MLP((*self.hidden_dims, self.latent_dim), activate_final=False, layer_norm=self.layer_norm)
 
     def __call__(self, observations, goals, is_phi=False, info=False):
@@ -484,7 +484,7 @@ class GCIQEValue(nn.Module):
     value_exp: bool = False
     encoder: nn.Module = None
 
-    def setup(self) -> None:
+    def setup(self):
         self.phi = MLP((*self.hidden_dims, self.latent_dim), activate_final=False, layer_norm=self.layer_norm)
         self.alpha = Param()
 

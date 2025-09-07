@@ -193,7 +193,7 @@ class GCIQLAgent(flax.struct.PyTreeNode):
 
         Args:
             seed: Random seed.
-            ex_observations: Example observations.
+            ex_observations: Example batch of observations.
             ex_actions: Example batch of actions. In discrete-action MDPs, this should contain the maximum action value.
             config: Configuration dictionary.
         """

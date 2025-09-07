@@ -1,5 +1,6 @@
 import os
 
+import gymnasium
 import mujoco
 import numpy as np
 from gymnasium import utils
@@ -19,6 +20,8 @@ class PointEnv(MujocoEnv, utils.EzPickle):
         'render_modes': ['human', 'rgb_array', 'depth_array'],
         'render_fps': 10,
     }
+    if gymnasium.__version__ >= '1.1.0':
+        metadata['render_modes'] += ['rgbd_tuple']
 
     def __init__(
         self,

@@ -138,6 +138,9 @@ class SceneEnv(ManipSpaceEnv):
             ),
         ]
 
+        if self._reward_task_id == 0:
+            self._reward_task_id = 2  # Default task.
+
     def add_objects(self, arena_mjcf):
         # Add objects to scene.
         cube_mjcf = mjcf.from_path((self._desc_dir / 'cube.xml').as_posix())
@@ -305,7 +308,9 @@ class SceneEnv(ManipSpaceEnv):
                 self.step(self.action_space.sample())
 
             # Save the goal observation.
-            self._cur_goal_ob = self.compute_observation()
+            self._cur_goal_ob = (
+                self.compute_oracle_observation() if self._use_oracle_rep else self.compute_observation()
+            )
             if self._render_goal:
                 self._cur_goal_rendered = self.render()
             else:
@@ -477,6 +482,24 @@ class SceneEnv(ManipSpaceEnv):
         self._prev_button_states = self._cur_button_states.copy()
         super().pre_step()
 
+    def _compute_successes(self):
+        """Compute object successes."""
+        cube_successes = []
+        for i in range(self._num_cubes):
+            obj_pos = self._data.joint(f'object_joint_{i}').qpos[:3]
+            tar_pos = self._data.mocap_pos[self._cube_target_mocap_ids[i]]
+            if np.linalg.norm(obj_pos - tar_pos) <= 0.04:
+                cube_successes.append(True)
+            else:
+                cube_successes.append(False)
+        button_successes = [
+            (self._cur_button_states[i] == self._target_button_states[i]) for i in range(self._num_buttons)
+        ]
+        drawer_success = np.abs(self._data.joint('drawer_slide').qpos[0] - self._target_drawer_pos) <= 0.04
+        window_success = np.abs(self._data.joint('window_slide').qpos[0] - self._target_window_pos) <= 0.04
+
+        return cube_successes, button_successes, drawer_success, window_success
+
     def post_step(self):
         # Check numerical stability.
         if self._mode == 'task':
@@ -517,20 +540,7 @@ class SceneEnv(ManipSpaceEnv):
         self._apply_button_states()
 
         # Evaluate successes.
-        cube_successes = []
-        for i in range(self._num_cubes):
-            obj_pos = self._data.joint(f'object_joint_{i}').qpos[:3]
-            tar_pos = self._data.mocap_pos[self._cube_target_mocap_ids[i]]
-            if np.linalg.norm(obj_pos - tar_pos) <= 0.04:
-                cube_successes.append(True)
-            else:
-                cube_successes.append(False)
-        button_successes = [
-            (self._cur_button_states[i] == self._target_button_states[i]) for i in range(self._num_buttons)
-        ]
-        drawer_success = np.abs(self._data.joint('drawer_slide').qpos[0] - self._target_drawer_pos) <= 0.04
-        window_success = np.abs(self._data.joint('window_slide').qpos[0] - self._target_window_pos) <= 0.04
-
+        cube_successes, button_successes, drawer_success, window_success = self._compute_successes()
         if self._mode == 'data_collection':
             self._success = {
                 'cube': cube_successes[self._target_block],
@@ -666,3 +676,34 @@ class SceneEnv(ManipSpaceEnv):
             )
 
             return np.concatenate(ob)
+
+    def compute_oracle_observation(self):
+        """Return the oracle goal representation of the current state."""
+        xyz_center = np.array([0.425, 0.0, 0.0])
+        xyz_scaler = 10.0
+        drawer_scaler = 18.0
+        window_scaler = 15.0
+
+        ob_info = self.compute_ob_info()
+        ob = []
+        for i in range(self._num_cubes):
+            ob.append((ob_info[f'privileged/block_{i}_pos'] - xyz_center) * xyz_scaler)
+        ob.append(self._cur_button_states.astype(np.float64))
+        ob.extend(
+            [
+                ob_info['privileged/drawer_pos'] * drawer_scaler,
+                ob_info['privileged/window_pos'] * window_scaler,
+            ]
+        )
+
+        return np.concatenate(ob)
+
+    def compute_reward(self, ob, action):
+        if self._reward_task_id is None:
+            return super().compute_reward(ob, action)
+
+        # Compute the reward based on the task.
+        cube_successes, button_successes, drawer_success, window_success = self._compute_successes()
+        successes = cube_successes + button_successes + [drawer_success, window_success]
+        reward = float(sum(successes) - len(successes))
+        return reward

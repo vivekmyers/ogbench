@@ -1,6 +1,7 @@
 import tempfile
 import xml.etree.ElementTree as ET
 
+import mujoco
 import numpy as np
 from gymnasium.spaces import Box
 
@@ -41,6 +42,8 @@ def make_maze_env(loco_env_type, maze_env_type, *args, **kwargs):
             terminate_at_goal=True,
             ob_type='states',
             add_noise_to_goal=True,
+            reward_task_id=None,
+            use_oracle_rep=False,
             *args,
             **kwargs,
         ):
@@ -53,6 +56,10 @@ def make_maze_env(loco_env_type, maze_env_type, *args, **kwargs):
                 terminate_at_goal: Whether to terminate the episode when the goal is reached.
                 ob_type: Observation type. Either 'states' or 'pixels'.
                 add_noise_to_goal: Whether to add noise to the goal position.
+                reward_task_id: Task ID for single-task RL. If this is not None, the environment operates in a
+                    single-task mode with the specified task ID. The task ID must be either a valid task ID or 0, where
+                    0 means using the default task.
+                use_oracle_rep: Whether to use oracle goal representations.
                 *args: Additional arguments to pass to the parent locomotion environment.
                 **kwargs: Additional keyword arguments to pass to the parent locomotion environment.
             """
@@ -62,6 +69,8 @@ def make_maze_env(loco_env_type, maze_env_type, *args, **kwargs):
             self._terminate_at_goal = terminate_at_goal
             self._ob_type = ob_type
             self._add_noise_to_goal = add_noise_to_goal
+            self._reward_task_id = reward_task_id
+            self._use_oracle_rep = use_oracle_rep
             assert ob_type in ['states', 'pixels']
 
             # Define constants.
@@ -158,6 +167,18 @@ def make_maze_env(loco_env_type, maze_env_type, *args, **kwargs):
 
             super().__init__(xml_file=maze_xml_file, *args, **kwargs)
 
+            # Make custom camera.
+            if self.camera_id is None and self.camera_name is None:
+                # Use a custom default view.
+                camera = mujoco.MjvCamera()
+                camera.lookat[0] = 2 * (self.maze_map.shape[1] - 3)
+                camera.lookat[1] = 2 * (self.maze_map.shape[0] - 3)
+                camera.distance = 5 * (self.maze_map.shape[1] - 2)
+                camera.elevation = -90
+                self.custom_camera = camera
+            else:
+                self.custom_camera = self.camera_id or self.camera_name
+
             # Set task goals.
             self.task_infos = []
             self.cur_task_id = None
@@ -166,6 +187,7 @@ def make_maze_env(loco_env_type, maze_env_type, *args, **kwargs):
             self.num_tasks = len(self.task_infos)
             self.cur_goal_xy = np.zeros(2)
 
+            self.custom_renderer = None
             if self._ob_type == 'pixels':
                 self.observation_space = Box(low=0, high=255, shape=(64, 64, 3), dtype=np.uint8)
 
@@ -184,17 +206,10 @@ def make_maze_env(loco_env_type, maze_env_type, *args, **kwargs):
                         r = int(x / tex_height * (max_value - min_value) + min_value)
                         g = int(y / tex_width * (max_value - min_value) + min_value)
                         tex_rgb[x, y, :] = [r, g, 128]
+                self.initialize_renderer()
             else:
                 ex_ob = self.get_ob()
                 self.observation_space = Box(low=-np.inf, high=np.inf, shape=ex_ob.shape, dtype=ex_ob.dtype)
-
-            # Set camera.
-            self.reset()
-            self.render()
-            self.mujoco_renderer.viewer.cam.lookat[0] = 2 * (self.maze_map.shape[1] - 3)
-            self.mujoco_renderer.viewer.cam.lookat[1] = 2 * (self.maze_map.shape[0] - 3)
-            self.mujoco_renderer.viewer.cam.distance = 5 * (self.maze_map.shape[1] - 2)
-            self.mujoco_renderer.viewer.cam.elevation = -90
 
         def update_tree(self, tree):
             """Update the XML tree to include the maze."""
@@ -337,11 +352,28 @@ def make_maze_env(loco_env_type, maze_env_type, *args, **kwargs):
                     )
                 )
 
+            if self._reward_task_id == 0:
+                self._reward_task_id = 1  # Default task.
+
+        def initialize_renderer(self):
+            # Make custom renderer.
+            self.custom_renderer = mujoco.Renderer(
+                self.model,
+                width=self.width,
+                height=self.height,
+            )
+            self.render()
+
         def reset(self, options=None, *args, **kwargs):
             if options is None:
                 options = {}
             # Set the task goal.
-            if 'task_id' in options:
+            if self._reward_task_id is not None:
+                # Use the pre-defined task.
+                assert 1 <= self._reward_task_id <= self.num_tasks, f'Task ID must be in [1, {self.num_tasks}].'
+                self.cur_task_id = self._reward_task_id
+                self.cur_task_info = self.task_infos[self.cur_task_id - 1]
+            elif 'task_id' in options:
                 # Use the pre-defined task.
                 assert 1 <= options['task_id'] <= self.num_tasks, f'Task ID must be in [1, {self.num_tasks}].'
                 self.cur_task_id = options['task_id']
@@ -377,7 +409,7 @@ def make_maze_env(loco_env_type, maze_env_type, *args, **kwargs):
             # Save the goal observation.
             self.set_goal(goal_xy=goal_xy)
             self.set_xy(goal_xy)
-            goal_ob = self.get_ob()
+            goal_ob = self.get_oracle_rep() if self._use_oracle_rep else self.get_ob()
             if render_goal:
                 goal_rendered = self.render()
 
@@ -416,7 +448,17 @@ def make_maze_env(loco_env_type, maze_env_type, *args, **kwargs):
                 info['success'] = 0.0
                 reward = 0.0
 
+            # If the environment is in the single-task mode, modify the reward.
+            if self._reward_task_id is not None:
+                reward = reward - 1.0  # -1 (failure) or 0 (success).
+
             return ob, reward, terminated, truncated, info
+
+        def render(self):
+            if self.custom_renderer is None:
+                self.initialize_renderer()
+            self.custom_renderer.update_scene(self.data, camera=self.custom_camera)
+            return self.custom_renderer.render()
 
         def get_ob(self, ob_type=None):
             ob_type = self._ob_type if ob_type is None else ob_type
@@ -425,6 +467,10 @@ def make_maze_env(loco_env_type, maze_env_type, *args, **kwargs):
             else:
                 frame = self.render()
                 return frame
+
+        def get_oracle_rep(self):
+            """Return the oracle goal representation (i.e., the goal position)."""
+            return np.array(self.cur_goal_xy)
 
         def set_goal(self, goal_ij=None, goal_xy=None):
             """Set the goal position and update the target object."""
@@ -559,11 +605,19 @@ def make_maze_env(loco_env_type, maze_env_type, *args, **kwargs):
                     )
                 )
 
+            if self._reward_task_id == 0:
+                self._reward_task_id = 4  # Default task.
+
         def reset(self, options=None, *args, **kwargs):
             if options is None:
                 options = {}
             # Set the task goal.
-            if 'task_id' in options:
+            if self._reward_task_id is not None:
+                # Use the pre-defined task.
+                assert 1 <= self._reward_task_id <= self.num_tasks, f'Task ID must be in [1, {self.num_tasks}].'
+                self.cur_task_id = self._reward_task_id
+                self.cur_task_info = self.task_infos[self.cur_task_id - 1]
+            elif 'task_id' in options:
                 # Use the pre-defined task.
                 assert 1 <= options['task_id'] <= self.num_tasks, f'Task ID must be in [1, {self.num_tasks}].'
                 self.cur_task_id = options['task_id']
@@ -599,7 +653,7 @@ def make_maze_env(loco_env_type, maze_env_type, *args, **kwargs):
             # Save the goal observation.
             self.set_goal(goal_xy=goal_xy)
             self.set_agent_ball_xy(goal_xy, goal_xy)
-            goal_ob = self.get_ob()
+            goal_ob = self.get_oracle_rep() if self._use_oracle_rep else self.get_ob()
             if render_goal:
                 goal_rendered = self.render()
 
@@ -626,6 +680,10 @@ def make_maze_env(loco_env_type, maze_env_type, *args, **kwargs):
             else:
                 info['success'] = 0.0
                 reward = 0.0
+
+            # If the environment is in the single-task mode, modify the reward.
+            if self._reward_task_id is not None:
+                reward = reward - 1.0  # -1 (failure) or 0 (success).
 
             return ob, reward, terminated, truncated, info
 

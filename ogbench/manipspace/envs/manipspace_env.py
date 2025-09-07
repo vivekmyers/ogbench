@@ -28,6 +28,9 @@ class ManipSpaceEnv(CustomMuJoCoEnv):
         terminate_at_goal=True,
         mode='task',
         visualize_info=True,
+        pixel_transparent_arm=True,
+        reward_task_id=None,
+        use_oracle_rep=False,
         **kwargs,
     ):
         """Initialize the ManipSpace environment.
@@ -41,6 +44,11 @@ class ManipSpaceEnv(CustomMuJoCoEnv):
                 for training and evaluation. In 'data_collection' mode, the environment is used for collecting offline
                 data.
             visualize_info: Whether to visualize the task information (e.g., success status).
+            pixel_transparent_arm: Whether to make the arm transparent in pixel-based observations.
+            reward_task_id: Task ID for single-task RL. If this is not None, the environment operates in a single-task
+            mode with the specified task ID. The task ID must be either a valid task ID or 0, where 0 means using the
+            default task.
+            use_oracle_rep: Whether to use oracle goal representations.
             **kwargs: Additional keyword arguments.
         """
         super().__init__(
@@ -60,14 +68,18 @@ class ManipSpaceEnv(CustomMuJoCoEnv):
         self._colors = dict(
             red=np.array([0.96, 0.26, 0.33, 1.0]),
             orange=np.array([1.0, 0.69, 0.21, 1.0]),
+            yellow=np.array([0.76, 0.96, 0.04, 1.0]),
             green=np.array([0.06, 0.74, 0.21, 1.0]),
             blue=np.array([0.35, 0.55, 0.91, 1.0]),
             purple=np.array([0.61, 0.28, 0.82, 1.0]),
+            magenta=np.array([0.82, 0.28, 0.61, 1.0]),
             lightred=np.array([0.99, 0.85, 0.86, 1.0]),
             lightorange=np.array([1.0, 0.94, 0.84, 1.0]),
+            lightyellow=np.array([0.95, 0.99, 0.8, 1.0]),
             lightgreen=np.array([0.77, 0.95, 0.81, 1.0]),
             lightblue=np.array([0.86, 0.9, 0.98, 1.0]),
             lightpurple=np.array([0.91, 0.84, 0.96, 1.0]),
+            lightmagenta=np.array([0.96, 0.84, 0.91, 1.0]),
             white=np.array([0.9, 0.9, 0.9, 1.0]),
             lightgray=np.array([0.7, 0.7, 0.7, 1.0]),
             gray=np.array([0.5, 0.5, 0.5, 1.0]),
@@ -79,6 +91,9 @@ class ManipSpaceEnv(CustomMuJoCoEnv):
         self._terminate_at_goal = terminate_at_goal
         self._mode = mode
         self._visualize_info = visualize_info
+        self._pixel_transparent_arm = pixel_transparent_arm
+        self._reward_task_id = reward_task_id
+        self._use_oracle_rep = use_oracle_rep
 
         assert ob_type in ['states', 'pixels']
 
@@ -189,17 +204,18 @@ class ManipSpaceEnv(CustomMuJoCoEnv):
 
         if self._ob_type == 'pixels':
             # Adjust colors for pixel-based tasks.
-            arena_mjcf.find('material', 'ur5e/robotiq/metal').rgba[3] = 0.1
-            arena_mjcf.find('material', 'ur5e/robotiq/silicone').rgba[3] = 0.1
-            arena_mjcf.find('material', 'ur5e/robotiq/gray').rgba[3] = 0.1
             arena_mjcf.find('material', 'ur5e/robotiq/black').rgba = self._colors['purple']
-            arena_mjcf.find('material', 'ur5e/robotiq/black').rgba[3] = 0.1
             arena_mjcf.find('material', 'ur5e/robotiq/pad_gray').rgba = self._colors['purple']
-            arena_mjcf.find('material', 'ur5e/robotiq/pad_gray').rgba[3] = 0.5
-            arena_mjcf.find('material', 'ur5e/black').rgba[3] = 0.1
-            arena_mjcf.find('material', 'ur5e/jointgray').rgba[3] = 0.1
-            arena_mjcf.find('material', 'ur5e/linkgray').rgba[3] = 0.1
-            arena_mjcf.find('material', 'ur5e/lightblue').rgba[3] = 0.1
+            if self._pixel_transparent_arm:
+                arena_mjcf.find('material', 'ur5e/robotiq/metal').rgba[3] = 0.1
+                arena_mjcf.find('material', 'ur5e/robotiq/silicone').rgba[3] = 0.1
+                arena_mjcf.find('material', 'ur5e/robotiq/gray').rgba[3] = 0.1
+                arena_mjcf.find('material', 'ur5e/robotiq/black').rgba[3] = 0.1
+                arena_mjcf.find('material', 'ur5e/robotiq/pad_gray').rgba[3] = 0.5
+                arena_mjcf.find('material', 'ur5e/black').rgba[3] = 0.1
+                arena_mjcf.find('material', 'ur5e/jointgray').rgba[3] = 0.1
+                arena_mjcf.find('material', 'ur5e/linkgray').rgba[3] = 0.1
+                arena_mjcf.find('material', 'ur5e/lightblue').rgba[3] = 0.1
 
         # Add bounding boxes to visualize the workspace and object sampling bounds.
         mjcf_utils.add_bounding_box_site(
@@ -264,7 +280,12 @@ class ManipSpaceEnv(CustomMuJoCoEnv):
             if options is None:
                 options = {}
 
-            if 'task_id' in options:
+            if self._reward_task_id is not None:
+                # Use the pre-defined task.
+                assert 1 <= self._reward_task_id <= self.num_tasks, f'Task ID must be in [1, {self.num_tasks}].'
+                self.cur_task_id = self._reward_task_id
+                self.cur_task_info = self.task_infos[self.cur_task_id - 1]
+            elif 'task_id' in options:
                 # Use the pre-defined task.
                 assert 1 <= options['task_id'] <= self.num_tasks, f'Task ID must be in [1, {self.num_tasks}].'
                 self.cur_task_id = options['task_id']
