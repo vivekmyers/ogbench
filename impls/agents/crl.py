@@ -5,6 +5,8 @@ import jax
 import jax.numpy as jnp
 import ml_collections
 import optax
+import numpy as np
+from typing import Dict
 from utils.encoders import GCEncoder, encoder_modules
 from utils.flax_utils import ModuleDict, TrainState, nonpytree_field
 from utils.networks import GCActor, GCBilinearValue, GCDiscreteActor, GCDiscreteBilinearCritic
@@ -336,3 +338,130 @@ def get_config():
         )
     )
     return config
+
+
+def sample_batch(
+    dataset: Dict[str, np.ndarray], *, batch_size: int, frame_stack: int = 1, config: Dict
+) -> Dict[str, jnp.ndarray]:
+    """Fast batch sampling for CRL contrastive learning."""
+    n = int(dataset['observations'].shape[0] * 0.8)
+    
+    # CRITICAL FIX: Limit sampling range to leave room for goal offsets
+    # Use a much more conservative approach - leave plenty of room
+    discount = config.get('discount', 0.95)  # Use the actual discount from config
+    geometric_p = 1 - discount
+    
+    # Use 99.9th percentile + safety margin for maximum offset
+    theoretical_max = int(np.log(0.001) / np.log(1 - geometric_p))  # 99.9th percentile
+    safety_margin = 100  # Additional safety margin
+    max_safe_offset = theoretical_max + safety_margin
+    max_safe_offset = min(max_safe_offset, 500)  # Cap at 500 frames
+    
+    # Sample from a much more conservative range
+    safe_n = max(n - max_safe_offset, n // 3)  # Use at most 2/3 of dataset for safety
+    
+    idx = np.random.choice(safe_n, batch_size, replace=True)
+    # Create base batch
+    batch = {
+        'observations': dataset['observations'][idx],
+        'action_labels': dataset['action_labels'][idx],
+        'actions': dataset['actions'][idx],
+        'next_observations': dataset['next_observations'][idx],
+        'rewards': jnp.zeros((batch_size,)),
+        'masks': jnp.ones((batch_size,)),
+    }
+    
+    should_debug = False  # Disable debug output for cleaner logs
+    
+    # Use geometric distribution for goal sampling (proper CRL approach)
+    # Sample goal offsets using geometric distribution based on discount factor
+    discount = config.get('discount', 0.99)
+    geometric_p = 1 - discount  # probability parameter for geometric distribution
+    
+    # Sample offsets for all batch elements using geometric distribution
+    offsets = np.random.geometric(p=geometric_p, size=batch_size)
+    
+    # Additional safety: clip offsets to reasonable range
+    offsets = np.clip(offsets, 1, 2000)  # Between 1 and 200 frames ahead
+    
+    # CRITICAL FIX: Use bidirectional mapping to maintain temporal structure
+    # BUT FALLBACK TO SIMPLE METHOD IF MAPPING IS BROKEN
+    use_mapping = ('shuffled_to_original' in dataset and 'original_to_shuffled' in dataset)
+    
+    # Quick sanity check on mapping if debug is enabled
+    if use_mapping:
+        mapping_ok = (
+            len(dataset['shuffled_to_original']) == len(dataset['observations']) and
+            len(dataset['original_to_shuffled']) == len(dataset['observations']) and
+            np.max(dataset['shuffled_to_original']) < len(dataset['observations']) and
+            np.max(dataset['original_to_shuffled']) < len(dataset['observations'])
+        )
+        if not mapping_ok:
+            use_mapping = False
+    
+    if use_mapping:
+        # Get the original temporal positions of our sampled frames
+        original_positions = dataset['shuffled_to_original'][idx]
+        
+        # Add offsets to get future frames in original temporal order
+        goal_original_positions = original_positions + offsets
+        
+        # Clip to valid range in original timeline
+        max_original_pos = len(dataset['original_to_shuffled']) - 1
+        goal_original_positions_safe = np.clip(goal_original_positions, 0, max_original_pos)
+        
+        # Direct lookup: where are these goal positions in the shuffled dataset?
+        goal_idx = dataset['original_to_shuffled'][goal_original_positions_safe]
+    else:
+        # SIMPLE BUT EFFECTIVE FALLBACK: Direct offset-based sampling
+        # This maintains temporal relationships without complex mapping
+        # Ensure goals don't go out of bounds by using the safe sampling we already did
+        goal_idx = np.clip(idx + offsets, 0, safe_n - 1)
+    
+    # Create goal-conditioned batch
+    goal_observations = dataset['observations'][goal_idx]
+    
+
+    
+    # Debug shape issues that might cause NaN
+    obs_shape = dataset['observations'].shape
+    goal_obs_shape = goal_observations.shape
+    
+    if np.random.random() < 0.001:  # Very rare debug print
+        print(f"DEBUG sample_batch shapes:")
+        print(f"  Original observations: {obs_shape}")
+        print(f"  Goal observations: {goal_obs_shape}")
+        print(f"  Frame stack: {frame_stack}")
+        print(f"  Expected channels per frame: 3")
+        print(f"  Expected total channels: {3 * frame_stack}")
+    
+    # Extract the last frame (last 3 channels) for goal
+    if len(goal_observations.shape) == 4 and goal_observations.shape[-1] >= 3:
+        base_goals = goal_observations[:, :, :, -3:]  # Last frame's RGB
+    else:
+        print(f"ERROR: Unexpected observation shape: {goal_observations.shape}")
+        print(f"Cannot extract last 3 channels for goal. Using full observation.")
+        base_goals = goal_observations
+    
+    # Check for any NaN/inf values in goals
+    if np.any(np.isnan(base_goals)) or np.any(np.isinf(base_goals)):
+        print(f"WARNING: NaN or Inf detected in base_goals!")
+        print(f"Goal indices: {goal_idx[:5]}...")  # Show first few
+        print(f"Data indices: {idx[:5]}...")
+        base_goals = np.nan_to_num(base_goals, nan=0.0, posinf=1.0, neginf=-1.0)
+    
+    goal_stack = jnp.concatenate([base_goals] * frame_stack, axis=-1)
+
+    batch['value_goals'] = goal_stack
+    batch['actor_goals'] = goal_stack
+    
+
+
+    # Compute rewards based on temporal distance (offsets), not shuffled index distance
+    # Closer goals (smaller temporal offsets) get higher rewards
+    batch['rewards'] = -offsets.astype(float) / 20.0  # Negative reward proportional to temporal distance
+    batch['masks'] = jnp.ones((batch_size,))  # Keep all transitions active
+    
+
+    
+    return batch

@@ -135,6 +135,7 @@ class TrainState(flax.struct.PyTreeNode):
         It additionally computes the gradient statistics and adds them to the dictionary.
         """
         grads, info = jax.grad(loss_fn, has_aux=True)(self.params)
+        grads = jax.tree_util.tree_map(lambda x: jnp.clip(x, -1.0, 1.0), grads)  # Clip to prevent instability
 
         grad_max = jax.tree_util.tree_map(jnp.max, grads)
         grad_min = jax.tree_util.tree_map(jnp.min, grads)

@@ -169,7 +169,8 @@ class GCActor(nn.Module):
         self.actor_net = MLP(self.hidden_dims, activate_final=True)
         self.mean_net = nn.Dense(self.action_dim, kernel_init=default_init(self.final_fc_init_scale))
         if self.state_dependent_std:
-            self.log_std_net = nn.Dense(self.action_dim, kernel_init=default_init(self.final_fc_init_scale))
+            # Initialize with smaller standard deviations for better BC learning
+            self.log_std_net = nn.Dense(self.action_dim, kernel_init=default_init(self.final_fc_init_scale * 0.1))
         else:
             if not self.const_std:
                 self.log_stds = self.param('log_stds', nn.initializers.zeros, (self.action_dim,))
@@ -228,12 +229,22 @@ class GCDiscreteActor(nn.Module):
 
     hidden_dims: Sequence[int]
     action_dim: int
+    num_bins_per_dim: int = 32
+    num_dims: int = 3
     final_fc_init_scale: float = 1e-2
     gc_encoder: nn.Module = None
+    multi_discrete: bool = False
 
     def setup(self):
         self.actor_net = MLP(self.hidden_dims, activate_final=True)
-        self.logit_net = nn.Dense(self.action_dim, kernel_init=default_init(self.final_fc_init_scale))
+        
+        if self.multi_discrete:
+            # For multi-discrete: output 96 logits (32 * 3)
+            total_logits = self.num_bins_per_dim * self.num_dims
+            self.logit_net = nn.Dense(total_logits, kernel_init=default_init(self.final_fc_init_scale))
+        else:
+            # For single discrete: output action_dim logits
+            self.logit_net = nn.Dense(self.action_dim, kernel_init=default_init(self.final_fc_init_scale))
 
     def __call__(
         self,
@@ -260,10 +271,78 @@ class GCDiscreteActor(nn.Module):
         outputs = self.actor_net(inputs)
 
         logits = self.logit_net(outputs)
+        
+        # Clip logits to prevent extreme values that cause numerical instability
+        logits = jnp.clip(logits, -10.0, 10.0)
+        
+        if self.multi_discrete:
+            # Reshape logits to (batch_size, num_dims, num_bins_per_dim)
+            logits = logits.reshape(-1, self.num_dims, self.num_bins_per_dim)
+            
+            # Create independent categorical distributions for each dimension
+            distributions = []
+            for i in range(self.num_dims):
+                dist = distrax.Categorical(logits=logits[:, i, :] / jnp.maximum(1e-6, temperature))
+                distributions.append(dist)
+            
+            # Return a custom distribution that handles multi-dimensional discrete actions
+            return MultiDiscreteDistribution(distributions)
+        else:
+            # Single discrete distribution
+            distribution = distrax.Categorical(logits=logits / jnp.maximum(1e-6, temperature))
+            return distribution
 
-        distribution = distrax.Categorical(logits=logits / jnp.maximum(1e-6, temperature))
 
-        return distribution
+class MultiDiscreteDistribution:
+    """Custom distribution for multi-dimensional discrete actions."""
+    
+    def __init__(self, distributions):
+        self.distributions = distributions
+        self.num_dims = len(distributions)
+    
+    def sample(self, seed=None):
+        """Sample actions from each dimension independently."""
+        if seed is not None:
+            seeds = jax.random.split(seed, self.num_dims)
+        else:
+            seeds = [None] * self.num_dims
+        
+        samples = []
+        for i, dist in enumerate(self.distributions):
+            sample = dist.sample(seed=seeds[i])
+            samples.append(sample)
+        
+        # Stack to get shape (batch_size, num_dims)
+        return jnp.stack(samples, axis=-1)
+    
+    def mode(self):
+        """Get the mode (most likely action) for each dimension."""
+        modes = []
+        for dist in self.distributions:
+            mode = dist.mode()
+            modes.append(mode)
+        
+        # Stack to get shape (batch_size, num_dims)
+        return jnp.stack(modes, axis=-1)
+    
+    def log_prob(self, actions):
+        """Compute log probability of actions.
+        
+        Args:
+            actions: Actions of shape (batch_size, num_dims)
+        """
+        log_probs = []
+        for i, dist in enumerate(self.distributions):
+            log_prob = dist.log_prob(actions[:, i])
+            log_probs.append(log_prob)
+        
+        # Sum log probabilities across dimensions
+        return jnp.sum(jnp.stack(log_probs, axis=-1), axis=-1)
+    
+    @property
+    def logits(self):
+        """Get the logits for all dimensions."""
+        return jnp.stack([dist.logits for dist in self.distributions], axis=1)
 
 
 class GCValue(nn.Module):
@@ -589,4 +668,3 @@ class DiscreteStateActionRepresentation(StateRepresentation):
             actions = jnp.eye(self.action_dim)[actions]
 
         return super().__call__(observations, actions, info)
-
