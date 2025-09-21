@@ -6,6 +6,6 @@ dist/
 .DS_Store
 .idea/
 .ruff_cache/
-
 # Wandb logs and artifacts
 impls/wandb/
+.wandb/
