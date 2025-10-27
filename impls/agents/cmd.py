@@ -65,7 +65,7 @@ class CMDAgent(flax.struct.PyTreeNode):
 
         I = jnp.eye(batch_size)
         contrastive_loss = jax.vmap(
-            lambda _logits: optax.sigmoid_binary_cross_entropy(logits=_logits, labels=I),
+            lambda _logits: optax.softmax_cross_entropy(logits=_logits.T, labels=I),
         )(logits)
         contrastive_loss = jnp.mean(contrastive_loss)
 
