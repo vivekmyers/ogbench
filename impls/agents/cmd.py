@@ -9,10 +9,10 @@ import optax
 from utils.encoders import GCEncoder, encoder_modules
 from utils.flax_utils import ModuleDict, TrainState, nonpytree_field
 from utils.networks import (
+    DiscreteStateActionRepresentation,
     GCActor,
     GCDiscreteActor,
     StateRepresentation,
-    DiscreteStateActionRepresentation,
 )
 
 
@@ -24,7 +24,7 @@ class CMDAgent(flax.struct.PyTreeNode):
     config: Any = nonpytree_field()
 
     def mrn_distance(self, x, y):
-        K = self.config["mrn_components"]
+        K = self.config['mrn_components']
 
         x, y = jnp.broadcast_arrays(x, y)
 
@@ -46,14 +46,12 @@ class CMDAgent(flax.struct.PyTreeNode):
         return jnp.stack(dists, axis=-1).mean(axis=-1)
 
     def contrastive_loss(self, batch, grad_params):
-        batch_size = batch["observations"].shape[0]
+        batch_size = batch['observations'].shape[0]
 
-        phi = self.network.select("critic")(
-            batch["observations"], batch["actions"], info=True, params=grad_params
-        )
-        actions_roll = jnp.roll(batch["actions"], shift=1, axis=0)
-        psi = self.network.select("critic")(
-            batch["value_goals"],
+        phi = self.network.select('critic')(batch['observations'], batch['actions'], info=True, params=grad_params)
+        actions_roll = jnp.roll(batch['actions'], shift=1, axis=0)
+        psi = self.network.select('critic')(
+            batch['value_goals'],
             actions_roll,
             info=True,
             params=grad_params,
@@ -67,7 +65,7 @@ class CMDAgent(flax.struct.PyTreeNode):
 
         I = jnp.eye(batch_size)
         contrastive_loss = jax.vmap(
-            lambda _logits: optax.sigmoid_binary_cross_entropy(logits=_logits, labels=I),
+            lambda _logits: optax.softmax_cross_entropy(logits=_logits.T, labels=I),
         )(logits)
         contrastive_loss = jnp.mean(contrastive_loss)
 
@@ -77,50 +75,50 @@ class CMDAgent(flax.struct.PyTreeNode):
         logits_neg = jnp.sum(logits * (1 - I)) / jnp.sum(1 - I)
 
         return contrastive_loss, {
-            "contrastive_loss": contrastive_loss,
-            "binary_accuracy": jnp.mean((logits > 0) == I),
-            "categorical_accuracy": jnp.mean(correct),
-            "logits_pos": logits_pos,
-            "logits_neg": logits_neg,
-            "logits": logits.mean(),
-            "dist": dist.mean(),
+            'contrastive_loss': contrastive_loss,
+            'binary_accuracy': jnp.mean((logits > 0) == I),
+            'categorical_accuracy': jnp.mean(correct),
+            'logits_pos': logits_pos,
+            'logits_neg': logits_neg,
+            'logits': logits.mean(),
+            'dist': dist.mean(),
         }
 
     def actor_loss(self, batch, grad_params, rng=None):
         # Maximize log Q if actor_log_q is True (which is default).
 
-        dist = self.network.select("actor")(batch["observations"], batch["actor_goals"], params=grad_params)
-        if self.config["const_std"]:
+        dist = self.network.select('actor')(batch['observations'], batch['actor_goals'], params=grad_params)
+        if self.config['const_std']:
             q_actions = jnp.clip(dist.mode(), -1, 1)
         else:
             q_actions = jnp.clip(dist.sample(seed=rng), -1, 1)
 
-        actions_roll = jnp.roll(batch["actions"], shift=1, axis=0)
+        actions_roll = jnp.roll(batch['actions'], shift=1, axis=0)
 
         assert q_actions.shape == actions_roll.shape
 
-        phi = self.network.select("critic")(batch["observations"], q_actions)
-        psi = self.network.select("critic")(batch["actor_goals"], actions_roll)
+        phi = self.network.select('critic')(batch['observations'], q_actions)
+        psi = self.network.select('critic')(batch['actor_goals'], actions_roll)
         q1, q2 = -self.mrn_distance(phi, psi)
         q = jnp.minimum(q1, q2)
 
         # Normalize Q values by the absolute mean to make the loss scale invariant.
         q_loss = -q.mean() / jax.lax.stop_gradient(jnp.abs(q).mean() + 1e-6)
-        log_prob = dist.log_prob(batch["actions"])
+        log_prob = dist.log_prob(batch['actions'])
 
-        bc_loss = -(self.config["alpha"] * log_prob).mean()
+        bc_loss = -(self.config['alpha'] * log_prob).mean()
 
         actor_loss = q_loss + bc_loss
 
         return actor_loss, {
-            "actor_loss": actor_loss,
-            "q_loss": q_loss,
-            "bc_loss": bc_loss,
-            "q_mean": q.mean(),
-            "q_abs_mean": jnp.abs(q).mean(),
-            "bc_log_prob": log_prob.mean(),
-            "mse": jnp.mean((dist.mode() - batch["actions"]) ** 2),
-            "std": jnp.mean(dist.scale_diag),
+            'actor_loss': actor_loss,
+            'q_loss': q_loss,
+            'bc_loss': bc_loss,
+            'q_mean': q.mean(),
+            'q_abs_mean': jnp.abs(q).mean(),
+            'bc_log_prob': log_prob.mean(),
+            'mse': jnp.mean((dist.mode() - batch['actions']) ** 2),
+            'std': jnp.mean(dist.scale_diag),
         }
 
     @jax.jit
@@ -130,12 +128,12 @@ class CMDAgent(flax.struct.PyTreeNode):
 
         critic_loss, critic_info = self.contrastive_loss(batch, grad_params)
         for k, v in critic_info.items():
-            info[f"critic/{k}"] = v
+            info[f'critic/{k}'] = v
 
         rng, actor_rng = jax.random.split(rng)
         actor_loss, actor_info = self.actor_loss(batch, grad_params, actor_rng)
         for k, v in actor_info.items():
-            info[f"actor/{k}"] = v
+            info[f'actor/{k}'] = v
 
         loss = critic_loss + actor_loss
         return loss, info
@@ -159,9 +157,9 @@ class CMDAgent(flax.struct.PyTreeNode):
         seed=None,
         temperature=1.0,
     ):
-        dist = self.network.select("actor")(observations, goals, temperature=temperature)
+        dist = self.network.select('actor')(observations, goals, temperature=temperature)
         actions = dist.sample(seed=seed)
-        if not self.config["discrete"]:
+        if not self.config['discrete']:
             actions = jnp.clip(actions, -1, 1)
         return actions
 
@@ -177,48 +175,48 @@ class CMDAgent(flax.struct.PyTreeNode):
         rng, init_rng = jax.random.split(rng, 2)
 
         ex_goals = ex_observations
-        if config["discrete"]:
+        if config['discrete']:
             action_dim = ex_actions.max() + 1
         else:
             action_dim = ex_actions.shape[-1]
 
         # Define encoders.
         encoders = dict()
-        if config["encoder"] is not None:
-            encoder_module = encoder_modules[config["encoder"]]
-            encoders["actor"] = GCEncoder(concat_encoder=encoder_module())
-            encoders["state"] = encoder_module()
+        if config['encoder'] is not None:
+            encoder_module = encoder_modules[config['encoder']]
+            encoders['actor'] = GCEncoder(concat_encoder=encoder_module())
+            encoders['state'] = encoder_module()
 
-        if config["discrete"]:
+        if config['discrete']:
             critic_def = DiscreteStateActionRepresentation(
-                hidden_dims=config["value_hidden_dims"],
-                latent_dim=config["latent_dim"],
-                layer_norm=config["layer_norm"],
+                hidden_dims=config['value_hidden_dims'],
+                latent_dim=config['latent_dim'],
+                layer_norm=config['layer_norm'],
                 ensemble=True,
                 value_exp=True,
-                state_encoder=encoders.get("state"),
+                state_encoder=encoders.get('state'),
                 action_dim=action_dim,
             )
             actor_def = GCDiscreteActor(
-                hidden_dims=config["actor_hidden_dims"],
+                hidden_dims=config['actor_hidden_dims'],
                 action_dim=action_dim,
-                gc_encoder=encoders.get("actor"),
+                gc_encoder=encoders.get('actor'),
             )
         else:
             critic_def = StateRepresentation(
-                hidden_dims=config["value_hidden_dims"],
-                latent_dim=config["latent_dim"],
-                layer_norm=config["layer_norm"],
+                hidden_dims=config['value_hidden_dims'],
+                latent_dim=config['latent_dim'],
+                layer_norm=config['layer_norm'],
                 ensemble=True,
                 value_exp=True,
-                state_encoder=encoders.get("state"),
+                state_encoder=encoders.get('state'),
             )
             actor_def = GCActor(
-                hidden_dims=config["actor_hidden_dims"],
+                hidden_dims=config['actor_hidden_dims'],
                 action_dim=action_dim,
                 state_dependent_std=False,
-                const_std=config["const_std"],
-                gc_encoder=encoders.get("actor"),
+                const_std=config['const_std'],
+                gc_encoder=encoders.get('actor'),
             )
 
         network_info = dict(
@@ -229,8 +227,8 @@ class CMDAgent(flax.struct.PyTreeNode):
         network_args = {k: v[1] for k, v in network_info.items()}
 
         network_def = ModuleDict(networks)
-        network_tx = optax.adam(learning_rate=config["lr"])
-        network_params = network_def.init(init_rng, **network_args)["params"]
+        network_tx = optax.adam(learning_rate=config['lr'])
+        network_params = network_def.init(init_rng, **network_args)['params']
         network = TrainState.create(network_def, network_params, tx=network_tx)
 
         return cls(rng, network=network, config=flax.core.FrozenDict(**config))
@@ -240,7 +238,7 @@ def get_config():
     config = ml_collections.ConfigDict(
         dict(
             # Agent hyperparameters.
-            agent_name="cmd",  # Agent name.
+            agent_name='cmd',  # Agent name.
             lr=3e-4,  # Learning rate.
             mrn_components=8,  # Number of components in MRN.
             batch_size=1024,  # Batch size.
@@ -250,14 +248,12 @@ def get_config():
             layer_norm=True,  # Whether to use layer normalization.
             discount=0.99,  # Discount factor.
             alpha=1.0,  # Temperature in AWR or BC coefficient in DDPG+BC.
-            encoder=ml_collections.config_dict.placeholder(
-                str
-            ),  # Visual encoder name (None, 'impala_small', etc.).
+            encoder=ml_collections.config_dict.placeholder(str),  # Visual encoder name (None, 'impala_small', etc.).
             actor_log_q=True,  # Whether to maximize log Q (True) or Q itself (False) in the actor loss.
             const_std=True,  # Whether to use constant standard deviation for the actor.
             discrete=False,  # Whether the action space is discrete.
             # Dataset hyperparameters.
-            dataset_class="GCDataset",  # Dataset class name.
+            dataset_class='GCDataset',  # Dataset class name.
             value_p_curgoal=0.0,  # Probability of using the current state as the value goal.
             value_p_trajgoal=1.0,  # Probability of using a future state in the same trajectory as the value goal.
             value_p_randomgoal=0.0,  # Probability of using a random state as the value goal.
