@@ -550,7 +550,7 @@ def main(args: argparse.Namespace) -> None:
     cfg.discrete = False  # Continuous actions (n x 3)
     cfg.actor_loss = "ddpgbc"
     cfg.expectile = 0.7
-    cfg.discount = 0.99
+    cfg.discount = args.discount
     cfg.alpha = 0.5
     cfg.encoder = "impala_large"
     cfg.lr = 3e-4  # Increased LR to help critic learn (was 1e-4)
@@ -779,6 +779,7 @@ if __name__ == "__main__":
     parser.add_argument("--epochs", type=int, default=2, help="Number of epochs to train")
     parser.add_argument("--batch_size", type=int, default=256)
     parser.add_argument("--actor_loss", choices=["awr", "ddpgbc"], default="ddpgbc")
+    parser.add_argument("--discount", type=float, default=0.99)
     parser.add_argument("--project", default="crl_training")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--log_every", type=int, default=1000)
