@@ -4,596 +4,803 @@ import argparse
 import time
 from importlib import import_module
 from pathlib import Path
-from typing import Dict, Sequence
+from typing import Dict, Tuple
 
 import flax.serialization as fxs
+from flax.core import freeze, unfreeze
 import jax
 import jax.numpy as jnp
+from jax import tree_util
+import ml_collections
 import numpy as np
 import wandb
 from tqdm import trange
 
-import distrax
+from utils.datasets import Dataset, GCDataset
+
+# =============================
+# Frame stacking (block-safe)
+# =============================
+def create_spaced_frame_stack(observations: np.ndarray, frame_offsets: Tuple[int, ...] = (0, -5, -10, -20), block_size: int = 400,) -> np.ndarray:
+    T, H, W, C = observations.shape
+    stacked_list = []
+    for t in range(T):
+        block_start = (t // block_size) * block_size
+        frames = []
+        for off in frame_offsets:
+            idx = t + off
+            if idx < block_start:
+                idx = block_start
+            elif idx >= block_start + block_size:
+                idx = block_start + block_size - 1
+            frames.append(observations[idx])
+        stacked_list.append(np.concatenate(frames, axis=-1))
+    return np.array(stacked_list, dtype=np.float32)
+
+def filter_intersection_frames(dataset: Dict[str, np.ndarray], throttle_threshold: float = 0.05, brake_threshold: float = 0.1,
+    window_size: int = 5,
+) -> Dict[str, np.ndarray]:
+    actions = dataset['actions']
+    T = len(actions)
+    terminals = dataset.get('terminals', np.zeros(T, dtype=bool))
+    
+    print(f"\n=== FILTERING DEBUG: BEFORE ===")
+    print(f"Total frames: {T}")
+    print(f"Terminal frames: {np.sum(terminals)}")
+    terminal_locs = np.where(terminals)[0]
+    print(f"Terminal locations (first 10): {terminal_locs[:10]}")
+    if len(terminal_locs) > 0:
+        print(f"Terminal locations (last 10): {terminal_locs[-10:]}")
+    print(f"Trajectory boundaries: {len(terminal_locs)} trajectories")
+    if len(terminal_locs) > 0:
+        traj_lengths = np.diff(np.concatenate([[0], terminal_locs + 1]))
+        print(f"Trajectory lengths (first 10): {traj_lengths[:10]}")
+        print(f"Trajectory lengths (stats): min={traj_lengths.min()}, max={traj_lengths.max()}, mean={traj_lengths.mean():.1f}")
+    
+    throttle = actions[:, 0]
+    brake = actions[:, 2]
+    low_throttle = throttle < throttle_threshold
+    high_brake = brake > brake_threshold
+    intersection_mask = np.zeros(T, dtype=bool)
+    intersection_mask = intersection_mask | high_brake
+    for i in range(T - window_size + 1):
+        if np.all(low_throttle[i:i+window_size]):
+            intersection_mask[i:i+window_size] = True
+    
+    # Count how many terminals would be removed BEFORE preserving them
+    terminals_to_remove = np.sum(intersection_mask[terminal_locs])
+    print(f"Terminals that would be removed (before preservation): {terminals_to_remove}")
+    
+    # CRITICAL: Preserve terminal markers - don't remove terminal frames
+    # If a terminal frame would be removed, keep it and mark the frame before as terminal instead
+    terminal_indices = np.where(terminals)[0]
+    
+    # Mark terminal frames as "must keep" to preserve trajectory boundaries
+    terminals_preserved = 0
+    for term_idx in terminal_indices:
+        if intersection_mask[term_idx]:
+            # Terminal frame would be removed - keep it to preserve boundary
+            intersection_mask[term_idx] = False
+            terminals_preserved += 1
+            # Also ensure the frame before terminal is kept (if it exists)
+            if term_idx > 0:
+                intersection_mask[term_idx - 1] = False
+    
+    keep_mask = ~intersection_mask
+    
+    n_removed = np.sum(intersection_mask)
+    n_kept = np.sum(keep_mask)
+    
+    print(f"\n=== FILTERING DEBUG: AFTER ===")
+    print(f"Intersection filtering: removed {n_removed} frames ({100.0*n_removed/T:.1f}%), kept {n_kept} frames")
+    print(f"Terminals preserved from removal: {terminals_preserved}")
+    filtered = {}
+    for key, arr in dataset.items():
+        if isinstance(arr, np.ndarray) and len(arr) == T:
+            filtered[key] = arr[keep_mask]
+        else:
+            filtered[key] = arr
+    
+    # Ensure terminals are properly preserved after filtering
+    # Map old terminal indices to new indices after filtering
+    if 'terminals' in dataset:
+        new_terminals = np.zeros(n_kept, dtype=bool)
+        # Build mapping: old_index -> new_index for kept frames
+        old_to_new = {}
+        new_idx = 0
+        for old_idx in range(T):
+            if keep_mask[old_idx]:
+                old_to_new[old_idx] = new_idx
+                new_idx += 1
+        
+        # Map terminal indices
+        terminals_mapped = 0
+        for old_term_idx in terminal_indices:
+            if old_term_idx in old_to_new:
+                new_term_idx = old_to_new[old_term_idx]
+                new_terminals[new_term_idx] = True
+                terminals_mapped += 1
+        
+        filtered['terminals'] = new_terminals
+        # Ensure last frame is always terminal
+        if len(new_terminals) > 0:
+            new_terminals[-1] = True
+        
+        print(f"Terminals after mapping: {np.sum(new_terminals)} (mapped {terminals_mapped} from {len(terminal_indices)} original)")
+        new_terminal_locs = np.where(new_terminals)[0]
+        print(f"New terminal locations (first 10): {new_terminal_locs[:10]}")
+        if len(new_terminal_locs) > 0:
+            new_traj_lengths = np.diff(np.concatenate([[0], new_terminal_locs + 1]))
+            print(f"New trajectory lengths (first 10): {new_traj_lengths[:10]}")
+            print(f"New trajectory lengths (stats): min={new_traj_lengths.min()}, max={new_traj_lengths.max()}, mean={new_traj_lengths.mean():.1f}")
+    
+    print("=" * 50)
+    return filtered
+
+def _maybe_get_terminals_from_source(data_np: Dict[str, np.ndarray]) -> np.ndarray | None:
+    """Return terminals array if present in the original dataset."""
+    if "terminals" in data_np:
+        terminals = np.asarray(data_np["terminals"], dtype=bool).reshape(-1)
+        if terminals.size > 0 and terminals.any():
+            return terminals
+    # Some datasets store terminals under 'dones' or 'episode_ends'.
+    for key in ("dones", "episode_ends", "is_terminal"):
+        if key in data_np:
+            terminals = np.asarray(data_np[key], dtype=bool).reshape(-1)
+            if terminals.size > 0 and terminals.any():
+                return terminals
+    return None
 
 
+def load_dataset_cpu(path: str | Path, frame_offsets: Tuple[int, ...], block_size: int) -> Dict[str, np.ndarray]:
+    print(f"Loading dataset from {path} ...")
+    data_np = np.load(path)
 
-def load_dataset(dataset: Dict[str, np.ndarray], frame_stack: int = 1, chunk_size: int = 20000, index: int = 0, config: dict = None) -> Dict[str, jnp.ndarray]:
-    start = time.time()
-    print(dataset['observations'].shape, dataset['observations'].size)
-    # Create a copy to avoid modifying the original dataset
-    print("Copying chunk data...")
-    chunk_data = {
-        'observations': dataset['observations'][index:(index + chunk_size)].copy(),
-        #'terminals': dataset['terminals'][index:(index + chunk_size)].copy(),
-        'terminals': np.zeros(chunk_size, dtype=np.bool_),
-        'actions': dataset['actions'][index:(index + chunk_size)].copy(),
+    obs = np.asarray(data_np["observations"], dtype=np.float32)
+    actions = np.asarray(data_np["actions"], dtype=np.float32)
+    
+    print(f"\n=== DATASET LOADING DEBUG ===")
+    print(f"Total frames in dataset: {len(obs)}")
+
+    terminals = _maybe_get_terminals_from_source(data_np)
+    if terminals is not None:
+        terminals = terminals.astype(bool).copy()
+        print(f"Found {int(terminals.sum())} terminal markers in dataset file.")
+    else:
+        # Fallback: assume fixed-length trajectories (legacy datasets)
+        print("WARNING: Dataset missing terminal markers. Falling back to synthetic 1000-step boundaries.")
+        terminals = np.zeros(len(obs), dtype=bool)
+        trajectory_length = 1000
+        terminal_indices = np.arange(trajectory_length - 1, len(obs), trajectory_length, dtype=int)
+        terminals[terminal_indices] = True
+
+    # Always mark last frame as terminal to close final trajectory
+    terminals[-1] = True
+
+    terminal_indices = np.where(terminals)[0]
+    print(f"Terminal count after initialization: {len(terminal_indices)}")
+    if len(terminal_indices) > 0:
+        print(f"Terminal indices (first 10): {terminal_indices[:10]}")
+        if len(terminal_indices) > 10:
+            print(f"Terminal indices (last 10): {terminal_indices[-10:]}")
+        traj_lengths = np.diff(np.concatenate([[0], terminal_indices + 1]))
+        print(
+            "Trajectory length stats (before filtering): "
+            f"min={traj_lengths.min()}, max={traj_lengths.max()}, mean={traj_lengths.mean():.1f}"
+        )
+
+    # Shape is always (N, 100, 100, 3)
+    if obs.max() > 1.0:
+        obs = obs / 255.0
+
+    # Always filter intersection frames (will preserve terminal markers)
+    filtered = filter_intersection_frames({
+        "observations": obs,
+        "actions": actions,
+        "terminals": terminals,
+    })
+    obs = filtered["observations"]
+    actions = filtered["actions"]
+    terminals = filtered["terminals"]
+    print(f"\n=== AFTER FILTERING (before frame stacking) ===")
+    print(f"Frames remaining: {len(obs)}")
+    print(f"Terminals remaining: {np.sum(terminals)}")
+    terminal_locs_after = np.where(terminals)[0]
+    if len(terminal_locs_after) > 0:
+        print(f"Terminal locations (first 10): {terminal_locs_after[:10]}")
+        traj_lengths_after = np.diff(np.concatenate([[0], terminal_locs_after + 1]))
+        print(f"Trajectory lengths (first 10): {traj_lengths_after[:10]}")
+        print(f"Trajectory lengths (stats): min={traj_lengths_after.min()}, max={traj_lengths_after.max()}, mean={traj_lengths_after.mean():.1f}")
+
+    obs_stacked = create_spaced_frame_stack(obs, frame_offsets=frame_offsets, block_size=block_size)
+    next_obs_stacked = np.roll(obs_stacked, shift=-1, axis=0)
+    next_obs_stacked[-1] = obs_stacked[-1]
+
+    print(f"Loaded: obs={obs_stacked.shape}, actions={actions.shape}, terminals={terminals.shape}")
+    return {
+        "observations": obs_stacked,
+        "next_observations": next_obs_stacked,
+        "actions": actions,
+        "terminals": terminals,
+        "cpu_mode": True,
     }
 
-    # Discretize actions if discrete flag is set
-    if config.get('discrete', False):
-        print("Discretizing continuous actions using independent softmax (32 bins per dimension, 3D discrete actions)...")
-        # Get action components
-        throttle = chunk_data['actions'][:, 0]  # 0 to 1
-        steer = chunk_data['actions'][:, 1]     # -1 to 1
-        brake = chunk_data['actions'][:, 2] if chunk_data['actions'].shape[1] > 2 else jnp.zeros_like(throttle)  # 0 to 1
-        # Use 32 bins for each dimension
-        num_bins = 32
-        # Create bin centers for each dimension
-        throttle_centers = jnp.linspace(0, 1, num_bins)  # [0, 1/31, 2/31, ..., 1]
-        steer_centers = jnp.linspace(-1, 1, num_bins)    # [-1, -29/31, -27/31, ..., 1]
-        brake_centers = jnp.linspace(0, 1, num_bins)     # [0, 1/31, 2/31, ..., 1]
-        throttle_distances = jnp.abs(throttle[:, None] - throttle_centers[None, :])
-        steer_distances = jnp.abs(steer[:, None] - steer_centers[None, :])
-        brake_distances = jnp.abs(brake[:, None] - brake_centers[None, :])
-        
-        # Convert distances to logits (negative distances = higher logits)
-        temperature = 0.7  # Much lower temperature for smoother distributions
-        throttle_logits = -throttle_distances * temperature
-        steer_logits = -steer_distances * temperature
-        brake_logits = -brake_distances * temperature
-        
-        # Clip logits to prevent extreme values that cause numerical instability
-        max_logit = 5.0  # More aggressive clipping
-        min_logit = -5.0  # More aggressive clipping
-        
-        throttle_logits = jnp.clip(throttle_logits, min_logit, max_logit)
-        steer_logits = jnp.clip(steer_logits, min_logit, max_logit)
-        brake_logits = jnp.clip(brake_logits, min_logit, max_logit)
-        
-        # Apply softmax to get probability distributions over bins
-        throttle_probs = jax.nn.softmax(throttle_logits, axis=-1)
-        steer_probs = jax.nn.softmax(steer_logits, axis=-1)
-        brake_probs = jax.nn.softmax(brake_logits, axis=-1)
-        
-        # For training, we still need discrete actions, so use the mode (most likely bin)
-        throttle_discrete = jnp.argmax(throttle_probs, axis=-1)
-        steer_discrete = jnp.argmax(steer_probs, axis=-1)
-        brake_discrete = jnp.argmax(brake_probs, axis=-1)
-        
-        # Store the discrete actions as a 3D vector
-        discrete_actions = jnp.stack([throttle_discrete, steer_discrete, brake_discrete], axis=-1)
-        
-        # Replace continuous actions with discrete version
-        chunk_data['actions'] = discrete_actions
-        
-        # Store the soft distributions for potential use in loss computation
-        chunk_data['throttle_probs'] = throttle_probs
-        chunk_data['steer_probs'] = steer_probs
-        chunk_data['brake_probs'] = brake_probs
-        
-        print(f"Action space discretized using independent softmax. Shape: {discrete_actions.shape}")
-        print(f"Total discrete actions per dimension: {num_bins} (throttle, steer, brake)")
-        print(f"Softmax temperature: {temperature}")
+
+def _gather_trajectories(
+    dataset: Dict[str, np.ndarray],
+    trajectory_ids: np.ndarray,
+    trajectory_length: int,
+) -> Dict[str, np.ndarray]:
+    if len(trajectory_ids) == 0:
+        return {
+            "observations": np.zeros((0, *dataset["observations"].shape[1:]), dtype=dataset["observations"].dtype),
+            "actions": np.zeros((0, *dataset["actions"].shape[1:]), dtype=dataset["actions"].dtype),
+            "terminals": np.zeros((0,), dtype=bool),
+        }
+
+    obs_list = []
+    act_list = []
+    term_list = []
+    next_list = [] if "next_observations" in dataset else None
+
+    total = len(dataset["observations"])
+    for traj_id in trajectory_ids:
+        start = traj_id * trajectory_length
+        if start >= total:
+            continue
+        end = min(start + trajectory_length, total)
+        obs_chunk = dataset["observations"][start:end]
+        act_chunk = dataset["actions"][start:end]
+        term_chunk = np.asarray(dataset["terminals"][start:end], dtype=bool)
+        term_chunk = term_chunk.reshape(-1).copy()
+        if len(term_chunk) == 0:
+            continue
+        term_chunk[-1] = True
+        if next_list is not None:
+            next_chunk = dataset["next_observations"][start:end].copy()
+            if len(next_chunk) > 0:
+                next_chunk[-1] = obs_chunk[-1]
+            next_list.append(next_chunk)
+        obs_list.append(obs_chunk)
+        act_list.append(act_chunk)
+        term_list.append(term_chunk)
+
+    if not obs_list:
+        return {
+            "observations": np.zeros((0, *dataset["observations"].shape[1:]), dtype=dataset["observations"].dtype),
+            "actions": np.zeros((0, *dataset["actions"].shape[1:]), dtype=dataset["actions"].dtype),
+            "terminals": np.zeros((0,), dtype=bool),
+        }
+
+    return {
+        "observations": np.concatenate(obs_list, axis=0),
+        "actions": np.concatenate(act_list, axis=0),
+        "terminals": np.concatenate(term_list, axis=0),
+        **(
+            {"next_observations": np.concatenate(next_list, axis=0)}
+            if next_list is not None and len(next_list) > 0
+            else {}
+        ),
+    }
+
+
+def split_dataset_by_terminals(
+    dataset: Dict[str, np.ndarray],
+    val_fraction: float,
+    seed: int,
+) -> Tuple[Dict[str, np.ndarray], Dict[str, np.ndarray]]:
+    """Split dataset by actual trajectory boundaries (terminals), not fixed length."""
+    print(f"\n=== SPLITTING DATASET BY TERMINALS ===")
+    terminals = dataset.get('terminals', np.zeros(len(dataset["observations"]), dtype=bool))
     
-    # Copy FULL mapping arrays (not sliced!) - they map global positions, not chunk positions
-    if 'original_to_shuffled' in dataset:
-        chunk_data['original_to_shuffled'] = dataset['original_to_shuffled'].copy()
-    if 'shuffled_to_original' in dataset:
-        chunk_data['shuffled_to_original'] = dataset['shuffled_to_original'].copy()
+    # Find all terminal locations (trajectory boundaries)
+    terminal_locs = np.where(terminals)[0]
     
-    n_transitions = len(chunk_data['observations'])
+    print(f"Total frames: {len(dataset['observations'])}")
+    print(f"Terminal locations found: {len(terminal_locs)}")
     
-    # Safety check: ensure we have data
-    if n_transitions == 0:
-        raise ValueError(f"Empty chunk at index {index}, chunk_size {chunk_size}, total dataset size {len(dataset['observations'])}")
-    h, w, c, = 100, 100, 3
-
-    # Debug original data
-    print(f"Original obs stats: min={np.min(chunk_data['observations']):.4f}, max={np.max(chunk_data['observations']):.4f}, mean={np.mean(chunk_data['observations']):.4f}")
+    if len(terminal_locs) == 0:
+        print("WARNING: No terminals found! Treating as single trajectory.")
+        # No terminals found, treat as single trajectory
+        return dataset, {k: v[:0] if isinstance(v, np.ndarray) else v for k, v in dataset.items()}
     
-    # Normalize observations to [0,1] range
-    print("Normalizing observations...")
-    chunk_data['observations'] = chunk_data['observations'].astype(np.float16) / 255.0
-    if not config['discrete']:
-        chunk_data['actions'] = chunk_data['actions'].astype(np.float16)
+    # Build trajectory boundaries: [start, end) for each trajectory
+    traj_starts = np.concatenate([[0], terminal_locs[:-1] + 1])
+    traj_ends = terminal_locs + 1
+    num_trajectories = len(traj_starts)
     
-    # Debug normalized data
-    print(f"Normalized obs stats: min={np.min(chunk_data['observations']):.4f}, max={np.max(chunk_data['observations']):.4f}, mean={np.mean(chunk_data['observations']):.4f}")
-
-    print('Converting to jnp...')
-    chunk_data = {k: jnp.array(v) for k, v in chunk_data.items()}
-
-    original_obs = chunk_data['observations'].reshape(n_transitions, h, w, c).astype(np.float32)
-    print(original_obs.shape)
-
-    terminals = chunk_data['terminals'][:-3]
-    terminals = terminals.at[-1].set(True)
-    chunk_data['terminals'] = terminals
-
-    print(f"Creating frame-stacked observations (frame_stack={frame_stack})...")
-    shifted_dataset = [jnp.roll(original_obs, shift=i, axis=0) for i in range(frame_stack - 1, -1, -1)]
-    concat_dataset = jnp.concatenate(shifted_dataset, axis=-1)
-    concat_dataset = concat_dataset[(frame_stack - 1) :]
-    chunk_data['observations'] = concat_dataset
-    next_obs = jnp.roll(concat_dataset, shift=-1, axis=0)
-    next_obs = next_obs.at[-1].set(next_obs[-2])
-    chunk_data['next_observations'] = next_obs
-
-    end = time.time()
-    return chunk_data
-
-def shuffle_dataset(path: str | Path) -> Dict[str, np.ndarray]:
-    print(f"Loading dataset from {path}...")
-    data_np = np.load(path)
-    print("Dataset loaded")
-    start_time = time.time()
-    dataset = {k: np.asarray(v, dtype=np.float16) for k, v in data_np.items()}
-    end_time = time.time()
-    print(f"Dataset conversion took {(end_time - start_time)*1000:.1f}ms")
-
-    steer_values = dataset['actions'][:, 1]
-
-    print(f'Dataset loaded: {len(dataset["observations"])} transitions')
-    print(f'Terminal states: {np.sum(dataset["terminals"])}')
-    print(f'Observation shape: {dataset["observations"].shape}, dtype: {dataset["observations"].dtype}')
-
-    # # Create bidirectional mapping for efficient goal sampling
-    # n_samples = len(dataset['observations'])
-    # print(f"Creating shuffled indices for {n_samples} samples...")
-    # rng = np.random.default_rng()
-    # shuffled_indices = rng.permutation(n_samples)
-
-    # print("Building bidirectional mappings...")
-    # # original_to_shuffled[original_pos] = shuffled_pos
-    # # "Where did original position i end up after shuffling?"
-    # dataset['original_to_shuffled'] = np.zeros(n_samples, dtype=int)
-    # for original_pos, shuffled_pos in enumerate(shuffled_indices):
-    #     dataset['original_to_shuffled'][original_pos] = shuffled_pos
+    traj_lengths = traj_ends - traj_starts
+    print(f"Number of trajectories: {num_trajectories}")
+    print(f"Trajectory lengths (first 10): {traj_lengths[:10]}")
+    print(f"Trajectory lengths (stats): min={traj_lengths.min()}, max={traj_lengths.max()}, mean={traj_lengths.mean():.1f}, median={np.median(traj_lengths):.1f}")
     
-    # # shuffled_to_original[shuffled_pos] = original_pos  
-    # # "What was the original position of the frame now at shuffled position i?"
-    # dataset['shuffled_to_original'] = np.zeros(n_samples, dtype=int)
-    # for original_pos, shuffled_pos in enumerate(shuffled_indices):
-    #     dataset['shuffled_to_original'][shuffled_pos] = original_pos
+    # Shuffle trajectory indices
+    rng = np.random.default_rng(seed)
+    traj_ids = np.arange(num_trajectories)
+    rng.shuffle(traj_ids)
     
-    # print("Shuffling dataset arrays...")
-    # dataset['observations'] = dataset['observations'][shuffled_indices]
-    # dataset['terminals'] = dataset['terminals'][shuffled_indices] 
-    # dataset['actions'] = dataset['actions'][shuffled_indices]
-
-    print("Dataset shuffled successfully!")
-    return dataset
-
-
-def compute_validation_loss(agent, val_dataset, sample_batch_fn, batch_size=1000, frame_stack=1, config=None):
-    """Compute validation loss on a subset of validation data."""
+    # Split trajectories
+    num_val = max(1, int(np.round(val_fraction * num_trajectories)))
+    num_val = min(num_val, num_trajectories - 1) if num_trajectories > 1 else num_val
     
-    # Use the same sample_batch function as training for perfect consistency
-    val_batch = sample_batch_fn(
-        val_dataset,
-        batch_size=batch_size,
-        frame_stack=frame_stack,
-        config=config
+    val_ids = traj_ids[:num_val]
+    train_ids = traj_ids[num_val:] if num_trajectories > num_val else traj_ids[:1]
+    
+    # Gather trajectories by actual boundaries
+    train_obs_list = []
+    train_act_list = []
+    train_term_list = []
+    train_next_list = [] if "next_observations" in dataset else None
+    
+    val_obs_list = []
+    val_act_list = []
+    val_term_list = []
+    val_next_list = [] if "next_observations" in dataset else None
+    
+    for traj_id in train_ids:
+        start = traj_starts[traj_id]
+        end = traj_ends[traj_id]
+        train_obs_list.append(dataset["observations"][start:end])
+        train_act_list.append(dataset["actions"][start:end])
+        term_chunk = terminals[start:end].copy()
+        term_chunk[-1] = True  # Ensure last frame is terminal
+        train_term_list.append(term_chunk)
+        if train_next_list is not None:
+            next_chunk = dataset["next_observations"][start:end].copy()
+            if len(next_chunk) > 0:
+                next_chunk[-1] = dataset["observations"][end-1]
+            train_next_list.append(next_chunk)
+    
+    for traj_id in val_ids:
+        start = traj_starts[traj_id]
+        end = traj_ends[traj_id]
+        val_obs_list.append(dataset["observations"][start:end])
+        val_act_list.append(dataset["actions"][start:end])
+        term_chunk = terminals[start:end].copy()
+        term_chunk[-1] = True  # Ensure last frame is terminal
+        val_term_list.append(term_chunk)
+        if val_next_list is not None:
+            next_chunk = dataset["next_observations"][start:end].copy()
+            if len(next_chunk) > 0:
+                next_chunk[-1] = dataset["observations"][end-1]
+            val_next_list.append(next_chunk)
+    
+    train_data = {
+        "observations": np.concatenate(train_obs_list, axis=0) if train_obs_list else np.zeros((0, *dataset["observations"].shape[1:]), dtype=dataset["observations"].dtype),
+        "actions": np.concatenate(train_act_list, axis=0) if train_act_list else np.zeros((0, *dataset["actions"].shape[1:]), dtype=dataset["actions"].dtype),
+        "terminals": np.concatenate(train_term_list, axis=0) if train_term_list else np.zeros((0,), dtype=bool),
+    }
+    # Ensure last frame of train set is terminal
+    if len(train_data["terminals"]) > 0:
+        train_data["terminals"][-1] = True
+    if train_next_list and len(train_next_list) > 0:
+        train_data["next_observations"] = np.concatenate(train_next_list, axis=0)
+    
+    val_data = {
+        "observations": np.concatenate(val_obs_list, axis=0) if val_obs_list else np.zeros((0, *dataset["observations"].shape[1:]), dtype=dataset["observations"].dtype),
+        "actions": np.concatenate(val_act_list, axis=0) if val_act_list else np.zeros((0, *dataset["actions"].shape[1:]), dtype=dataset["actions"].dtype),
+        "terminals": np.concatenate(val_term_list, axis=0) if val_term_list else np.zeros((0,), dtype=bool),
+    }
+    # Ensure last frame of val set is terminal
+    if len(val_data["terminals"]) > 0:
+        val_data["terminals"][-1] = True
+    if val_next_list and len(val_next_list) > 0:
+        val_data["next_observations"] = np.concatenate(val_next_list, axis=0)
+    
+    print(f"\n=== SPLIT COMPLETE ===")
+    print(f"Train: {len(train_data['observations'])} frames, {len(train_ids)} trajectories")
+    print(f"Val: {len(val_data['observations'])} frames, {len(val_ids)} trajectories")
+    train_terminal_count = np.sum(train_data['terminals'])
+    val_terminal_count = np.sum(val_data['terminals'])
+    print(f"Train terminals: {train_terminal_count}, Val terminals: {val_terminal_count}")
+    print("=" * 50)
+    
+    return train_data, val_data
+
+
+def enforce_periodic_terminals(data: Dict[str, np.ndarray], period: int) -> Dict[str, np.ndarray]:
+    if period <= 0 or len(data["observations"]) == 0:
+        return data
+    terminals = np.zeros(len(data["observations"]), dtype=bool)
+    indices = np.arange(period - 1, len(terminals), period, dtype=int)
+    terminals[indices] = True
+    terminals[-1] = True
+    data["terminals"] = terminals
+    return data
+
+
+def numpy_to_jax(batch: Dict[str, np.ndarray]) -> Dict[str, jnp.ndarray]:
+    return tree_util.tree_map(
+        lambda x: jnp.asarray(x) if isinstance(x, np.ndarray) else x,
+        batch,
     )
-    
-    try:
-        actor_loss, actor_info = agent.actor_loss(val_batch, agent.network.params)
-        actor_dist = agent.network.select('actor')(
-            val_batch['observations'],
-            val_batch['actor_goals'],
-            params=agent.network.params
+
+
+# =============================
+# Validation
+# =============================
+def test_goal_conditioning(agent, val_dataset: GCDataset | None, num_test_samples: int = 50):
+    """Measure how strongly the actor responds to goal variations on a fixed observation."""
+    if val_dataset is None or val_dataset.size == 0:
+        return {"val/goal_conditioning_sensitivity": float("nan")}
+
+    total = val_dataset.size
+    num_samples = min(num_test_samples, total)
+    if num_samples == 0:
+        return {"val/goal_conditioning_sensitivity": float("nan")}
+
+    rng = np.random.default_rng()
+    sample_indices = rng.choice(total, num_samples, replace=False)
+    observations = np.asarray(val_dataset.dataset["observations"])
+    num_goals_per_obs = 10
+
+    sensitivities = []
+    random_sensitivities = []
+
+    discount = float(val_dataset.config.get("discount", 0.99))
+    geom_p = max(1e-4, 1.0 - discount)
+
+    for idx in sample_indices[: min(10, num_samples)]:
+        obs = jnp.asarray(observations[idx])
+        obs_batch = jnp.broadcast_to(obs[None, ...], (num_goals_per_obs, *obs.shape))
+
+        block_idx = int(np.searchsorted(val_dataset.terminal_locs, idx))
+        block_start = int(val_dataset.initial_locs[block_idx])
+        block_end = int(val_dataset.terminal_locs[block_idx]) + 1
+
+        if block_end - block_start <= 1:
+            goal_positions = np.full((num_goals_per_obs,), idx, dtype=int)
+        else:
+            max_forward = max(1, block_end - idx - 1)
+            near_offsets = np.clip(
+                rng.geometric(p=geom_p, size=max(1, num_goals_per_obs // 2)),
+                1,
+                max_forward,
+            )
+            far_offsets = np.linspace(
+                1,
+                max_forward,
+                num=max(1, num_goals_per_obs - len(near_offsets)),
+                dtype=int,
+            )
+            offsets = np.concatenate([near_offsets, far_offsets])[:num_goals_per_obs]
+            goal_positions = np.clip(idx + offsets, block_start, block_end - 1)
+
+        goals_same_block = jnp.asarray(observations[goal_positions])
+        actor_dist = agent.network.select("actor")(obs_batch, goals_same_block, params=agent.network.params)
+        actions = actor_dist.mode()
+        sensitivities.append(float(jnp.std(actions, axis=0).mean()))
+
+        random_goal_indices = rng.integers(0, total, size=num_goals_per_obs)
+        goals_random = jnp.asarray(observations[random_goal_indices])
+        actor_dist_random = agent.network.select("actor")(obs_batch, goals_random, params=agent.network.params)
+        actions_random = actor_dist_random.mode()
+        random_sensitivities.append(float(jnp.std(actions_random, axis=0).mean()))
+
+    mean_sensitivity = float(np.mean(sensitivities)) if sensitivities else 0.0
+    mean_random_sensitivity = float(np.mean(random_sensitivities)) if random_sensitivities else 0.0
+
+    return {
+        "val/goal_conditioning_sensitivity": mean_sensitivity,
+        "val/goal_conditioning_sensitivity_random": mean_random_sensitivity,
+    }
+
+
+def compute_validation_loss(agent, val_dataset: GCDataset | None, batch_size: int = 1024):
+    """Run a validation pass using the goal-conditioned dataset sampler."""
+    if val_dataset is None or val_dataset.size == 0:
+        return {}
+
+    actual_batch = min(batch_size, val_dataset.size)
+    batch_np = val_dataset.sample(actual_batch, evaluation=True)
+    batch = numpy_to_jax(batch_np)
+
+    for k in ("observations", "actions", "actor_goals", "value_goals"):
+        if k in batch and jnp.any(jnp.isnan(batch[k])):
+            print(f"WARNING: NaN detected in validation field '{k}'")
+
+    # Compute actor loss (all agents have this)
+    actor_loss, actor_info = agent.actor_loss(batch, agent.network.params)
+
+    # Compute critic loss only if the agent has it (CRL agents)
+    if hasattr(agent, 'contrastive_loss'):
+        critic_loss, critic_info = agent.contrastive_loss(batch, agent.network.params)
+    else:
+        critic_loss = 0.0
+        critic_info = {}
+
+    metrics: Dict[str, object] = {}
+
+    # ============================
+    # Validation action distributions
+    # ============================
+    # Log predicted vs target action distributions as histograms for diagnostics.
+    if "pred_actions" in actor_info and "target_actions" in actor_info:
+        pred_actions = np.asarray(actor_info["pred_actions"])
+        target_actions = np.asarray(actor_info["target_actions"])
+        if pred_actions.ndim == 2 and pred_actions.shape == target_actions.shape:
+            action_names = ["steer", "throttle", "brake"]
+            action_dim = pred_actions.shape[1]
+            for i in range(action_dim):
+                name = action_names[i] if i < len(action_names) else f"action_{i}"
+                metrics[f"val/pred_{name}_hist"] = wandb.Histogram(pred_actions[:, i])
+                metrics[f"val/target_{name}_hist"] = wandb.Histogram(target_actions[:, i])
+
+    # Actor metrics: keep only BC loss, Q loss, and MSE.
+    if "bc_loss" in actor_info:
+        metrics["val/actor_bc_loss"] = float(actor_info["bc_loss"])
+    if "q_loss" in actor_info:
+        metrics["val/actor_q_loss"] = float(actor_info["q_loss"])
+    if "mse" in actor_info:
+        metrics["val/actor_mse"] = float(actor_info["mse"])
+
+    # Critic metrics: keep only contrastive loss and categorical accuracy.
+    if hasattr(agent, "contrastive_loss"):
+        metrics["val/critic_loss"] = float(critic_loss)
+        metrics["val/critic_categorical_accuracy"] = float(
+            critic_info.get("categorical_accuracy", 0.0)
         )
-        
-        # Handle discrete vs continuous actions properly
-        if config.get('discrete', False):
-            predicted_actions = actor_dist.mode()
-            expert_actions = val_batch['actions']
-            
-            if config.get('multi_discrete', False):
-                # For multi-discrete actions (3D), compute accuracy per dimension
-                throttle_accuracy = jnp.mean(predicted_actions[:, 0] == expert_actions[:, 0])
-                steer_accuracy = jnp.mean(predicted_actions[:, 1] == expert_actions[:, 1])
-                brake_accuracy = jnp.mean(predicted_actions[:, 2] == expert_actions[:, 2])
-                
-                # Overall exact match accuracy (all dimensions must match)
-                exact_match_accuracy = jnp.mean(jnp.all(predicted_actions == expert_actions, axis=-1))
-                
-                # Compute categorical accuracy for discrete actions
-                categorical_accuracy = (throttle_accuracy + steer_accuracy + brake_accuracy) / 3
-                
-                # Cross-entropy loss (using the distribution's log_prob method)
-                cross_entropy_loss = -jnp.mean(actor_dist.log_prob(expert_actions))
-                
-                # Perplexity
-                perplexity = jnp.exp(cross_entropy_loss)
-                
-                # Action distribution entropy
-                action_probs = jax.nn.softmax(actor_dist.logits, axis=-1)
-                action_entropy = -jnp.sum(action_probs * jnp.log(action_probs + 1e-8), axis=-1)
-                
-                # Max probability (confidence)
-                max_prob = jnp.max(action_probs, axis=-1)
-                
-                # Compute action prediction MSE (less meaningful for discrete but still useful)
-                action_mse = jnp.mean((predicted_actions - expert_actions) ** 2)
-                
-                # Compute log probability of actual actions
-                log_prob = actor_dist.log_prob(val_batch['actions']).mean()
-                
-                return {
-                    'val_actor_loss': float(actor_loss),
-                    'val_action_mse': float(action_mse),
-                    'val_categorical_accuracy': float(categorical_accuracy),
-                    'val_throttle_accuracy': float(throttle_accuracy),
-                    'val_steer_accuracy': float(steer_accuracy),
-                    'val_brake_accuracy': float(brake_accuracy),
-                    'val_exact_match_accuracy': float(exact_match_accuracy),
-                    'val_cross_entropy_loss': float(cross_entropy_loss),
-                    'val_perplexity': float(perplexity),
-                    'val_action_entropy': float(jnp.mean(action_entropy)),
-                    'val_max_probability': float(jnp.mean(max_prob)),
-                    'val_log_prob': float(log_prob),
-                    'val_bc_log_prob': float(actor_info.get('bc_log_prob', 0.0)),
-                    'val_mse': float(actor_info.get('mse', 0.0))
-                }
-            else:
-                # For single discrete actions
-                categorical_accuracy = jnp.mean(predicted_actions == expert_actions)
-                
-                # Cross-entropy loss (using the distribution's log_prob method)
-                cross_entropy_loss = -jnp.mean(actor_dist.log_prob(expert_actions))
-                
-                # Perplexity
-                perplexity = jnp.exp(cross_entropy_loss)
-                
-                # Action distribution entropy
-                action_probs = jax.nn.softmax(actor_dist.logits, axis=-1)
-                action_entropy = -jnp.sum(action_probs * jnp.log(action_probs + 1e-8), axis=-1)
-                
-                # Max probability (confidence)
-                max_prob = jnp.max(action_probs, axis=-1)
-                
-                # Compute action prediction MSE (less meaningful for discrete but still useful)
-                action_mse = jnp.mean((predicted_actions - expert_actions) ** 2)
-        
-        # Compute log probability of actual actions
-        log_prob = actor_dist.log_prob(val_batch['actions']).mean()
-        
-        return {
-            'val_actor_loss': float(actor_loss),
-            'val_action_mse': float(action_mse),
-                    'val_categorical_accuracy': float(categorical_accuracy),
-                    'val_cross_entropy_loss': float(cross_entropy_loss),
-                    'val_perplexity': float(perplexity),
-                    'val_action_entropy': float(jnp.mean(action_entropy)),
-                    'val_max_probability': float(jnp.mean(max_prob)),
-            'val_log_prob': float(log_prob),
-            'val_bc_log_prob': float(actor_info.get('bc_log_prob', 0.0)),
-            'val_mse': float(actor_info.get('mse', 0.0))
-        }
-    except Exception as e:
-        print(f"Warning: Could not compute validation loss: {e}")
-        return {
-            'val_actor_loss': float('nan'),
-            'val_action_mse': float('nan'),
-            'val_categorical_accuracy': float('nan'),
-            'val_top_3_accuracy': float('nan'),
-            'val_log_prob': float('nan'),
-            'val_bc_log_prob': float('nan'),
-            'val_mse': float('nan')
-        }
+
+    return metrics
 
 
+# =============================
+# Training
+# =============================
 def main(args: argparse.Namespace) -> None:
-    if args.use_guided:
-        agent_module = import_module(f'agents.guided_{args.algorithm.lower()}')
-    else:
-        agent_module = import_module(f'agents.{args.algorithm.lower()}')
-    # Use original algorithm directly
-    agent_cls = getattr(agent_module, f'{args.algorithm}Agent')
-    get_config = getattr(agent_module, 'get_config')
-    
-    # Import agent-specific batch sampling function
-    if hasattr(agent_module, 'sample_batch'):
-        sample_batch_fn = getattr(agent_module, 'sample_batch')
-    else:
-        # Fallback to CRL sample_batch if agent doesn't provide one
-        from agents.crl import sample_batch as crl_sample_batch
-        sample_batch_fn = crl_sample_batch
-        print(f"Warning: {args.algorithm} doesn't have its own sample_batch function, using CRL's implementation")
+    agent_module = import_module(f"agents.{args.algorithm.lower()}")
+    agent_cls = getattr(agent_module, f"{args.algorithm}Agent")
+    get_config = getattr(agent_module, "get_config")
 
-    # Get algorithm-specific config
     cfg = get_config()
-
-    # Override with training-specific settings for GCIQL
     cfg.batch_size = args.batch_size
-    cfg.actor_loss = 'ddpgbc'  # Use DDPG+BC for stable offline learning
-    cfg.expectile = 0.7  # Standard IQL expectile value
-    cfg.discount = 0.99  # Reasonable discount for driving task
-    cfg.alpha = 0.5  # Moderate BC coefficient for DDPG+BC
-    cfg.encoder = 'impala_large'
-    cfg.lr = 5e-5  # Much higher learning rate to compensate for small gradients
-    cfg.frame_stack = args.frame_stack
-    cfg.discrete = True
-    cfg.multi_discrete = True  # Enable multi-discrete actor (96 logits, 3D actions)
+    cfg.discrete = False  # Continuous actions (n x 3)
+    cfg.actor_loss = "ddpgbc"
+    cfg.expectile = 0.7
+    cfg.discount = 0.99
+    cfg.alpha = 0.5
+    cfg.encoder = "impala_large"
+    cfg.lr = 3e-4  # Increased LR to help critic learn (was 1e-4)
+    cfg.actor_hidden_dims = (512, 512, 512)
+    cfg.value_hidden_dims = (512, 512, 512)
+    cfg.latent_dim = 512
+    cfg.critic_lr_scale = 1.0
+    cfg.actor_lr_scale = 1.0
+    cfg.frame_stack = None  # Observations are pre-stacked on disk.
+    cfg.block_size = args.block_size
+    cfg.frame_offsets = tuple(args.frame_offsets if args.frame_offsets else [0, -10, -20, -50, -80])
+    cfg.p_aug = 0.25
+    cfg.distance_loss_weight = 0.05
+    cfg.distance_head_hidden_dims = (256, 256)
+    cfg.upsample_mode = 'none'  # Disable action component upsampling (was causing instability)
+    cfg.upsample_weight = 3.0
+    cfg.steer_thresh = 0.1
+    cfg.throttle_thresh = 0.3
+    cfg.brake_thresh = 0.1
+    cfg.p_curgoal = 0.025
+    cfg.use_mrn_metric = args.use_mrn_metric
+    if args.mrn_components is not None:
+        cfg.mrn_components = args.mrn_components
 
-    dataset = shuffle_dataset(args.dataset_path)
-    chunk = load_dataset(dataset, frame_stack=args.frame_stack, chunk_size=args.chunk_size, index=0, config=cfg)
+    np.random.seed(args.seed)
 
-    # Create example action labels for initialization (5 discrete actions)
-    ex_action_labels = jnp.zeros(1, dtype=jnp.int32)  # Single example with label 0q
+    cpu_dataset = load_dataset_cpu(
+        args.dataset_path,
+        frame_offsets=cfg.frame_offsets,
+        block_size=args.block_size,
+    )
 
-    # Create agent
+    # Split by actual trajectory boundaries (using terminal markers, not fixed length)
+    # This will respect the variable-length trajectories after filtering
+    train_split, val_split = split_dataset_by_terminals(
+        cpu_dataset,
+        val_fraction=0.2,
+        seed=args.seed,
+    )
+
+    def build_gc_dataset(split: Dict[str, np.ndarray]) -> GCDataset | None:
+        if split["observations"].size == 0:
+            return None
+        dataset_fields = dict(
+            observations=split["observations"],
+            actions=split["actions"],
+            terminals=split["terminals"],
+        )
+        if "next_observations" in split:
+            dataset_fields["next_observations"] = split["next_observations"]
+        return GCDataset(Dataset.create(**dataset_fields), cfg)
+
+    train_dataset = build_gc_dataset(train_split)
+    val_dataset = build_gc_dataset(val_split)
+
+    if train_dataset is None or train_dataset.size == 0:
+        raise ValueError("Training dataset is empty after preprocessing.")
+
+    print(
+        f"Dataset summary: train={train_dataset.size} frames, "
+        f"val={(val_dataset.size if val_dataset is not None else 0)} frames"
+    )
+
+    example_batch = train_dataset.sample(min(10, cfg.batch_size))
+    ex_obs_np = np.asarray(example_batch["observations"])
+    ex_act_np = np.asarray(example_batch["actions"])
+    print(f"Creating agent with example shapes: obs={ex_obs_np.shape}, actions={ex_act_np.shape}")
+
     agent = agent_cls.create(
         seed=args.seed,
-        ex_observations=chunk['observations'][0],  # Use frame-stacked observations
-        ex_actions=chunk['actions'][0],
+        ex_observations=ex_obs_np,
+        ex_actions=ex_act_np,
         config=cfg,
     )
+    print("Agent created successfully")
 
-    rng = np.random.default_rng(seed=args.seed + 1)
-
-    # Create checkpoint directory
     ckpt_dir = Path(args.ckpt_dir)
     ckpt_dir.mkdir(parents=True, exist_ok=True)
-
-    # Progress bar
-    total_steps = args.steps * args.epochs
-    progress = trange(total_steps, dynamic_ncols=True)
-
-    # Add tracking of actor performance
-    reward_stats = []
-    actor_losses = []
-    bc_losses = []
-
-    # Create validation dataset from last 20% of data
-    total_size = len(dataset['observations'])
-    val_size = total_size // 5  # Use last 20% for validation
-    
-    # Create validation dataset by processing the last portion through load_dataset
-    val_start_idx = total_size - val_size
-    val_dataset = load_dataset(dataset, frame_stack=args.frame_stack, chunk_size=args.chunk_size, index=val_start_idx, config=cfg)
-    val_start_idx = val_start_idx + args.chunk_size
-    
-    print(f"Created validation dataset with {val_size} examples")
-
     wandb.init(project=args.project, config=cfg.to_dict())
-    
+
     total_steps = 0
+    last_ckpt_step = -1
+    last_val_step = -1
+    last_log_step = -1
+
     for epoch in range(args.epochs):
-        dataset = shuffle_dataset(args.dataset_path)
-        chunk = load_dataset(dataset, frame_stack=args.frame_stack, chunk_size=args.chunk_size, index=0, config=cfg)
         print(f"\nStarting epoch {epoch + 1}/{args.epochs}")
-        # Progress bar for this epoch
+        if float(agent.config['alpha']) != float(cfg.alpha):
+            config_dict = unfreeze(agent.config)
+            config_dict['alpha'] = float(cfg.alpha)
+            agent = agent.replace(config=freeze(config_dict))
+
         progress = trange(args.steps, dynamic_ncols=True)
-        # Load initial chunk for this epoch
-        chunk = load_dataset(dataset, frame_stack=args.frame_stack, chunk_size=args.chunk_size, index=0, config=cfg)
-        
         for step in progress:
-            # Timing: Start of step
-            step_start_time = time.time()
-            
             total_steps += 1
-            if step % ((args.steps * args.chunk_size) // (dataset['terminals'].shape[0])) == 0 and step < args.steps:
-                # Calculate index and ensure it doesn't exceed dataset size
-                dataset_size = len(dataset['observations'])
-                index = 2 * (step // 5)
-                if index >= dataset_size:
-                    index = index % dataset_size  # Wrap around
-                print(f"Loading chunk at step {step}, epoch {epoch+1}/{args.epochs}, index {index}")
-                chunk = load_dataset(dataset, frame_stack=args.frame_stack, chunk_size=args.chunk_size, index=index, config=cfg)
-            
-            # Timing: Batch sampling
-            batch_start_time = time.time()
-            batch = sample_batch_fn(
-                chunk,
-                batch_size=cfg.batch_size,
-                frame_stack=args.frame_stack,
-                config=cfg
-            )
-            batch_time = time.time() - batch_start_time
+            t0 = time.time()
+            batch_np = train_dataset.sample(cfg.batch_size)
+            batch = numpy_to_jax(batch_np)
+            batch_ms = (time.time() - t0) * 1000.0
 
-            reward_stats.append(
-                {
-                    'mean': float(np.mean(batch['rewards'])),
-                    'min': float(np.min(batch['rewards'])),
-                    'max': float(np.max(batch['rewards'])),
-                    'at_goal': float(np.mean(batch['masks'] == 0.0)),
-                }
-            )
-
-            # Timing: Agent update
-            update_start_time = time.time()
+            t1 = time.time()
             agent, info = agent.update(batch)
-            update_time = time.time() - update_start_time
-            
-            # Timing: Post-processing
-            postprocess_start_time = time.time()
-            # Track actor loss components
-            actor_losses.append(float(info.get('actor/actor_loss', 0.0)))
-            bc_losses.append(float(info.get('actor/bc_loss', 0.0)))
-            if step % args.log_every == 0:
-                # Timing: Logging section
-                logging_start_time = time.time()
-                log_dict = {k: float(v) for k, v in info.items()}
-                
-                # Log action predictions
-                actor_dist = agent.network.select('actor')(batch['observations'], batch['actor_goals'], params=agent.network.params)
-                
-                if cfg.discrete:
-                    if cfg.get('multi_discrete', False):
-                        # For multi-discrete actions (3D), compute accuracy per dimension
-                        predicted_actions = actor_dist.mode()
-                        expert_actions = batch['actions']
-                        
-                        throttle_accuracy = jnp.mean(predicted_actions[:, 0] == expert_actions[:, 0])
-                        steer_accuracy = jnp.mean(predicted_actions[:, 1] == expert_actions[:, 1])
-                        brake_accuracy = jnp.mean(predicted_actions[:, 2] == expert_actions[:, 2])
-                        
-                        log_dict['actions/throttle_accuracy'] = float(throttle_accuracy)
-                        log_dict['actions/steer_accuracy'] = float(steer_accuracy)
-                        log_dict['actions/brake_accuracy'] = float(brake_accuracy)
-                        log_dict['actions/overall_discrete_accuracy'] = float((throttle_accuracy + steer_accuracy + brake_accuracy) / 3)
-                        
-                        # Overall exact match accuracy (all dimensions must match)
-                        exact_match_accuracy = jnp.mean(jnp.all(predicted_actions == expert_actions, axis=-1))
-                        log_dict['actions/exact_match_accuracy'] = float(exact_match_accuracy)
-                    else:
-                        # For single discrete actions, compute exact match accuracy
-                        predicted_actions = actor_dist.mode()
-                        expert_actions = batch['actions']
-                        categorical_accuracy = jnp.mean(predicted_actions == expert_actions)
-                        log_dict['actions/categorical_accuracy'] = float(categorical_accuracy)
-                    
-                    # Debug: Check for NaN values in key computations
-                    log_probs = actor_dist.log_prob(expert_actions)
-                    log_dict['debug/log_probs_has_nan'] = float(jnp.any(jnp.isnan(log_probs)))
-                    log_dict['debug/logits_has_nan'] = float(jnp.any(jnp.isnan(actor_dist.logits)))
-                    
-                    # Debug: Check logit ranges and softmax behavior
-                    log_dict['debug/logits_min'] = float(jnp.min(actor_dist.logits))
-                    log_dict['debug/logits_max'] = float(jnp.max(actor_dist.logits))
-                    log_dict['debug/logits_mean'] = float(jnp.mean(actor_dist.logits))
-                    log_dict['debug/logits_std'] = float(jnp.std(actor_dist.logits))
-                    
-                    # Check if logits are in a reasonable range
-                    logits_range = jnp.max(actor_dist.logits) - jnp.min(actor_dist.logits)
-                    log_dict['debug/logits_range'] = float(logits_range)
-                    
-                    # Check softmax probabilities
-                    action_probs = jax.nn.softmax(actor_dist.logits, axis=-1)
-                    log_dict['debug/max_prob'] = float(jnp.max(action_probs))
-                    log_dict['debug/min_prob'] = float(jnp.min(action_probs))
-                    log_dict['debug/prob_std'] = float(jnp.std(action_probs))
-                    
-                    log_dict['debug/expert_actions_min'] = float(jnp.min(expert_actions))
-                    log_dict['debug/expert_actions_max'] = float(jnp.max(expert_actions))
-                    log_dict['debug/expert_actions_unique'] = int(len(jnp.unique(expert_actions)))
-                    
-                    log_dict['debug/predicted_actions_min'] = float(jnp.min(predicted_actions))
-                    log_dict['debug/predicted_actions_max'] = float(jnp.max(predicted_actions))
-                    log_dict['debug/predicted_actions_unique'] = int(len(jnp.unique(predicted_actions)))
-                    
-                    # Cross-entropy loss (using the distribution's log_prob method)
-                    cross_entropy_loss = -jnp.mean(log_probs)
-                    log_dict['actions/cross_entropy_loss'] = float(cross_entropy_loss)
-                    
-                    # Perplexity (exponential of cross-entropy, measures model confidence)
-                    perplexity = jnp.exp(cross_entropy_loss)
-                    log_dict['actions/perplexity'] = float(perplexity)
-                    
-                    # Action distribution entropy (measures diversity of predictions)
-                    action_probs = jax.nn.softmax(actor_dist.logits, axis=-1)
-                    action_entropy = -jnp.sum(action_probs * jnp.log(action_probs + 1e-8), axis=-1)
-                    log_dict['actions/entropy'] = float(jnp.mean(action_entropy))
-                    
-                    # Max probability (confidence of the top prediction)
-                    max_prob = jnp.max(action_probs, axis=-1)
-                    log_dict['actions/max_probability'] = float(jnp.mean(max_prob))
-                    
-                    # Logit statistics (useful for debugging)
-                    logit_mean = jnp.mean(actor_dist.logits, axis=-1)
-                    logit_std = jnp.std(actor_dist.logits, axis=-1)
-                    log_dict['actions/logit_mean'] = float(jnp.mean(logit_mean))
-                    log_dict['actions/logit_std'] = float(jnp.mean(logit_std))
-                    
-                    # Action space coverage (how many unique actions are being predicted)
-                    unique_predicted = len(jnp.unique(predicted_actions))
-                    unique_expert = len(jnp.unique(expert_actions))
-                    log_dict['actions/unique_predicted'] = unique_predicted
-                    log_dict['actions/unique_expert'] = unique_expert
-                    log_dict['actions/prediction_diversity'] = unique_predicted / unique_expert if unique_expert > 0 else 0.0
-                    
-                    # Remove the problematic bincount code for multi-discrete actions
-                    # Expert action frequency (how often the expert action appears in the batch)
-                    # This doesn't make sense for 3D discrete actions, so we'll skip it
-                    # expert_action_freq = jnp.bincount(expert_actions, length=actor_dist.logits.shape[-1])
-                    # expert_action_freq = expert_action_freq / jnp.sum(expert_action_freq)
-                    # log_dict['actions/expert_action_entropy'] = float(-jnp.sum(expert_action_freq * jnp.log(expert_action_freq + 1e-8)))
-                
-                # Add actor loss component analysis
-                if actor_losses:
-                    recent_actor_losses = actor_losses[-args.log_every:]
-                    recent_bc_losses = bc_losses[-args.log_every:]
-                    
-                    log_dict['actor/loss_std'] = float(np.std(recent_actor_losses))
-                    log_dict['actor/loss_change'] = (recent_actor_losses[-1] - recent_actor_losses[0]) if len(recent_actor_losses) > 1 else 0
-                    log_dict['actor/bc_loss_mean'] = float(np.mean(recent_bc_losses))
-                
-                wandb.log(log_dict, step=total_steps)
+            upd_ms = (time.time() - t1) * 1000.0
 
-                progress.set_postfix(
-                    actor_loss=float(info.get('actor/actor_loss', 0.0)),
-                    reward_mean=reward_stats[-1]['mean'] if reward_stats else 0,
-                    at_goal=reward_stats[-1]['at_goal'] if reward_stats else 0,
+            # Logging (use total_steps, not step, so logging works across epochs)
+            if total_steps % args.log_every == 0:
+                log_dict: Dict[str, object] = {}
+
+                # ============================
+                # Actor action distributions (train)
+                # ============================
+                # Recompute predictions here to avoid changing the agent implementation.
+                actor_dist = agent.network.select("actor")(
+                    batch["observations"],
+                    batch["actor_goals"],
+                    params=agent.network.params,
                 )
-                
-                # Timing: End of logging
-                logging_time = time.time() - logging_start_time
-                if step % 15 == 0:  # Add logging time to our timing report
-                    #print(f"Logging time:   {logging_time:.4f}s")
-                    pass
-            if args.ckpt_every and step and step % args.ckpt_every == 0 or step == 80000:
-                ckpt_path = ckpt_dir / f'agent_step{total_steps}.pkl'
-                with ckpt_path.open('wb') as f:
+                pred_actions = np.asarray(actor_dist.mode())
+                target_actions = np.asarray(batch["actions"])
+                if pred_actions.ndim == 2 and pred_actions.shape == target_actions.shape:
+                    action_names = ["steer", "throttle", "brake"]
+                    action_dim = pred_actions.shape[1]
+                    for i in range(action_dim):
+                        name = action_names[i] if i < len(action_names) else f"action_{i}"
+                        log_dict[f"train/pred_{name}_hist"] = wandb.Histogram(pred_actions[:, i])
+                        log_dict[f"train/target_{name}_hist"] = wandb.Histogram(target_actions[:, i])
+
+                # Log only the requested scalar metrics under clear names.
+                metric_map = [
+                    ("actor/bc_loss", "train/actor_bc_loss"),
+                    ("actor/q_loss", "train/actor_q_loss"),
+                    ("actor/mse", "train/actor_mse"),
+                    ("critic/contrastive_loss", "train/critic_loss"),
+                    ("critic/categorical_accuracy", "train/critic_categorical_accuracy"),
+                ]
+                for src_key, dst_name in metric_map:
+                    if src_key in info:
+                        log_dict[dst_name] = float(info[src_key])
+
+                wandb.log(log_dict, step=total_steps)
+                last_log_step = total_steps
+
+            # Progress bar: show primary loss metrics
+            postfix = {}
+            if "actor/bc_loss" in info:
+                postfix["bc"] = float(info["actor/bc_loss"])
+            if "actor/q_loss" in info:
+                postfix["q"] = float(info["actor/q_loss"])
+            if "critic/contrastive_loss" in info:
+                postfix["critic"] = float(info["critic/contrastive_loss"])
+            if postfix:
+                progress.set_postfix(**postfix)
+
+            # checkpoints (use total_steps, not step, so checkpoints work across epochs)
+            if args.ckpt_every and total_steps % args.ckpt_every == 0:
+                ckpt_path = ckpt_dir / f"agent_step{total_steps}.pkl"
+                with ckpt_path.open("wb") as f:
                     f.write(fxs.to_bytes(agent))
-            # Compute validation loss every 20000 steps
-            if step % 10000 == 0 and step > 0:
-                print(f"\nComputing validation loss at step {total_steps}...")
-                val_metrics = compute_validation_loss(agent, val_dataset, sample_batch_fn, batch_size=1000, frame_stack=args.frame_stack, config=cfg)
-                
-                print(f"Validation metrics:")
-                for key, value in val_metrics.items():
-                    print(f"  {key}: {value:.4f}")
-                
-                # Log validation metrics to wandb
+                last_ckpt_step = total_steps
+
+            # validation (use total_steps, not step, so validation works across epochs)
+            if val_dataset is not None and total_steps % args.val_every == 0:
+                val_metrics = compute_validation_loss(agent, val_dataset, batch_size=cfg.batch_size)
+                # Filter out non-numeric values (like wandb.Table) when printing
+                numeric_metrics = {k: v for k, v in val_metrics.items() if isinstance(v, (int, float, np.number))}
+                print(f"\nValidation @ step {total_steps}: " + ", ".join(f"{k}={v:.4f}" for k, v in numeric_metrics.items()))
                 wandb.log(val_metrics, step=total_steps)
+                last_val_step = total_steps
+
+        # After epoch ends, checkpoint/validate/log if we haven't already this step
+        if args.ckpt_every and total_steps != last_ckpt_step:
+            ckpt_path = ckpt_dir / f"agent_step{total_steps}.pkl"
+            with ckpt_path.open("wb") as f:
+                f.write(fxs.to_bytes(agent))
+            print(f"Checkpoint saved @ step {total_steps} (end of epoch {epoch + 1})")
+            last_ckpt_step = total_steps
+
+        if val_dataset is not None and total_steps != last_val_step:
+            val_metrics = compute_validation_loss(agent, val_dataset, batch_size=cfg.batch_size)
+            numeric_metrics = {k: v for k, v in val_metrics.items() if isinstance(v, (int, float, np.number))}
+            print(f"\nValidation @ step {total_steps} (end of epoch {epoch + 1}): " + ", ".join(f"{k}={v:.4f}" for k, v in numeric_metrics.items()))
+            wandb.log(val_metrics, step=total_steps)
+            last_val_step = total_steps
+
+        # Log at end of epoch if we haven't already this step
+        if total_steps != last_log_step:
+            batch_np = train_dataset.sample(cfg.batch_size)
+            batch = numpy_to_jax(batch_np)
+            _, info = agent.update(batch)
+
+            log_dict: Dict[str, object] = {}
+            key_subset = (
+                "actor/bc_loss",
+                "actor/q_loss",
+                "actor/mse",
+                "critic/contrastive_loss",
+                "critic/categorical_accuracy",
+            )
+            for metric_key in key_subset:
+                if metric_key in info:
+                    log_dict[f"train/{metric_key.replace('/', '_')}"] = float(info[metric_key])
             
-            if step % 10000 == 0:
-                print(f'Step {total_steps} (Epoch {epoch+1}/{args.epochs}): At-goal rate = {float(jnp.mean(batch["masks"] == 0.0)):.4f}')
-    
-    final_model_path = ckpt_dir / 'final_model.pkl'
-    print(f'Saving final model to {final_model_path}')
-    with final_model_path.open('wb') as f:
+            wandb.log(log_dict, step=total_steps)
+            last_log_step = total_steps
+
+    # save final
+    final_model_path = Path(args.ckpt_dir) / "final_model.pkl"
+    print(f"Saving final model to {final_model_path}")
+    with final_model_path.open("wb") as f:
         f.write(fxs.to_bytes(agent))
 
-    # Final validation evaluation
-    print("\nComputing final validation loss...")
-    final_val_metrics = compute_validation_loss(agent, val_dataset, sample_batch_fn, batch_size=1000, frame_stack=args.frame_stack, config=cfg)
-    
-    print("Final validation metrics:")
-    for key, value in final_val_metrics.items():
-        print(f"  {key}: {value:.4f}")
-    
-    wandb.log(final_val_metrics, step=step)
+    # final validation
+    if val_dataset is not None:
+        final_val = compute_validation_loss(agent, val_dataset, batch_size=cfg.batch_size)
+        # Filter out non-numeric values (like wandb.Table) when printing
+        numeric_final_val = {k: float(v) for k, v in final_val.items() if isinstance(v, (int, float, np.number))}
+        print("Final validation:", numeric_final_val)
+        wandb.log(final_val, step=total_steps)
     wandb.finish()
 
 
-if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='Minimal CRL offline training script')
-    parser.add_argument('--dataset_path', type=str, required=True, help='Path to .npz offline dataset')
-    parser.add_argument('--steps', type=int, default=500_000, help='Total gradient steps')
-    parser.add_argument('--epochs', type=int, default=3, help='Number of epochs to train')
-    parser.add_argument('--batch_size', type=int, default=256)
-    parser.add_argument('--actor_loss', choices=['awr', 'ddpgbc'], default='ddpgbc')
-    parser.add_argument('--project', default='crl_training')
-    parser.add_argument('--seed', type=int, default=0)
-    parser.add_argument('--log_every', type=int, default=1000)
-    parser.add_argument('--ckpt_every', type=int, default=50_000)
-    parser.add_argument('--ckpt_dir', default='checkpoints')
-    parser.add_argument('--frame_stack', type=int, default=1)
-    parser.add_argument('--algorithm', default='CRL')
-    parser.add_argument('--use_guided', action='store_true', help='Use GuidedAgent with CRL as base')
-    parser.add_argument('--chunk_size', type=int, default=5000)
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="CRL/GCBC offline training (clean CPU-bypass design)")
+    parser.add_argument("--dataset_path", type=str, required=True, help="Path to .npz offline dataset")
+    parser.add_argument("--steps", type=int, default=800_000, help="Total gradient steps")
+    parser.add_argument("--epochs", type=int, default=2, help="Number of epochs to train")
+    parser.add_argument("--batch_size", type=int, default=256)
+    parser.add_argument("--actor_loss", choices=["awr", "ddpgbc"], default="ddpgbc")
+    parser.add_argument("--project", default="crl_training")
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--log_every", type=int, default=1000)
+    parser.add_argument("--ckpt_every", type=int, default=50_000)
+    parser.add_argument("--ckpt_dir", default="checkpoints")
+    parser.add_argument("--algorithm", default="CRL")
+    parser.add_argument("--block_size", type=int, default=400, help="Block size for block-aware frame stacking and shuffling")
+    parser.add_argument("--val_every", type=int, default=500)
+    parser.add_argument("--obs_h", type=int, default=100)
+    parser.add_argument("--obs_w", type=int, default=100)
+    parser.add_argument("--obs_c", type=int, default=3)
+    parser.add_argument("--frame_offsets", nargs="*", type=int, default=None, help="e.g., --frame_offsets 0 -5 -10 -20")
+    parser.add_argument("--no_filter_intersections", action="store_true", help="Disable filtering of intersection/stationary frames")
+    parser.add_argument("--use_mrn_metric", action="store_true", help="Enable MRN distance inside CRL contrastive loss")
+    parser.add_argument("--mrn_components", type=int, default=None, help="Number of MRN components (requires --use_mrn_metric)")
+
     args = parser.parse_args()
     main(args)

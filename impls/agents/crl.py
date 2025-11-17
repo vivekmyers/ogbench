@@ -4,12 +4,17 @@ import flax
 import jax
 import jax.numpy as jnp
 import ml_collections
-import optax
 import numpy as np
-from typing import Dict
+import optax
 from utils.encoders import GCEncoder, encoder_modules
 from utils.flax_utils import ModuleDict, TrainState, nonpytree_field
-from utils.networks import GCActor, GCBilinearValue, GCDiscreteActor, GCDiscreteBilinearCritic
+from utils.networks import (
+    GCActor,
+    GCBilinearValue,
+    GCDiscreteActor,
+    GCDiscreteBilinearCritic,
+    GoalDistanceHead,
+)
 
 
 class CRLAgent(flax.struct.PyTreeNode):
@@ -41,23 +46,67 @@ class CRLAgent(flax.struct.PyTreeNode):
         if len(phi.shape) == 2:  # Non-ensemble.
             phi = phi[None, ...]
             psi = psi[None, ...]
-        logits = jnp.einsum('eik,ejk->ije', phi, psi) / jnp.sqrt(phi.shape[-1])
+        
+        # Normalize phi and psi to unit vectors to prevent representation collapse
+        phi_norm = phi / (jnp.linalg.norm(phi, axis=-1, keepdims=True) + 1e-8)
+        psi_norm = psi / (jnp.linalg.norm(psi, axis=-1, keepdims=True) + 1e-8)
+        
+        # Compute logits: similarity between phi[i] and psi[j] for all pairs
+        # Use normalized representations to ensure meaningful similarity scores
+        logits = jnp.einsum('eik,ejk->ije', phi_norm, psi_norm)
         # logits.shape is (B, B, e) with one term for positive pair and (B - 1) terms for negative pairs in each row.
         I = jnp.eye(batch_size)
-        contrastive_loss = jax.vmap(
-            lambda _logits: optax.sigmoid_binary_cross_entropy(logits=_logits, labels=I),
-            in_axes=-1,
-            out_axes=-1,
-        )(logits)
+        
+        # Use InfoNCE-style contrastive loss with temperature scaling
+        # Temperature scaling helps the model learn better separations
+        temperature = 0.17  # Standard temperature for contrastive learning
+        logits_scaled = logits / temperature
+        
+        # For each ensemble member, compute InfoNCE loss
+        # For each row i, we want logits[i, i] (positive) to be larger than logits[i, j] for j != i (negatives)
+        def infonce_loss(_logits):
+
+            row_log_probs = jax.nn.log_softmax(_logits, axis=-1)  # Shape: (B, B)
+            
+            pos_log_probs = jnp.diag(row_log_probs)  # Shape: (B,)
+        
+            return -jnp.mean(pos_log_probs)
+        
+        contrastive_loss = jax.vmap(infonce_loss, in_axes=-1, out_axes=-1)(logits_scaled)
         contrastive_loss = jnp.mean(contrastive_loss)
+        
+        # Use original logits (before scaling) for statistics
+        logits_for_stats = logits
 
         # Compute additional statistics.
-        logits = jnp.mean(logits, axis=-1)
+        v = jnp.exp(v)
+        logits = jnp.mean(logits_for_stats, axis=-1)  # Average over ensemble for stats
         correct = jnp.argmax(logits, axis=1) == jnp.argmax(I, axis=1)
         logits_pos = jnp.sum(logits * I) / jnp.sum(I)
         logits_neg = jnp.sum(logits * (1 - I)) / jnp.sum(1 - I)
+        
+        # Additional diagnostics: check representation diversity
+        phi_mean = jnp.mean(phi_norm, axis=(0, 1))  # Average over ensemble and batch
+        psi_mean = jnp.mean(psi_norm, axis=(0, 1))
+        phi_std = jnp.std(phi_norm, axis=(0, 1))
+        psi_std = jnp.std(psi_norm, axis=(0, 1))
+        phi_psi_diff = jnp.mean(jnp.abs(phi_mean - psi_mean))
+        
+        # Check for representation collapse: if all representations are similar, std will be low
+        # Average std across batch dimension for each ensemble member, then average over ensemble
+        phi_batch_std = jnp.mean(jnp.std(phi_norm, axis=1))  # Shape: (e, latent_dim) -> mean over e and latent_dim
+        psi_batch_std = jnp.mean(jnp.std(psi_norm, axis=1))
+        
+        # Check if positive pairs are actually more similar than negatives
+        pos_similarities = jnp.diag(logits)  # Positive pair similarities (B,)
+        neg_similarities = logits * (1 - I)  # All negative pairs (B, B)
+        neg_similarities_mean = jnp.sum(neg_similarities) / jnp.sum(1 - I)
+        pos_neg_gap = jnp.mean(pos_similarities) - neg_similarities_mean
 
-        return contrastive_loss, {
+        distance_weight = float(self.config.get('distance_loss_weight', 0.0))
+        distance_loss = 0.0
+
+        stats = {
             'contrastive_loss': contrastive_loss,
             'v_mean': v.mean(),
             'v_max': v.max(),
@@ -67,26 +116,59 @@ class CRLAgent(flax.struct.PyTreeNode):
             'logits_pos': logits_pos,
             'logits_neg': logits_neg,
             'logits': logits.mean(),
+            'logits_std': jnp.std(logits),
+            'logits_pos_neg_diff': logits_pos - logits_neg,  # Should be positive if working
+            'phi_mean_norm': jnp.linalg.norm(phi_mean),
+            'psi_mean_norm': jnp.linalg.norm(psi_mean),
+            'phi_std_mean': jnp.mean(phi_std),
+            'psi_std_mean': jnp.mean(psi_std),
+            'phi_psi_diff': phi_psi_diff,
+            # Representation collapse diagnostics
+            'phi_batch_std': phi_batch_std,  # Low (< 0.05) = representation collapse
+            'psi_batch_std': psi_batch_std,  # Low (< 0.05) = representation collapse
+            'pos_neg_gap': pos_neg_gap,  # Should be positive and increasing (target: > 0.2)
+            'pos_similarity_mean': jnp.mean(pos_similarities),
+            'neg_similarity_mean': neg_similarities_mean,
         }
+
+        if (
+            module_name == 'critic'
+            and distance_weight > 0.0
+            and 'distance_head' in grad_params
+            and 'value_goal_deltas' in batch
+        ):
+            phi_mean = jnp.mean(phi, axis=0)
+            psi_mean = jnp.mean(psi, axis=0)
+            distance_pred = self.network.select('distance_head')(
+                phi_mean,
+                psi_mean,
+                params=grad_params,
+            )
+            targets = batch['value_goal_deltas']
+            mask = batch.get('value_goal_delta_mask')
+            if mask is None:
+                mask = jnp.ones_like(targets)
+            mse = (distance_pred - targets) ** 2
+            distance_loss = jnp.sum(mask * mse) / (jnp.sum(mask) + 1e-6)
+            contrastive_loss = contrastive_loss + distance_weight * distance_loss
+
+            stats.update(
+                {
+                    'distance_loss': distance_loss,
+                    'distance_pred_mean': jnp.mean(distance_pred),
+                    'distance_target_mean': jnp.mean(targets),
+                    'distance_mask_fraction': jnp.mean(mask),
+                }
+            )
+
+        return contrastive_loss, stats
 
     def actor_loss(self, batch, grad_params, rng=None):
         """Compute the actor loss (AWR or DDPG+BC)."""
-        # Maximize log Q if actor_log_q is True (which is default).
-        if self.config['actor_log_q']:
-
-            def value_transform(x):
-                return jnp.log(jnp.maximum(x, 1e-6))
-        else:
-
-            def value_transform(x):
-                return x
-
         if self.config['actor_loss'] == 'awr':
             # AWR loss.
-            v = value_transform(self.network.select('value')(batch['observations'], batch['actor_goals']))
-            q1, q2 = value_transform(
-                self.network.select('critic')(batch['observations'], batch['actor_goals'], batch['actions'])
-            )
+            v = self.network.select('value')(batch['observations'], batch['actor_goals'])
+            q1, q2 = self.network.select('critic')(batch['observations'], batch['actor_goals'], batch['actions'])
             q = jnp.minimum(q1, q2)
             adv = q - v
 
@@ -95,6 +177,8 @@ class CRLAgent(flax.struct.PyTreeNode):
 
             dist = self.network.select('actor')(batch['observations'], batch['actor_goals'], params=grad_params)
             log_prob = dist.log_prob(batch['actions'])
+
+            pred_actions = dist.mode()
 
             actor_loss = -(exp_a * log_prob).mean()
 
@@ -121,9 +205,7 @@ class CRLAgent(flax.struct.PyTreeNode):
                 q_actions = jnp.clip(dist.mode(), -1, 1)
             else:
                 q_actions = jnp.clip(dist.sample(seed=rng), -1, 1)
-            q1, q2 = value_transform(
-                self.network.select('critic')(batch['observations'], batch['actor_goals'], q_actions)
-            )
+            q1, q2 = self.network.select('critic')(batch['observations'], batch['actor_goals'], q_actions)
             q = jnp.minimum(q1, q2)
 
             # Normalize Q values by the absolute mean to make the loss scale invariant.
@@ -211,7 +293,7 @@ class CRLAgent(flax.struct.PyTreeNode):
 
         Args:
             seed: Random seed.
-            ex_observations: Example observations.
+            ex_observations: Example batch of observations.
             ex_actions: Example batch of actions. In discrete-action MDPs, this should contain the maximum action value.
             config: Configuration dictionary.
         """
@@ -242,7 +324,7 @@ class CRLAgent(flax.struct.PyTreeNode):
                 latent_dim=config['latent_dim'],
                 layer_norm=config['layer_norm'],
                 ensemble=True,
-                value_exp=True,
+                value_exp=False,
                 state_encoder=encoders.get('critic_state'),
                 goal_encoder=encoders.get('critic_goal'),
                 action_dim=action_dim,
@@ -253,7 +335,7 @@ class CRLAgent(flax.struct.PyTreeNode):
                 latent_dim=config['latent_dim'],
                 layer_norm=config['layer_norm'],
                 ensemble=True,
-                value_exp=True,
+                value_exp=False,
                 state_encoder=encoders.get('critic_state'),
                 goal_encoder=encoders.get('critic_goal'),
             )
@@ -265,7 +347,7 @@ class CRLAgent(flax.struct.PyTreeNode):
                 latent_dim=config['latent_dim'],
                 layer_norm=config['layer_norm'],
                 ensemble=False,
-                value_exp=True,
+                value_exp=False,
                 state_encoder=encoders.get('value_state'),
                 goal_encoder=encoders.get('value_goal'),
             )
@@ -293,6 +375,16 @@ class CRLAgent(flax.struct.PyTreeNode):
             network_info.update(
                 value=(value_def, (ex_observations, ex_goals)),
             )
+        if config.get('distance_loss_weight', 0.0) > 0.0:
+            distance_head_def = GoalDistanceHead(
+                latent_dim=config['latent_dim'],
+                hidden_dims=config.get('distance_head_hidden_dims', (256, 256)),
+            )
+            dummy_latent = np.zeros((1, config['latent_dim']), dtype=ex_observations.dtype)
+            network_info['distance_head'] = (
+                distance_head_def,
+                (dummy_latent, dummy_latent),
+            )
         networks = {k: v[0] for k, v in network_info.items()}
         network_args = {k: v[1] for k, v in network_info.items()}
 
@@ -318,7 +410,6 @@ def get_config():
             discount=0.99,  # Discount factor.
             actor_loss='ddpgbc',  # Actor loss type ('awr' or 'ddpgbc').
             alpha=0.1,  # Temperature in AWR or BC coefficient in DDPG+BC.
-            actor_log_q=True,  # Whether to maximize log Q (True) or Q itself (False) in the actor loss.
             const_std=True,  # Whether to use constant standard deviation for the actor.
             discrete=False,  # Whether the action space is discrete.
             encoder=ml_collections.config_dict.placeholder(str),  # Visual encoder name (None, 'impala_small', etc.).
@@ -335,133 +426,8 @@ def get_config():
             gc_negative=False,  # Unused (defined for compatibility with GCDataset).
             p_aug=0.0,  # Probability of applying image augmentation.
             frame_stack=ml_collections.config_dict.placeholder(int),  # Number of frames to stack.
+            distance_loss_weight=0.0,
+            distance_head_hidden_dims=(256, 256),
         )
     )
     return config
-
-
-def sample_batch(
-    dataset: Dict[str, np.ndarray], *, batch_size: int, frame_stack: int = 1, config: Dict
-) -> Dict[str, jnp.ndarray]:
-    """Fast batch sampling for CRL contrastive learning."""
-    n = int(dataset['observations'].shape[0] * 0.8)
-    
-    # CRITICAL FIX: Limit sampling range to leave room for goal offsets
-    # Use a much more conservative approach - leave plenty of room
-    discount = config.get('discount', 0.95)  # Use the actual discount from config
-    geometric_p = 1 - discount
-    
-    # Use 99.9th percentile + safety margin for maximum offset
-    theoretical_max = int(np.log(0.001) / np.log(1 - geometric_p))  # 99.9th percentile
-    safety_margin = 100  # Additional safety margin
-    max_safe_offset = theoretical_max + safety_margin
-    max_safe_offset = min(max_safe_offset, 500)  # Cap at 500 frames
-    
-    # Sample from a much more conservative range
-    safe_n = max(n - max_safe_offset, n // 3)  # Use at most 2/3 of dataset for safety
-    
-    idx = np.random.choice(safe_n, batch_size, replace=True)
-    # Create base batch
-    batch = {
-        'observations': dataset['observations'][idx],
-        'action_labels': dataset['action_labels'][idx],
-        'actions': dataset['actions'][idx],
-        'next_observations': dataset['next_observations'][idx],
-        'rewards': jnp.zeros((batch_size,)),
-        'masks': jnp.ones((batch_size,)),
-    }
-    
-    should_debug = False  # Disable debug output for cleaner logs
-    
-    # Use geometric distribution for goal sampling (proper CRL approach)
-    # Sample goal offsets using geometric distribution based on discount factor
-    discount = config.get('discount', 0.99)
-    geometric_p = 1 - discount  # probability parameter for geometric distribution
-    
-    # Sample offsets for all batch elements using geometric distribution
-    offsets = np.random.geometric(p=geometric_p, size=batch_size)
-    
-    # Additional safety: clip offsets to reasonable range
-    offsets = np.clip(offsets, 1, 2000)  # Between 1 and 200 frames ahead
-    
-    # CRITICAL FIX: Use bidirectional mapping to maintain temporal structure
-    # BUT FALLBACK TO SIMPLE METHOD IF MAPPING IS BROKEN
-    use_mapping = ('shuffled_to_original' in dataset and 'original_to_shuffled' in dataset)
-    
-    # Quick sanity check on mapping if debug is enabled
-    if use_mapping:
-        mapping_ok = (
-            len(dataset['shuffled_to_original']) == len(dataset['observations']) and
-            len(dataset['original_to_shuffled']) == len(dataset['observations']) and
-            np.max(dataset['shuffled_to_original']) < len(dataset['observations']) and
-            np.max(dataset['original_to_shuffled']) < len(dataset['observations'])
-        )
-        if not mapping_ok:
-            use_mapping = False
-    
-    if use_mapping:
-        # Get the original temporal positions of our sampled frames
-        original_positions = dataset['shuffled_to_original'][idx]
-        
-        # Add offsets to get future frames in original temporal order
-        goal_original_positions = original_positions + offsets
-        
-        # Clip to valid range in original timeline
-        max_original_pos = len(dataset['original_to_shuffled']) - 1
-        goal_original_positions_safe = np.clip(goal_original_positions, 0, max_original_pos)
-        
-        # Direct lookup: where are these goal positions in the shuffled dataset?
-        goal_idx = dataset['original_to_shuffled'][goal_original_positions_safe]
-    else:
-        # SIMPLE BUT EFFECTIVE FALLBACK: Direct offset-based sampling
-        # This maintains temporal relationships without complex mapping
-        # Ensure goals don't go out of bounds by using the safe sampling we already did
-        goal_idx = np.clip(idx + offsets, 0, safe_n - 1)
-    
-    # Create goal-conditioned batch
-    goal_observations = dataset['observations'][goal_idx]
-    
-
-    
-    # Debug shape issues that might cause NaN
-    obs_shape = dataset['observations'].shape
-    goal_obs_shape = goal_observations.shape
-    
-    if np.random.random() < 0.001:  # Very rare debug print
-        print(f"DEBUG sample_batch shapes:")
-        print(f"  Original observations: {obs_shape}")
-        print(f"  Goal observations: {goal_obs_shape}")
-        print(f"  Frame stack: {frame_stack}")
-        print(f"  Expected channels per frame: 3")
-        print(f"  Expected total channels: {3 * frame_stack}")
-    
-    # Extract the last frame (last 3 channels) for goal
-    if len(goal_observations.shape) == 4 and goal_observations.shape[-1] >= 3:
-        base_goals = goal_observations[:, :, :, -3:]  # Last frame's RGB
-    else:
-        print(f"ERROR: Unexpected observation shape: {goal_observations.shape}")
-        print(f"Cannot extract last 3 channels for goal. Using full observation.")
-        base_goals = goal_observations
-    
-    # Check for any NaN/inf values in goals
-    if np.any(np.isnan(base_goals)) or np.any(np.isinf(base_goals)):
-        print(f"WARNING: NaN or Inf detected in base_goals!")
-        print(f"Goal indices: {goal_idx[:5]}...")  # Show first few
-        print(f"Data indices: {idx[:5]}...")
-        base_goals = np.nan_to_num(base_goals, nan=0.0, posinf=1.0, neginf=-1.0)
-    
-    goal_stack = jnp.concatenate([base_goals] * frame_stack, axis=-1)
-
-    batch['value_goals'] = goal_stack
-    batch['actor_goals'] = goal_stack
-    
-
-
-    # Compute rewards based on temporal distance (offsets), not shuffled index distance
-    # Closer goals (smaller temporal offsets) get higher rewards
-    batch['rewards'] = -offsets.astype(float) / 20.0  # Negative reward proportional to temporal distance
-    batch['masks'] = jnp.ones((batch_size,))  # Keep all transitions active
-    
-
-    
-    return batch

@@ -135,7 +135,13 @@ class TrainState(flax.struct.PyTreeNode):
         It additionally computes the gradient statistics and adds them to the dictionary.
         """
         grads, info = jax.grad(loss_fn, has_aux=True)(self.params)
-        grads = jax.tree_util.tree_map(lambda x: jnp.clip(x, -1.0, 1.0), grads)  # Clip to prevent instability
+        # Use global gradient clipping by norm instead of element-wise clipping
+        grad_norm = jnp.sqrt(sum(jnp.sum(jnp.square(x)) for x in jax.tree_util.tree_leaves(grads)))
+        clip_norm = 50.0  # Increased for large visual networks
+        grads = jax.tree_util.tree_map(
+            lambda x: x * jnp.minimum(1.0, clip_norm / (grad_norm + 1e-8)), 
+            grads
+        )
 
         grad_max = jax.tree_util.tree_map(jnp.max, grads)
         grad_min = jax.tree_util.tree_map(jnp.min, grads)

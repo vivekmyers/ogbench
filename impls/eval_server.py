@@ -13,7 +13,7 @@ def main():
     parser.add_argument("--algorithm", type=str, required=True, help="Algorithm name (e.g., CRL, GCIQL, SAC)")
     parser.add_argument("--model_path", type=str, required=True, help="Path to model .pkl file")
     parser.add_argument("--dataset_path", type=str, required=True, help="Path to dataset .npz file")
-    parser.add_argument("--goal_index", type=int, default=0, help="Goal frame index from dataset")
+    parser.add_argument("--goal_index", type=int, default=100, help="Goal frame index from dataset")
     parser.add_argument("--frame_stack", type=int, default=4)
     args = parser.parse_args()
 
@@ -24,17 +24,19 @@ def main():
     get_config = getattr(agent_module, "get_config")
     
     config = get_config()
-    config.encoder = "impala"
+    config.encoder = "impala_large"  # Match training encoder
     config.frame_stack = args.frame_stack
+    config.layer_norm = False  # Match training config
+    config.frame_offsets = [0, -5, -10, -15]  # Match training frame offsets
     
     # Algorithm-specific configs
     if args.algorithm.upper() == "CRL":
         config.actor_loss = "ddpgbc"
     config.discrete = False
 
-    obs_shape = (48, 48, 3)
-    act_shape = (2,)
-    stacked_obs_shape = (48, 48, obs_shape[2] * config.frame_stack)
+    obs_shape = (100, 100, 3)  # Match training observation shape
+    act_shape = (3,)  # Match training action shape (throttle, steer, brake)
+    stacked_obs_shape = (100, 100, obs_shape[2] * config.frame_stack)
 
     # Dummy inputs
     dummy_obs = jnp.zeros((1, *stacked_obs_shape))
@@ -92,7 +94,17 @@ def main():
             act = dist.mean()
 
             act_np = np.array(act[0], dtype=np.float32)
-            conn.sendall(act_np.tobytes())
+            
+            # Debug: Print action values
+            print(f"Action: throttle={act_np[0]:.3f}, steer={act_np[1]:.3f}, brake={act_np[2]:.3f}")
+            
+            # If simulator expects 2D actions, drop the brake dimension
+            if len(act_np) == 3:
+                # For CARLA, might want to use: [throttle, steer] or [throttle-brake, steer]
+                act_np_2d = np.array([act_np[0], act_np[1]], dtype=np.float32)  # throttle, steer
+                conn.sendall(act_np_2d.tobytes())
+            else:
+                conn.sendall(act_np.tobytes())
 
     except KeyboardInterrupt:
         print("Interrupted by User")

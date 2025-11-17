@@ -22,8 +22,6 @@ class GCBCAgent(flax.struct.PyTreeNode):
 
     def actor_loss(self, batch, grad_params, rng=None):
         dist = self.network.select('actor')(batch['observations'], batch['actor_goals'], params=grad_params)
-        #print(dist.shape)
-        print(batch['actions'].shape)
         log_prob = dist.log_prob(batch['actions'])
 
         actor_loss = -log_prob.mean()
@@ -149,77 +147,78 @@ class GCBCAgent(flax.struct.PyTreeNode):
         return cls(rng, network=network, config=flax.core.FrozenDict(**config))
 
 def sample_batch(
-    dataset: Dict[str, np.ndarray], *, batch_size: int, frame_stack: int = 1, config: Dict, use_guided: bool = False
+    dataset: Dict[str, np.ndarray], *, batch_size: int, frame_stack: int = 1, config: Dict, add_action_noise: bool = True
 ) -> Dict[str, jnp.ndarray]:
     n = len(dataset['observations'])
-    idx = np.random.choice(n, batch_size, replace=True)
     
+    # Action component upsampling
+    upsample_mode = config.get('upsample_mode', 'none')
+    if upsample_mode != 'none' and 'actions' in dataset:
+        actions = dataset['actions']
+        throttle = actions[:, 0]
+        steer = actions[:, 1]
+        brake = actions[:, 2]
+        
+        steer_thresh = config.get('steer_thresh', 0.1)
+        throttle_thresh = config.get('throttle_thresh', 0.3)
+        brake_thresh = config.get('brake_thresh', 0.1)
+        upsample_weight = config.get('upsample_weight', 3.0)
+        
+        if upsample_mode == 'turns_low':
+            is_target = np.abs(steer) < steer_thresh
+        elif upsample_mode == 'turns_high':
+            is_target = np.abs(steer) > steer_thresh
+        elif upsample_mode == 'throttle_low':
+            is_target = throttle < throttle_thresh
+        elif upsample_mode == 'throttle_high':
+            is_target = throttle > throttle_thresh
+        elif upsample_mode == 'brake_low':
+            is_target = brake < brake_thresh
+        elif upsample_mode == 'brake_high':
+            is_target = brake > brake_thresh
+        else:
+            is_target = np.zeros(n, dtype=bool)
+        
+        weights = np.where(is_target, upsample_weight, 1.0).astype(np.float64)
+        weights /= weights.sum()
+        idx = np.random.choice(n, batch_size, replace=True, p=weights)
+    else:
+        idx = np.random.choice(n, batch_size, replace=True)
+    
+    # Sample from CPU numpy arrays, then move to GPU as JAX arrays
     batch = {
-        'observations': dataset['observations'][idx],
-        'actions': dataset['actions'][idx],
-        'next_observations': dataset['next_observations'][idx],
+        'observations': jnp.array(dataset['observations'][idx]),
+        'actions': jnp.array(dataset['actions'][idx]),
         'rewards': jnp.zeros((batch_size,)),
         'masks': jnp.ones((batch_size,)),
     }
-    if not config['discrete']:
-        # Continuous action noise handling
-        action_noise_stds = jnp.array([0.005, 0.006, 0.003])
-        action_correlation = 0.9
-        
-        action_shape = batch['actions'].shape
-        if len(action_shape) == 2:
-            batch_size, action_dim = action_shape
-            rng = jax.random.PRNGKey(np.random.randint(0, 2**32))
-            noise = jnp.zeros((batch_size, action_dim))
-            for dim in range(min(3, action_dim)):
-                rng, noise_key = jax.random.split(rng)
-                noise = noise.at[:, dim].set(
-                    jax.random.normal(noise_key, (batch_size,)) * action_noise_stds[dim]
-                )
-            batch['actions'] = batch['actions'] + noise
-            batch['actions'] = batch['actions'].at[:, 0].set(jnp.clip(batch['actions'][:, 0], 0.0, 1.0))
-            batch['actions'] = batch['actions'].at[:, 1].set(jnp.clip(batch['actions'][:, 1], -1.0, 1.0))
-            if batch['actions'].shape[1] >= 3:
-                batch['actions'] = batch['actions'].at[:, 2].set(jnp.clip(batch['actions'][:, 2], 0.0, 1.0))
-        elif len(action_shape) == 3:
-            batch_size, seq_len, action_dim = action_shape
-            rng = jax.random.PRNGKey(np.random.randint(0, 2**32))
-            base_noise = jnp.zeros((seq_len, batch_size, action_dim))
-            for dim in range(min(3, action_dim)):
-                rng, noise_key = jax.random.split(rng)
-                base_noise = base_noise.at[:, :, dim].set(
-                    jax.random.normal(noise_key, (seq_len, batch_size)) * action_noise_stds[dim]
-                )
-            
-            def correlate_step(carry, noise):
-                prev_noise = carry
-                new_noise = action_correlation * prev_noise + (1 - action_correlation) * noise
-                return new_noise, new_noise
-            
-            init_noise = base_noise[0]
-            _, correlated_noise = jax.lax.scan(correlate_step, init_noise, base_noise[1:])
-            correlated_noise = jnp.concatenate([init_noise[None, ...], correlated_noise], axis=0)
-            correlated_noise = jnp.transpose(correlated_noise, (1, 0, 2))
-            batch['actions'] = batch['actions'] + correlated_noise
-            batch['actions'] = batch['actions'].at[:, :, 0].set(jnp.clip(batch['actions'][:, :, 0], 0.0, 1.0))
-            batch['actions'] = batch['actions'].at[:, :, 1].set(jnp.clip(batch['actions'][:, :, 1], -1.0, 1.0))
-            if batch['actions'].shape[2] >= 3:
-                batch['actions'] = batch['actions'].at[:, :, 2].set(jnp.clip(batch['actions'][:, :, 2], 0.0, 1.0))
     
-    # Goal sampling
+    # Goal sampling with geometric distribution
     discount = config.get('discount', 0.99)
     geometric_p = 1 - discount
+    
+    # Use pure geometric sampling (standard for goal-conditioned RL)
+    # At 20fps with discount=0.99: E[horizon] = 100 steps = 5 seconds
     offsets = np.random.geometric(p=geometric_p, size=batch_size)
-    offsets = np.clip(offsets, 1, 200)
-    goal_idx = idx + offsets
-    goal_idx = np.clip(goal_idx, 0, len(dataset['observations']) - 1)
-    goal_idx = goal_idx % len(dataset['observations'])
     
-    base_goals = dataset['observations'][goal_idx][:, :, :, -3:]
-    goal_stack = jnp.concatenate([base_goals] * frame_stack, axis=-1)
+    block_size = config.get('block_size', 1000)
+    goal_idx = np.zeros_like(idx)
     
-    batch['value_goals'] = jnp.zeros_like(goal_stack)
-    batch['actor_goals'] = jnp.zeros_like(goal_stack)
+    for i, obs_idx in enumerate(idx):
+        block_start = (obs_idx // block_size) * block_size
+        block_end = block_start + block_size
+        
+        goal_pos = obs_idx + offsets[i]
+        # Clip to both block boundaries AND dataset size
+        goal_pos = min(goal_pos, block_end - 1, n - 1)
+        goal_idx[i] = goal_pos
+    
+    # Goals use pre-stacked observations directly (already have correct channel count)
+    goal_observations = jnp.array(dataset['observations'][goal_idx])
+    
+    # Only need actor goals for GCBC
+    batch['actor_goals'] = goal_observations
+    batch['rewards'] = jnp.zeros((batch_size,))
     batch['masks'] = jnp.ones((batch_size,))
     return batch
     
@@ -248,6 +247,22 @@ def get_config():
             gc_negative=True,  # Unused (defined for compatibility with GCDataset).
             p_aug=0.5,  # Probability of applying image augmentation.
             frame_stack=ml_collections.config_dict.placeholder(int),  # Number of frames to stack.
+            block_size=1000,  # Block size for goal sampling (trajectory length).
+            upsample_mode='none',  # Upsampling mode: 'turns_low', 'turns_high', 'throttle_low', 'throttle_high', 'brake_low', 'brake_high', 'none'
+            upsample_weight=3.0,  # Weight multiplier for upsampled samples
+            steer_thresh=0.1,  # Steer threshold for low/high detection
+            throttle_thresh=0.3,  # Throttle threshold for low/high detection
+            brake_thresh=0.1,  # Brake threshold for low/high detection
+            cycle_steps=20000,  # Steps per mode in cycle (20k each = 120k full cycle)
         )
     )
     return config
+
+
+# Metrics to log during training
+METRICS_TO_LOG = [
+    'actor/actor_loss',
+    'actor/bc_log_prob',
+    'actor/mse',
+    'actor/std',
+]

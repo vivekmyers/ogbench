@@ -186,6 +186,8 @@ class GCDataset:
         (self.terminal_locs,) = np.nonzero(self.dataset['terminals'] > 0)
         self.initial_locs = np.concatenate([[0], self.terminal_locs[:-1] + 1])
         assert self.terminal_locs[-1] == self.size - 1
+        # Trajectory id for each frame (same length as dataset).
+        self.traj_ids = np.searchsorted(self.terminal_locs, np.arange(self.size), side='left')
 
         # Assert probabilities sum to 1.
         assert np.isclose(
@@ -242,6 +244,14 @@ class GCDataset:
         successes = (idxs == value_goal_idxs).astype(float)
         batch['masks'] = 1.0 - successes
         batch['rewards'] = successes - (1.0 if self.config['gc_negative'] else 0.0)
+
+        # Goal-distance supervision (in frames).
+        value_goal_deltas = np.maximum(value_goal_idxs - idxs, 0)
+        same_traj = self.traj_ids[value_goal_idxs] == self.traj_ids[idxs]
+        future_goal = value_goal_idxs >= idxs
+        distance_mask = (same_traj & future_goal).astype(np.float32)
+        batch['value_goal_deltas'] = value_goal_deltas.astype(np.float32)
+        batch['value_goal_delta_mask'] = distance_mask
 
         if self.config['p_aug'] is not None and not evaluation:
             if np.random.rand() < self.config['p_aug']:

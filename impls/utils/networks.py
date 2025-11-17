@@ -339,6 +339,31 @@ class MultiDiscreteDistribution:
         # Sum log probabilities across dimensions
         return jnp.sum(jnp.stack(log_probs, axis=-1), axis=-1)
     
+    def mean(self):
+        """Convert discrete bins to continuous action values using linspace.
+        
+        This method computes the expected continuous action value by taking the weighted
+        average of bin centers, where weights are the softmax probabilities.
+        """
+        num_bins = 32
+        throttle_centers = jnp.linspace(0, 1, num_bins)
+        steer_centers = jnp.linspace(-1, 1, num_bins)
+        brake_centers = jnp.linspace(0, 1, num_bins)
+
+        all_centers = jnp.stack([throttle_centers, steer_centers, brake_centers], axis=0)
+
+        probs = []
+        for dist in self.distributions:
+            prob = jax.nn.softmax(dist.logits, axis=-1)
+            probs.append(prob)
+        
+        probs = jnp.stack(probs, axis=1)
+        batch_size = probs.shape[0]
+        centers_broadcast = all_centers[None, :, :]
+
+        mean_actions = jnp.sum(probs * centers_broadcast, axis=-1) 
+        return mean_actions
+    
     @property
     def logits(self):
         """Get the logits for all dimensions."""
@@ -481,6 +506,27 @@ class GCDiscreteBilinearCritic(GCBilinearValue):
     def __call__(self, observations, goals=None, actions=None, info=False):
         actions = jnp.eye(self.action_dim)[actions]
         return super().__call__(observations, goals, actions, info)
+
+
+class GoalDistanceHead(nn.Module):
+    """Predicts temporal distance between state and goal embeddings."""
+
+    latent_dim: int
+    hidden_dims: Sequence[int] = (256, 256)
+    layer_norm: bool = False
+
+    @nn.compact
+    def __call__(self, phi, psi):
+        """Inputs are (batch, latent_dim)."""
+        features = [
+            phi,
+            psi,
+            jnp.abs(phi - psi),
+            phi * psi,
+        ]
+        x = jnp.concatenate(features, axis=-1)
+        x = MLP((*self.hidden_dims, 1), layer_norm=self.layer_norm)(x)
+        return x.squeeze(-1)
 
 
 class GCMRNValue(nn.Module):
@@ -668,3 +714,63 @@ class DiscreteStateActionRepresentation(StateRepresentation):
             actions = jnp.eye(self.action_dim)[actions]
 
         return super().__call__(observations, actions, info)
+
+
+class GoalClassifier(nn.Module):
+    """Goal-conditioned success classifier C(s, a, g).
+    
+    This classifier predicts whether action a from state s will reach goal g within
+    a certain distance threshold. Shares the state encoder with the critic for
+    efficient feature reuse.
+    
+    Attributes:
+        hidden_dims: Hidden layer dimensions.
+        layer_norm: Whether to apply layer normalization.
+        state_encoder: Optional state encoder (shared with critic).
+        action_dim: Action dimension (for discrete actions, to one-hot encode).
+        discrete: Whether actions are discrete.
+    """
+    
+    hidden_dims: Sequence[int]
+    layer_norm: bool = True
+    state_encoder: nn.Module = None
+    action_dim: Optional[int] = None
+    discrete: bool = False
+    
+    def setup(self):
+        # Trunk: shared state encoder (if provided)
+        # Head: MLP that takes [encoded_state, action, encoded_goal] -> logit
+        self.classifier_head = MLP(
+            (*self.hidden_dims, 1),
+            activate_final=False,
+            layer_norm=self.layer_norm,
+        )
+    
+    def __call__(self, observations, actions, goals, goal_encoded=False):
+        """Return success logit C(s, a, g).
+        
+        Args:
+            observations: Current states s.
+            actions: Actions a (continuous or discrete integers).
+            goals: Goals g.
+            goal_encoded: Whether goals are already encoded (not used, for compatibility).
+        """
+        # Encode states and goals using shared encoder
+        if self.state_encoder is not None:
+            encoded_states = self.state_encoder(observations)
+            encoded_goals = self.state_encoder(goals)
+        else:
+            encoded_states = observations
+            encoded_goals = goals
+        
+        # Handle discrete actions: convert to one-hot
+        if self.discrete and self.action_dim is not None:
+            # actions are integers, convert to one-hot
+            actions = jnp.eye(self.action_dim)[actions]
+        
+        # Concatenate [encoded_state, action, encoded_goal]
+        inputs = jnp.concatenate([encoded_states, actions, encoded_goals], axis=-1)
+        
+        # Output logit
+        logit = self.classifier_head(inputs).squeeze(-1)
+        return logit

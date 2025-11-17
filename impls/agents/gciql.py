@@ -305,6 +305,7 @@ def get_config():
             gc_negative=True,  # Whether to use '0 if s == g else -1' (True) or '1 if s == g else 0' (False) as reward.
             p_aug=0.0,  # Probability of applying image augmentation.
             frame_stack=ml_collections.config_dict.placeholder(int),  # Number of frames to stack.
+            block_size=1000,  # Block size for goal sampling (trajectory length).
         )
     )
     return config
@@ -313,28 +314,14 @@ def get_config():
 def sample_batch(
     dataset: Dict[str, np.ndarray], *, batch_size: int, frame_stack: int = 1, config: Dict
 ) -> Dict[str, jnp.ndarray]:
-    """Fast batch sampling for GCIQL with goal-conditioned learning."""
+    """Fast batch sampling for GCIQL with goal-conditioned learning and block-wise constraints."""
     n = int(dataset['observations'].shape[0] * 0.8)
     
-    # CRITICAL FIX: Limit sampling range to leave room for goal offsets
-    # Use a much more conservative approach - leave plenty of room
-    discount = config.get('discount', 0.95)  # Use the actual discount from config
-    geometric_p = 1 - discount
-    
-    # Use 99.9th percentile + safety margin for maximum offset
-    theoretical_max = int(np.log(0.001) / np.log(1 - geometric_p))  # 99.9th percentile
-    safety_margin = 100  # Additional safety margin
-    max_safe_offset = theoretical_max + safety_margin
-    max_safe_offset = min(max_safe_offset, 500)  # Cap at 500 frames
-    
-    # Sample from a much more conservative range
-    safe_n = max(n - max_safe_offset, n // 3)  # Use at most 2/3 of dataset for safety
-    
-    idx = np.random.choice(safe_n, batch_size, replace=True)
+    # Sample indices from the safe range
+    idx = np.random.choice(n, batch_size, replace=True)
     # Create base batch
     batch = {
         'observations': dataset['observations'][idx],
-        'action_labels': dataset['action_labels'][idx],
         'actions': dataset['actions'][idx],
         'next_observations': dataset['next_observations'][idx],
         'rewards': jnp.zeros((batch_size,)),
@@ -343,50 +330,27 @@ def sample_batch(
     
     should_debug = False  # Disable debug output for cleaner logs
     
-    # Use geometric distribution for goal sampling (proper approach)
-    # Sample goal offsets using geometric distribution based on discount factor
+    # Use geometric distribution for goal sampling with block-wise constraints
     discount = config.get('discount', 0.99)
     geometric_p = 1 - discount  # probability parameter for geometric distribution
     
     # Sample offsets for all batch elements using geometric distribution
     offsets = np.random.geometric(p=geometric_p, size=batch_size)
     
-    # Additional safety: clip offsets to reasonable range
-    offsets = np.clip(offsets, 1, 2000)  # Between 1 and 200 frames ahead
+    # Block-wise goal sampling: ensure goals stay within the same block
+    block_size = config.get('block_size', 400)
+    goal_idx = np.zeros_like(idx)
     
-    # CRITICAL FIX: Use bidirectional mapping to maintain temporal structure
-    # BUT FALLBACK TO SIMPLE METHOD IF MAPPING IS BROKEN
-    use_mapping = ('shuffled_to_original' in dataset and 'original_to_shuffled' in dataset)
-    
-    # Quick sanity check on mapping if debug is enabled
-    if use_mapping:
-        mapping_ok = (
-            len(dataset['shuffled_to_original']) == len(dataset['observations']) and
-            len(dataset['original_to_shuffled']) == len(dataset['observations']) and
-            np.max(dataset['shuffled_to_original']) < len(dataset['observations']) and
-            np.max(dataset['original_to_shuffled']) < len(dataset['observations'])
-        )
-        if not mapping_ok:
-            use_mapping = False
-    
-    if use_mapping:
-        # Get the original temporal positions of our sampled frames
-        original_positions = dataset['shuffled_to_original'][idx]
+    for i, obs_idx in enumerate(idx):
+        # Calculate which block this observation belongs to
+        block_start = (obs_idx // block_size) * block_size
+        block_end = block_start + block_size
         
-        # Add offsets to get future frames in original temporal order
-        goal_original_positions = original_positions + offsets
-        
-        # Clip to valid range in original timeline
-        max_original_pos = len(dataset['original_to_shuffled']) - 1
-        goal_original_positions_safe = np.clip(goal_original_positions, 0, max_original_pos)
-        
-        # Direct lookup: where are these goal positions in the shuffled dataset?
-        goal_idx = dataset['original_to_shuffled'][goal_original_positions_safe]
-    else:
-        # SIMPLE BUT EFFECTIVE FALLBACK: Direct offset-based sampling
-        # This maintains temporal relationships without complex mapping
-        # Ensure goals don't go out of bounds by using the safe sampling we already did
-        goal_idx = np.clip(idx + offsets, 0, safe_n - 1)
+        # Calculate goal position within the block
+        goal_pos = obs_idx + offsets[i]
+        # Clip to block boundaries
+        goal_pos = min(goal_pos, block_end - 1)
+        goal_idx[i] = goal_pos
     
     # Create goal-conditioned batch
     goal_observations = dataset['observations'][goal_idx]
