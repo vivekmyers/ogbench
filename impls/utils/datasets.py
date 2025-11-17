@@ -332,13 +332,20 @@ class GCDataset:
         block_size = max(1, self.block_size)
         block_start = (idxs // block_size) * block_size
         block_end = np.minimum(block_start + block_size - 1, self.size - 1)
-        stacked_frames = []
-        for offset in self.frame_offsets:
+
+        num_offsets = len(self.frame_offsets)
+        if num_offsets == 0:
+            return self._normalize_frames(self._obs_array[idxs])
+
+        H, W, C = self._obs_array.shape[1:]
+        stacked = np.empty((len(idxs), H, W, C * num_offsets), dtype=self._obs_array.dtype)
+
+        for i, offset in enumerate(self.frame_offsets):
             offset_idxs = np.clip(idxs + offset, block_start, block_end)
             frames = self._obs_array[offset_idxs]
-            frames = self._normalize_frames(frames)
-            stacked_frames.append(frames)
-        return np.concatenate(stacked_frames, axis=-1)
+            stacked[..., i * C : (i + 1) * C] = frames
+
+        return self._normalize_frames(stacked)
 
     def get_stacked_observations(self, idxs):
         """Return the frame-stacked observations for the given indices."""
