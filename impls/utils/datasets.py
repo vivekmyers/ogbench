@@ -189,6 +189,12 @@ class GCDataset:
         # Trajectory id for each frame (same length as dataset).
         self.traj_ids = np.searchsorted(self.terminal_locs, np.arange(self.size), side='left')
 
+        # Frame stacking / dtype metadata.
+        self.frame_offsets = tuple(self.config.get('frame_offsets', ()))
+        self.block_size = int(self.config.get('block_size', 400))
+        self._obs_array = np.asarray(self.dataset['observations'])
+        self._obs_is_uint8 = self._obs_array.dtype == np.uint8
+
         # Assert probabilities sum to 1.
         assert np.isclose(
             self.config['value_p_curgoal'] + self.config['value_p_trajgoal'] + self.config['value_p_randomgoal'], 1.0
@@ -218,11 +224,20 @@ class GCDataset:
         """
         if idxs is None:
             idxs = self.dataset.get_random_idxs(batch_size)
+        idxs = np.asarray(idxs, dtype=np.int64)
 
         batch = self.dataset.sample(batch_size, idxs)
-        if self.config['frame_stack'] is not None:
+
+        use_frame_offsets = len(self.frame_offsets) > 0
+        needs_runtime_stack = use_frame_offsets or (self.config['frame_stack'] is not None and not self.preprocess_frame_stack)
+        if needs_runtime_stack:
+            next_idxs = np.minimum(idxs + 1, self.size - 1)
             batch['observations'] = self.get_observations(idxs)
-            batch['next_observations'] = self.get_observations(idxs + 1)
+            batch['next_observations'] = self.get_observations(next_idxs)
+        elif self._obs_is_uint8:
+            batch['observations'] = batch['observations'].astype(np.float32) / 255.0
+            if 'next_observations' in batch:
+                batch['next_observations'] = batch['next_observations'].astype(np.float32) / 255.0
 
         value_goal_idxs = self.sample_goals(
             idxs,
@@ -301,10 +316,29 @@ class GCDataset:
 
     def get_observations(self, idxs):
         """Return the observations for the given indices."""
-        if self.config['frame_stack'] is None or self.preprocess_frame_stack:
-            return jax.tree_util.tree_map(lambda arr: arr[idxs], self.dataset['observations'])
-        else:
+        idxs = np.asarray(idxs, dtype=np.int64)
+        if len(self.frame_offsets) > 0:
+            return self._get_observations_with_offsets(idxs)
+        if self.config['frame_stack'] is not None and not self.preprocess_frame_stack:
             return self.get_stacked_observations(idxs)
+        return self._normalize_frames(self._obs_array[idxs])
+
+    def _normalize_frames(self, frames):
+        if frames.dtype == np.uint8:
+            return frames.astype(np.float32) / 255.0
+        return frames
+
+    def _get_observations_with_offsets(self, idxs):
+        block_size = max(1, self.block_size)
+        block_start = (idxs // block_size) * block_size
+        block_end = np.minimum(block_start + block_size - 1, self.size - 1)
+        stacked_frames = []
+        for offset in self.frame_offsets:
+            offset_idxs = np.clip(idxs + offset, block_start, block_end)
+            frames = self._obs_array[offset_idxs]
+            frames = self._normalize_frames(frames)
+            stacked_frames.append(frames)
+        return np.concatenate(stacked_frames, axis=-1)
 
     def get_stacked_observations(self, idxs):
         """Return the frame-stacked observations for the given indices."""

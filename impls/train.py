@@ -156,7 +156,7 @@ def load_dataset_cpu(path: str | Path, frame_offsets: Tuple[int, ...], block_siz
     print(f"Loading dataset from {path} ...")
     data_np = np.load(path)
 
-    obs = np.asarray(data_np["observations"], dtype=np.float32)
+    obs = np.asarray(data_np["observations"])
     actions = np.asarray(data_np["actions"], dtype=np.float32)
     
     print(f"\n=== DATASET LOADING DEBUG ===")
@@ -189,10 +189,6 @@ def load_dataset_cpu(path: str | Path, frame_offsets: Tuple[int, ...], block_siz
             f"min={traj_lengths.min()}, max={traj_lengths.max()}, mean={traj_lengths.mean():.1f}"
         )
 
-    # Shape is always (N, 100, 100, 3)
-    if obs.max() > 1.0:
-        obs = obs / 255.0
-
     # Always filter intersection frames (will preserve terminal markers)
     filtered = filter_intersection_frames({
         "observations": obs,
@@ -212,14 +208,9 @@ def load_dataset_cpu(path: str | Path, frame_offsets: Tuple[int, ...], block_siz
         print(f"Trajectory lengths (first 10): {traj_lengths_after[:10]}")
         print(f"Trajectory lengths (stats): min={traj_lengths_after.min()}, max={traj_lengths_after.max()}, mean={traj_lengths_after.mean():.1f}")
 
-    obs_stacked = create_spaced_frame_stack(obs, frame_offsets=frame_offsets, block_size=block_size)
-    next_obs_stacked = np.roll(obs_stacked, shift=-1, axis=0)
-    next_obs_stacked[-1] = obs_stacked[-1]
-
-    print(f"Loaded: obs={obs_stacked.shape}, actions={actions.shape}, terminals={terminals.shape}")
+    print(f"Loaded (unstacked): obs={obs.shape}, actions={actions.shape}, terminals={terminals.shape}")
     return {
-        "observations": obs_stacked,
-        "next_observations": next_obs_stacked,
+        "observations": obs,
         "actions": actions,
         "terminals": terminals,
         "cpu_mode": True,
@@ -431,8 +422,10 @@ def test_goal_conditioning(agent, val_dataset: GCDataset | None, num_test_sample
 
     rng = np.random.default_rng()
     sample_indices = rng.choice(total, num_samples, replace=False)
-    observations = np.asarray(val_dataset.dataset["observations"])
     num_goals_per_obs = 10
+
+    def gather_obs(indices: np.ndarray) -> np.ndarray:
+        return np.asarray(val_dataset.get_observations(np.asarray(indices, dtype=np.int64)))
 
     sensitivities = []
     random_sensitivities = []
@@ -441,7 +434,7 @@ def test_goal_conditioning(agent, val_dataset: GCDataset | None, num_test_sample
     geom_p = max(1e-4, 1.0 - discount)
 
     for idx in sample_indices[: min(10, num_samples)]:
-        obs = jnp.asarray(observations[idx])
+        obs = jnp.asarray(gather_obs(np.asarray([idx]))[0])
         obs_batch = jnp.broadcast_to(obs[None, ...], (num_goals_per_obs, *obs.shape))
 
         block_idx = int(np.searchsorted(val_dataset.terminal_locs, idx))
@@ -466,13 +459,13 @@ def test_goal_conditioning(agent, val_dataset: GCDataset | None, num_test_sample
             offsets = np.concatenate([near_offsets, far_offsets])[:num_goals_per_obs]
             goal_positions = np.clip(idx + offsets, block_start, block_end - 1)
 
-        goals_same_block = jnp.asarray(observations[goal_positions])
+        goals_same_block = jnp.asarray(gather_obs(goal_positions))
         actor_dist = agent.network.select("actor")(obs_batch, goals_same_block, params=agent.network.params)
         actions = actor_dist.mode()
         sensitivities.append(float(jnp.std(actions, axis=0).mean()))
 
         random_goal_indices = rng.integers(0, total, size=num_goals_per_obs)
-        goals_random = jnp.asarray(observations[random_goal_indices])
+        goals_random = jnp.asarray(gather_obs(random_goal_indices))
         actor_dist_random = agent.network.select("actor")(obs_batch, goals_random, params=agent.network.params)
         actions_random = actor_dist_random.mode()
         random_sensitivities.append(float(jnp.std(actions_random, axis=0).mean()))
@@ -566,7 +559,7 @@ def main(args: argparse.Namespace) -> None:
     cfg.latent_dim = 512
     cfg.critic_lr_scale = 1.0
     cfg.actor_lr_scale = 1.0
-    cfg.frame_stack = None  # Observations are pre-stacked on disk.
+    cfg.frame_stack = None  # Stacking handled on-the-fly via frame_offsets.
     cfg.block_size = args.block_size
     cfg.frame_offsets = tuple(args.frame_offsets if args.frame_offsets else [0, -10, -20, -50, -80])
     cfg.p_aug = 0.25
