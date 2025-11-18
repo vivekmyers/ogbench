@@ -293,12 +293,27 @@ class GCDataset:
             middle_goal_idxs = np.round(
                 (np.minimum(idxs + 1, final_state_idxs) * distances + final_state_idxs * (1 - distances))
             ).astype(int)
-        goal_idxs = np.where(
-            np.random.rand(batch_size) < p_trajgoal / (1.0 - p_curgoal + 1e-6), middle_goal_idxs, random_goal_idxs
-        )
-
-        # Goals at the current state.
-        goal_idxs = np.where(np.random.rand(batch_size) < p_curgoal, idxs, goal_idxs)
+        
+        # First decide: current goal vs not current goal
+        rand1 = np.random.rand(batch_size)
+        is_current = rand1 < p_curgoal
+        
+        # For non-current goals, decide between trajectory and random using p_randomgoal explicitly
+        # P(trajectory | not current) = p_trajgoal / (1 - p_curgoal)
+        # P(random | not current) = p_randomgoal / (1 - p_curgoal)
+        not_current_prob = 1.0 - p_curgoal
+        if not_current_prob > 1e-6:
+            rand2 = np.random.rand(batch_size)
+            # Use p_randomgoal explicitly
+            use_random = rand2 < (p_randomgoal / not_current_prob)
+            goal_idxs = np.where(
+                is_current,
+                idxs,  # Current goal
+                np.where(use_random, random_goal_idxs, middle_goal_idxs)  # Random or trajectory
+            )
+        else:
+            # p_curgoal is 1.0, so all goals are current
+            goal_idxs = idxs
 
         return goal_idxs
 

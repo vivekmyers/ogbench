@@ -504,21 +504,6 @@ def compute_validation_loss(agent, val_dataset: GCDataset | None, batch_size: in
 
     metrics: Dict[str, object] = {}
 
-    # ============================
-    # Validation action distributions
-    # ============================
-    # Log predicted vs target action distributions as histograms for diagnostics.
-    if "pred_actions" in actor_info and "target_actions" in actor_info:
-        pred_actions = np.asarray(actor_info["pred_actions"])
-        target_actions = np.asarray(actor_info["target_actions"])
-        if pred_actions.ndim == 2 and pred_actions.shape == target_actions.shape:
-            action_names = ["steer", "throttle", "brake"]
-            action_dim = pred_actions.shape[1]
-            for i in range(action_dim):
-                name = action_names[i] if i < len(action_names) else f"action_{i}"
-                metrics[f"val/pred_{name}_hist"] = wandb.Histogram(pred_actions[:, i])
-                metrics[f"val/target_{name}_hist"] = wandb.Histogram(target_actions[:, i])
-
     # Actor metrics: keep only BC loss, Q loss, and MSE.
     if "bc_loss" in actor_info:
         metrics["val/actor_bc_loss"] = float(actor_info["bc_loss"])
@@ -562,7 +547,7 @@ def main(args: argparse.Namespace) -> None:
     cfg.frame_stack = None  # Stacking handled on-the-fly via frame_offsets.
     cfg.block_size = args.block_size
     cfg.frame_offsets = tuple(args.frame_offsets if args.frame_offsets else [0, -10, -20, -50, -80])
-    cfg.p_aug = 0.25
+    cfg.p_aug = 0.5
     cfg.distance_loss_weight = 0.05
     cfg.distance_head_hidden_dims = (256, 256)
     cfg.upsample_mode = 'none'  # Disable action component upsampling (was causing instability)
@@ -570,7 +555,7 @@ def main(args: argparse.Namespace) -> None:
     cfg.steer_thresh = 0.1
     cfg.throttle_thresh = 0.3
     cfg.brake_thresh = 0.1
-    cfg.p_curgoal = 0.025
+    cfg.p_randomgoal = 1.0
     cfg.use_mrn_metric = args.use_mrn_metric
     if args.mrn_components is not None:
         cfg.mrn_components = args.mrn_components
@@ -658,25 +643,6 @@ def main(args: argparse.Namespace) -> None:
             # Logging (use total_steps, not step, so logging works across epochs)
             if total_steps % args.log_every == 0:
                 log_dict: Dict[str, object] = {}
-
-                # ============================
-                # Actor action distributions (train)
-                # ============================
-                # Recompute predictions here to avoid changing the agent implementation.
-                actor_dist = agent.network.select("actor")(
-                    batch["observations"],
-                    batch["actor_goals"],
-                    params=agent.network.params,
-                )
-                pred_actions = np.asarray(actor_dist.mode())
-                target_actions = np.asarray(batch["actions"])
-                if pred_actions.ndim == 2 and pred_actions.shape == target_actions.shape:
-                    action_names = ["steer", "throttle", "brake"]
-                    action_dim = pred_actions.shape[1]
-                    for i in range(action_dim):
-                        name = action_names[i] if i < len(action_names) else f"action_{i}"
-                        log_dict[f"train/pred_{name}_hist"] = wandb.Histogram(pred_actions[:, i])
-                        log_dict[f"train/target_{name}_hist"] = wandb.Histogram(target_actions[:, i])
 
                 # Log only the requested scalar metrics under clear names.
                 metric_map = [
