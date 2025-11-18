@@ -1,3 +1,4 @@
+from .bc import BCAgent
 from .crl import CRLAgent
 from .gcbc import GCBCAgent
 from .gciql import GCIQLAgent
@@ -9,6 +10,7 @@ from .cmd import CMDAgent
 #from impls.agents.tra import TRAAgent
 
 agents = dict(
+    bc=BCAgent,
     crl=CRLAgent,
     gcbc=GCBCAgent,
     gciql=GCIQLAgent,
