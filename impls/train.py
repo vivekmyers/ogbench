@@ -556,6 +556,8 @@ def main(args: argparse.Namespace) -> None:
     cfg.throttle_thresh = 0.3
     cfg.brake_thresh = 0.1
     cfg.p_randomgoal = 1.0
+    cfg.p_trajgoal = 0.0
+    cfg.p_curgoal = 0.0
     cfg.use_mrn_metric = args.use_mrn_metric
     if args.mrn_components is not None:
         cfg.mrn_components = args.mrn_components
