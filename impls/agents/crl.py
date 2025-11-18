@@ -137,29 +137,44 @@ class CRLAgent(flax.struct.PyTreeNode):
             and 'distance_head' in grad_params
             and 'value_goal_deltas' in batch
         ):
-            phi_mean = jnp.mean(phi, axis=0)
-            psi_mean = jnp.mean(psi, axis=0)
-            distance_pred = self.network.select('distance_head')(
-                phi_mean,
-                psi_mean,
-                params=grad_params,
-            )
             targets = batch['value_goal_deltas']
             mask = batch.get('value_goal_delta_mask')
             if mask is None:
                 mask = jnp.ones_like(targets)
-            mse = (distance_pred - targets) ** 2
-            distance_loss = jnp.sum(mask * mse) / (jnp.sum(mask) + 1e-6)
-            contrastive_loss = contrastive_loss + distance_weight * distance_loss
+            
+            # Only apply distance loss if we have enough valid samples (mask fraction > 0.1)
+            # This prevents the head from interfering when using random goals
+            mask_fraction = jnp.mean(mask)
+            if mask_fraction > 0.1:
+                phi_mean = jnp.mean(phi, axis=0)
+                psi_mean = jnp.mean(psi, axis=0)
+                distance_pred = self.network.select('distance_head')(
+                    phi_mean,
+                    psi_mean,
+                    params=grad_params,
+                )
+                mse = (distance_pred - targets) ** 2
+                distance_loss = jnp.sum(mask * mse) / (jnp.sum(mask) + 1e-6)
+                contrastive_loss = contrastive_loss + distance_weight * distance_loss
 
-            stats.update(
-                {
-                    'distance_loss': distance_loss,
-                    'distance_pred_mean': jnp.mean(distance_pred),
-                    'distance_target_mean': jnp.mean(targets),
-                    'distance_mask_fraction': jnp.mean(mask),
-                }
-            )
+                stats.update(
+                    {
+                        'distance_loss': distance_loss,
+                        'distance_pred_mean': jnp.mean(distance_pred),
+                        'distance_target_mean': jnp.mean(targets),
+                        'distance_mask_fraction': mask_fraction,
+                    }
+                )
+            else:
+                # Log that we're skipping the distance head due to low mask fraction
+                stats.update(
+                    {
+                        'distance_loss': 0.0,
+                        'distance_pred_mean': 0.0,
+                        'distance_target_mean': jnp.mean(targets),
+                        'distance_mask_fraction': mask_fraction,
+                    }
+                )
 
         return contrastive_loss, stats
 
