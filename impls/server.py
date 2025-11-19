@@ -108,7 +108,9 @@ def main():
     config.frame_offsets = [0, -10, -20, -50, -80]
 
     obs_shape = (args.obs_h, args.obs_w, args.obs_c)                     # (100,100,3)
-    stacked_obs_shape = (args.obs_h, args.obs_w, args.obs_c*config.frame_stack)  # (100,100,12)
+    # Use frame_offsets to determine actual stacked shape, not frame_stack
+    num_frame_offsets = len(config.frame_offsets)
+    stacked_obs_shape = (args.obs_h, args.obs_w, args.obs_c*num_frame_offsets)  # (100,100,15) with 5 offsets
     act_shape = (3,)
 
     # Initialize with *stacked* shape (this must match runtime)

@@ -560,6 +560,16 @@ def main(args: argparse.Namespace) -> None:
     cfg.p_randomgoal = 1.0
     cfg.p_trajgoal = 0.0
     cfg.p_curgoal = 0.0
+    # GCDataset requires these parameters (use same values for value and actor goals)
+    cfg.value_p_curgoal = cfg.p_curgoal
+    cfg.value_p_trajgoal = cfg.p_trajgoal
+    cfg.value_p_randomgoal = cfg.p_randomgoal
+    cfg.actor_p_curgoal = cfg.p_curgoal
+    cfg.actor_p_trajgoal = cfg.p_trajgoal
+    cfg.actor_p_randomgoal = cfg.p_randomgoal
+    cfg.value_geom_sample = True  # Use geometric sampling for value goals
+    cfg.actor_geom_sample = False  # Use uniform sampling for actor goals
+    cfg.gc_negative = True  # Use '0 if s == g else -1' reward format
     cfg.use_mrn_metric = args.use_mrn_metric
     if args.mrn_components is not None:
         cfg.mrn_components = args.mrn_components
