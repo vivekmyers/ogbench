@@ -23,27 +23,26 @@ class CMDAgent(flax.struct.PyTreeNode):
     network: Any
     config: Any = nonpytree_field()
 
-    def mrn_distance(self, x, y):
-        K = self.config["mrn_components"]
+    @jax.jit
+    def mrn_distance(self, x: jnp.ndarray, y: jnp.ndarray):
+        K = self.config['mrn_components']
+        assert x.shape[-1] % K == 0
 
-        x, y = jnp.broadcast_arrays(x, y)
-
-        def mrn_distance_component(x, y):
-            eps = 1e-6
+        @jax.jit
+        def mrn_distance_component(x: jnp.ndarray, y: jnp.ndarray):
+            eps = 1e-8
             d = x.shape[-1]
-            x_prefix = x[..., : d // 2]
-            x_suffix = x[..., d // 2 :]
-            y_prefix = y[..., : d // 2]
-            y_suffix = y[..., d // 2 :]
-            max_component = jnp.max(jax.nn.relu(x_prefix - y_prefix), axis=-1)
-            l2_component = jnp.sqrt(jnp.square(x_suffix - y_suffix).sum(axis=-1) + eps)
-            assert max_component.shape == l2_component.shape
+            mask = jnp.arange(d) < d // 2
+            max_component: jnp.ndarray = jax.nn.relu(jnp.max((x - y) * mask, axis=-1)) # jax.nn.relu(jax.nn.logsumexp((x - y) * mask, axis=-1, b=1/x.shape[-1])) # jax.nn.relu(jax.nn.logsumexp((x - y) * mask, axis=-1, b=1/x.shape[-1]))#jnp.logsumexp(jax.nn.relu(jnp.max((x - y) * mask , axis=-1)))
+            l2_component: jnp.ndarray = jnp.linalg.norm((x - y) * (1 - mask) + eps, axis=-1)
+            # assert max_component.shape == l2_component.shape
             return max_component + l2_component
 
-        x_split = jnp.array_split(x, K, axis=-1)
-        y_split = jnp.array_split(y, K, axis=-1)
-        dists = [mrn_distance_component(x_split[i], y_split[i]) for i in range(K)]
-        return jnp.stack(dists, axis=-1).mean(axis=-1)
+        x_split = jnp.stack(jnp.split(x, K, axis=-1), axis=-1)
+        y_split = jnp.stack(jnp.split(y, K, axis=-1), axis=-1)
+        dists: jnp.ndarray = jax.vmap(mrn_distance_component, in_axes=(-1, -1), out_axes=-1)(x_split, y_split)
+
+        return dists.mean(axis=-1)
 
     def contrastive_loss(self, batch, grad_params):
         batch_size = batch["observations"].shape[0]
@@ -62,7 +61,7 @@ class CMDAgent(flax.struct.PyTreeNode):
             phi = phi[None, ...]
 
         dist = self.mrn_distance(phi[:, :, None], psi[:, None, :])
-        logits = -dist
+        logits = -dist / jnp.sqrt(phi.shape[-1])
         # logits.shape is (e, B, B) with one term for positive pair and (B - 1) terms for negative pairs in each row.
 
         I = jnp.eye(batch_size)
@@ -85,6 +84,17 @@ class CMDAgent(flax.struct.PyTreeNode):
             "logits": logits.mean(),
             "dist": dist.mean(),
         }
+    
+    @jax.jit
+    def get_distance(self, observations, goals, actions):
+        #actions not used, will be used for cmd
+        if self.config['use_action_for_distance']:
+            # psi = self.network.select('psi')(observations)
+            phi = self.network.select('critic')(observations, actions)
+        else:
+            phi = self.network.select('critic')(observations, jnp.zeros_like(actions))
+        psi = self.network.select('critic')(goals, jnp.zeros_like(actions))
+        return self.mrn_distance(phi, psi)
 
     def actor_loss(self, batch, grad_params, rng=None):
         # Maximize log Q if actor_log_q is True (which is default).
@@ -124,7 +134,7 @@ class CMDAgent(flax.struct.PyTreeNode):
         }
 
     @jax.jit
-    def total_loss(self, batch, grad_params, rng=None):
+    def total_loss(self, batch, grad_params, rng=None, critic_only=None, step=None):
         info = {}
         rng = rng if rng is not None else self.rng
 
@@ -141,7 +151,7 @@ class CMDAgent(flax.struct.PyTreeNode):
         return loss, info
 
     @jax.jit
-    def update(self, batch):
+    def update(self, batch, contrastive_only=None, step=None):
         new_rng, rng = jax.random.split(self.rng)
 
         def loss_fn(grad_params):
@@ -172,6 +182,7 @@ class CMDAgent(flax.struct.PyTreeNode):
         ex_observations,
         ex_actions,
         config,
+        train_steps,
     ):
         rng = jax.random.PRNGKey(seed)
         rng, init_rng = jax.random.split(rng, 2)
@@ -241,18 +252,16 @@ def get_config():
         dict(
             # Agent hyperparameters.
             agent_name="cmd",  # Agent name.
-            lr=3e-4,  # Learning rate.
+            lr=3e-4,
             mrn_components=8,  # Number of components in MRN.
             batch_size=1024,  # Batch size.
             actor_hidden_dims=(512, 512, 512),  # Actor network hidden dimensions.
             value_hidden_dims=(512, 512, 512),  # Value network hidden dimensions.
-            latent_dim=2048,  # Latent dimension for phi and psi.
+            latent_dim=512,  # Latent dimension for phi and psi.
             layer_norm=True,  # Whether to use layer normalization.
             discount=0.99,  # Discount factor.
-            alpha=1.0,  # Temperature in AWR or BC coefficient in DDPG+BC.
-            encoder=ml_collections.config_dict.placeholder(
-                str
-            ),  # Visual encoder name (None, 'impala_small', etc.).
+            alpha=0.1,  # Temperature in AWR or BC coefficient in DDPG+BC.
+            encoder=ml_collections.config_dict.placeholder(str),  # Visual encoder name (None, 'impala_small', etc.).
             actor_log_q=True,  # Whether to maximize log Q (True) or Q itself (False) in the actor loss.
             const_std=True,  # Whether to use constant standard deviation for the actor.
             discrete=False,  # Whether the action space is discrete.
@@ -269,6 +278,8 @@ def get_config():
             gc_negative=False,  # Unused (defined for compatibility with GCDataset).
             p_aug=0.0,  # Probability of applying image augmentation.
             frame_stack=ml_collections.config_dict.placeholder(int),  # Number of frames to stack.
+            cotrain_steps=1000000,  # Number of steps to train the contrastive loss.
+            use_action_for_distance=False,  # Whether to use the action for the distance computation.
         )
     )
     return config
