@@ -5,6 +5,8 @@ from queue import Queue, Empty, Full
 import numpy as np
 import cv2
 import carla
+from matplotlib.figure import Figure
+from matplotlib.backends.backend_agg import FigureCanvasAgg as FigureCanvas
 
 try:
     import wandb
@@ -172,13 +174,13 @@ def main():
         raise RuntimeError("No spawn points available")
 
     spawn_point = carla.Transform(
-        carla.Location(x=-103, y=51, z=5),   # coordinates in world space
+        carla.Location(x=-100, y=-50, z=0.5),   # coordinates in world space
         carla.Rotation(pitch=0.0, yaw=180.0, roll=0.0)  # orientation
     )
     ego, chosen_tf = None, None
     for tf in random.sample(spawns, k=min(20, len(spawns))):
         #ego = world.try_spawn_actor(ego_bp, tf)
-        spawn_point.rotation.yaw += 90.0 
+        spawn_point.rotation.yaw += 270.0 
         ego = world.try_spawn_actor(ego_bp, spawn_point)
         if ego is not None:
             chosen_tf = tf
@@ -252,6 +254,10 @@ def main():
     stuck_counter = 0
     prev_loc = start_loc
 
+    # Action chunking state
+    current_action_chunk = None
+    chunk_index = 0
+
     print(f"[RUN] → Running up to {args.frames} frames …", flush=True)
 
     try:
@@ -273,25 +279,44 @@ def main():
             video_frames.append(img_100)
             img_norm = (img_100.astype(np.float32) / 255.0)
 
-            # serialize once (we may re-use this if we must reconnect)
-            payload = pickle.dumps(img_norm, protocol=pickle.HIGHEST_PROTOCOL)
+            # Request new action chunk if we've exhausted the current one
+            if current_action_chunk is None or chunk_index >= len(current_action_chunk):
+                # serialize once (we may re-use this if we must reconnect)
+                payload = pickle.dumps(img_norm, protocol=pickle.HIGHEST_PROTOCOL)
 
-            # send → recv with auto-reconnect; re-send same payload on success
-            try:
-                send_with_len(sock, payload)
-                action = np.frombuffer(recvall(sock, 12, timeout=10.0), dtype=np.float32)
-            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, socket.timeout) as e:
-                print(f"[NET] IO failed at step {i}: {e} → reconnecting…")
-                try: sock.close()
-                except Exception: pass
-                sock = connect_eval(args.server_host, args.server_port, timeout=10.0)
-                send_with_len(sock, payload)
-                action = np.frombuffer(recvall(sock, 12, timeout=10.0), dtype=np.float32)
+                # send → recv with auto-reconnect; re-send same payload on success
+                try:
+                    send_with_len(sock, payload)
+                    # Receive action chunk: [4-byte chunk_length] + [chunk_length * 3 * float32]
+                    chunk_length_bytes = recvall(sock, 4, timeout=10.0)
+                    chunk_length = int.from_bytes(chunk_length_bytes, "big")
+                    action_chunk_size = chunk_length * 3 * 4  # chunk_length * 3 dims * 4 bytes per float32
+                    action_chunk_flat = np.frombuffer(recvall(sock, action_chunk_size, timeout=10.0), dtype=np.float32)
+                    current_action_chunk = action_chunk_flat.reshape(chunk_length, 3)  # (chunk_length, 3)
+                    chunk_index = 0
+                    print(f"[NET] Received new action chunk: shape={current_action_chunk.shape}")
+                except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, socket.timeout) as e:
+                    print(f"[NET] IO failed at step {i}: {e} → reconnecting…")
+                    try: sock.close()
+                    except Exception: pass
+                    sock = connect_eval(args.server_host, args.server_port, timeout=10.0)
+                    send_with_len(sock, payload)
+                    chunk_length_bytes = recvall(sock, 4, timeout=10.0)
+                    chunk_length = int.from_bytes(chunk_length_bytes, "big")
+                    action_chunk_size = chunk_length * 3 * 4
+                    action_chunk_flat = np.frombuffer(recvall(sock, action_chunk_size, timeout=10.0), dtype=np.float32)
+                    current_action_chunk = action_chunk_flat.reshape(chunk_length, 3)  # (chunk_length, 3)
+                    chunk_index = 0
 
+            # Use next action from current chunk
+            action = current_action_chunk[chunk_index]
+            chunk_index += 1
+            
             thr  = float(np.clip(action[0], 0.0, 1.0))
             steer= float(np.clip(action[1], -1.0, 1.0))
             brk  = float(np.clip(action[2], 0.0, 1.0))
             if brk < 0.05: brk = 0.0
+            if abs(steer) < 0.03: steer = 0.0
 
             # Apply control
             if i < 0:
@@ -350,7 +375,7 @@ def main():
                           step=len(video_frames))
             except Exception as e:
                 print(f"[W&B] [WARN] video log failed: {e}")
-        # --- XY scatter (traj + goal as star) ---
+        # --- XY scatter (traj + goal as star) with map overlay ---
         pts = [(float(x), float(y)) for x, y in zip(xs, ys)
                if np.isfinite(x) and np.isfinite(y)]
 
@@ -359,39 +384,49 @@ def main():
             if goal_xy is not None and np.all(np.isfinite(goal_xy)):
                 rows.append([float(goal_xy[0]), float(goal_xy[1]), "goal"])
 
-            table = wandb.Table(data=rows, columns=["x", "y", "series"])
+            # Get map waypoints for overlay
+            try:
+                carla_map = world.get_map()
+                waypoints = carla_map.generate_waypoints(distance=2.0)  # Sample every 2m
+                map_rows = [[float(wp.transform.location.x), float(wp.transform.location.y), "map"] 
+                           for wp in waypoints]
+                rows.extend(map_rows)
+            except Exception as e:
+                print(f"[W&B] [WARN] Failed to get map waypoints: {e}")
 
-            TRAJ_COLOR = "#4e79a7"   # blue
-            GOAL_COLOR = "#f28e2b"   # orange
+            # Build matplotlib overlay (map gray, traj blue, goal orange)
+            map_pts = [(x, y) for x, y, s in rows if s == "map"]
+            traj_pts = [(x, y) for x, y, s in rows if s == "traj"]
+            goal_pts = [(x, y) for x, y, s in rows if s == "goal"]
 
-            vega_spec = {
-              "$schema": "https://vega.github.io/schema/vega-lite/v2.json",
-              "data": {"name": "table"},
-              "width": 600, "height": 600,
-              "layer": [
-                {
-                  "mark": {"type": "point", "filled": True, "size": 36},
-                  "encoding": {
-                    "x": {"field": "x", "type": "quantitative", "axis": {"title": "x"}},
-                    "y": {"field": "y", "type": "quantitative", "axis": {"title": "y"}},
-                    "color": {"value": TRAJ_COLOR}
-                  },
-                  "transform": [{"filter": "datum.series == 'traj'"}]
-                },
-                {
-                  "mark": {"type": "text", "baseline": "middle", "align": "center"},
-                  "encoding": {
-                    "x": {"field": "x", "type": "quantitative"},
-                    "y": {"field": "y", "type": "quantitative"},
-                    "text": {"value": "★"},
-                    "size": {"value": 220},
-                    "color": {"value": GOAL_COLOR}
-                  },
-                  "transform": [{"filter": "datum.series == 'goal'"}]
-                }
-              ]
-            }
-            wandb.log({"Trajectory": wandb.plot.scatter(table, x="x", y="y", title="Trajectory and Goal")}) 
+            fig = Figure(figsize=(6, 6), dpi=120)
+            canvas = FigureCanvas(fig)
+            ax = fig.add_subplot(111)
+
+            if map_pts:
+                mx, my = zip(*map_pts)
+                ax.scatter(mx, my, s=2, c="#cccccc", alpha=0.3, label="map")
+            if traj_pts:
+                tx, ty = zip(*traj_pts)
+                ax.scatter(tx, ty, s=20, c="#4e79a7", label="traj")
+            if goal_pts:
+                gx, gy = zip(*goal_pts)
+                ax.scatter(gx, gy, marker="*", s=220, c="#f28e2b", label="goal")
+
+            ax.set_aspect("equal")
+            ax.set_xlabel("x")
+            ax.set_ylabel("y")
+            ax.legend(loc="best")
+
+            # Tight layout and render to array
+            fig.tight_layout()
+            canvas.draw()
+            map_img = np.frombuffer(canvas.tostring_rgb(), dtype=np.uint8)
+            map_img = map_img.reshape(fig.canvas.get_width_height()[::-1] + (3,))
+            try:
+                wandb.log({"trajectory_map": wandb.Image(map_img)}, step=len(video_frames))
+            except Exception as e:
+                print(f"[W&B] [WARN] map image log failed: {e}")
         else:
             print("[W&B] [WARN] No valid trajectory points; skipping scatter.")
 

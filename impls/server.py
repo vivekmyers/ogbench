@@ -4,13 +4,18 @@ import socket
 import pickle
 import argparse
 import time
+import inspect
 from collections import deque
 import importlib
 
 import numpy as np
 import jax
 import jax.numpy as jnp
-from flax.serialization import from_bytes
+from flax.serialization import from_bytes, to_state_dict, from_state_dict, msgpack_restore
+import optax
+
+# Import discrete action conversion functions
+from agents.gcbc import discrete_bins_to_continuous
 
 # ---------------- XLA memory knobs (same as your setup) ----------------
 os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
@@ -70,22 +75,25 @@ def fit_to_hw(img: np.ndarray, H: int, W: int) -> np.ndarray:
 # ---------------- main ----------------
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--agent", default="gcbc", choices=["crl", "cmd", "gcbc", "gciql"])
+    # Server-specific arguments
+    p.add_argument("--agent", default="gcbc", choices=["crl", "cmd", "gcbc", "gciql", "tmd"])
     p.add_argument("--model_path",
-                   default="/global/scratch/users/achyuthkv76/crl_models/run4.pkl")
+                   default="/global/scratch/users/achyuthkv76/tmd_models/run2.pkl")
     p.add_argument("--dataset_path",
-                   default="/global/scratch/users/achyuthkv76/carla_test_scripts/goals_1024.npz")
+                   default="/global/scratch/users/achyuthkv76/carla_test_scripts/goals.npz")
     p.add_argument("--goal_frame_index", type=int, default=1)
     p.add_argument("--host", default="localhost")
     p.add_argument("--port", type=int, default=5050)
-    p.add_argument("--network_dim", type=int, default=512)
-    p.add_argument("--latent_dim", type=int, default=512)
-
-    # keep 100x100 as per your training
+    
+    # Match train.py arguments EXACTLY (same names, same defaults, same help text)
     p.add_argument("--obs_h", type=int, default=100)
     p.add_argument("--obs_w", type=int, default=100)
     p.add_argument("--obs_c", type=int, default=3)
-    p.add_argument("--frame_stack", type=int, default=4)
+    p.add_argument("--frame_offsets", nargs="*", type=int, default=None, help="e.g., --frame_offsets 0 -5 -10 -20")
+    p.add_argument("--block_size", type=int, default=400, help="Block size for block-aware frame stacking and shuffling")
+    p.add_argument("--action_chunk_length", type=int, default=1, help="Number of actions to predict in sequence (1 = disabled, typical: 4-16)")
+    p.add_argument("--n_actions", type=int, default=4, help="Use only the first N actions from the chunk (default: 4 = use first 4 actions). Useful when model was trained with chunking but you want to execute only the first N actions.")
+    p.add_argument("--use_discrete", action="store_true", default=False, help="Use discrete actions (multi-discrete mode: discretize throttle/steer/brake into 32 bins each)")
     args = p.parse_args()
 
     # ---- Load agent ----
@@ -96,36 +104,107 @@ def main():
     get_config = getattr(module, "get_config")
 
     config = get_config()
-    config.encoder = "impala_large"
-    config.actor_loss = "ddpgbc"
-    config.discrete = False
-    config.multi_discrete = False
-    config.frame_stack = args.frame_stack
-    config.actor_hidden_dims = (args.network_dim, args.network_dim, args.network_dim)
-    config.value_hidden_dims = (args.network_dim, args.network_dim, args.network_dim)
-    config.latent_dim = args.latent_dim
+    # Match train.py configuration EXACTLY
+    config.encoder = "impala_large"  # Match train.py line 332
+    config.actor_loss = "ddpgbc"  # Match train.py line 329
+    config.discrete = args.use_discrete  # Match train.py line 327
+    config.multi_discrete = args.use_discrete  # Match train.py line 328
+    config.frame_stack = None  # Match train.py line 337 (NOT using frame_stack)
+    config.frame_offsets = tuple(args.frame_offsets if args.frame_offsets else [0, -1])  # Match train.py line 430
+    config.block_size = args.block_size  # Match train.py line 338
+    config.actor_hidden_dims = (512, 512, 512)  # Match train.py line 334
+    config.value_hidden_dims = (512, 512, 512)  # Match train.py line 335
+    config.latent_dim = 2048  # Match train.py line 336
+    config.alpha = 0.1  # Match train.py line 331
+    config.action_chunk_length = args.action_chunk_length  # Match train.py line 352
     config.layer_norm = False
-    config.frame_offsets = [0, -10, -20, -50, -80]
+    
+    config.lr = 3e-4  # Match train.py default
 
-    obs_shape = (args.obs_h, args.obs_w, args.obs_c)                     # (100,100,3)
-    # Use frame_offsets to determine actual stacked shape, not frame_stack
+    obs_shape = (args.obs_h, args.obs_w, args.obs_c)  # (100,100,3)
+    # Use frame_offsets to determine actual stacked shape (matching train.py)
     num_frame_offsets = len(config.frame_offsets)
-    stacked_obs_shape = (args.obs_h, args.obs_w, args.obs_c*num_frame_offsets)  # (100,100,15) with 5 offsets
+    stacked_obs_shape = (args.obs_h, args.obs_w, args.obs_c * num_frame_offsets)  # e.g., (100,100,6) with [0, -1]
     act_shape = (3,)
+    action_dim = act_shape[0]  # 3
 
+    # Load checkpoint first to get saved config, then create agent with matching structure
+    with open(args.model_path, "rb") as f:
+        checkpoint_dict = pickle.load(f)
+    
+    # Extract config and agent bytes from checkpoint (matches train.py format)
+    if isinstance(checkpoint_dict, dict) and 'agent' in checkpoint_dict and 'config' in checkpoint_dict:
+        saved_config = checkpoint_dict['config']
+        checkpoint_bytes = checkpoint_dict['agent']
+        
+        # Update config with saved values (this ensures agent structure matches checkpoint)
+        if isinstance(saved_config, dict):
+            for key, value in saved_config.items():
+                if hasattr(config, key):
+                    setattr(config, key, value)
+            print(f"[INFO] Loaded config from checkpoint: {len(saved_config)} keys")
+    else:
+        # Old format: raw bytes (fallback for compatibility)
+        checkpoint_bytes = checkpoint_dict if isinstance(checkpoint_dict, bytes) else pickle.dumps(checkpoint_dict)
+    
     # Initialize with *stacked* shape (this must match runtime)
     dummy_obs = jnp.zeros((1, *stacked_obs_shape), dtype=jnp.float32)
-    dummy_act = jnp.zeros((1, *act_shape), dtype=jnp.float32)
-    agent = Agent.create(seed=0, ex_observations=dummy_obs, ex_actions=dummy_act, config=config)
-
-    with open(args.model_path, "rb") as f:
-        agent = from_bytes(agent, f.read())
+    # Create dummy_act with correct chunk shape for actor initialization (use config.action_chunk_length from checkpoint)
+    if config.action_chunk_length > 1:
+        dummy_act = jnp.zeros((1, config.action_chunk_length, *act_shape), dtype=jnp.float32)  # (1, 10, 3) for chunk_length=10
+    else:
+        dummy_act = jnp.zeros((1, *act_shape), dtype=jnp.float32)  # (1, 3) for single action
+    
+    # Create agent with config that matches checkpoint (structure will match)
+    agent = Agent.create(
+        seed=0,
+        ex_observations=dummy_obs,
+        ex_actions=dummy_act,
+        config=config,
+    )
+    
+    # Load checkpoint state dict directly (bypasses agent structure validation)
+    # Extract only params to avoid opt_state structure mismatches
+    checkpoint_state_dict = msgpack_restore(checkpoint_bytes)
+    current_state = to_state_dict(agent)
+    
+    # Copy only params from checkpoint, keep fresh opt_state from current agent
+    if 'network' in checkpoint_state_dict and 'params' in checkpoint_state_dict['network']:
+        current_state['network']['params'] = checkpoint_state_dict['network']['params']
+        # Optionally preserve step if it exists
+        if 'network' in checkpoint_state_dict and 'step' in checkpoint_state_dict['network']:
+            current_state['network']['step'] = checkpoint_state_dict['network']['step']
+        agent = from_state_dict(agent, current_state)
+    else:
+        raise ValueError("Could not find network params in checkpoint")
+    
     print("Model loaded and agent initialized")
+    
     print(args.goal_frame_index)
     # ---- Load dataset & goal (stay at 100x100; crop/pad if needed) ----
     dataset = np.load(args.dataset_path)
-    gi_raw = np.asarray(dataset["frames"][args.goal_frame_index])  # possibly already (100,100,3)
-    gi_obs = fit_to_hw(gi_raw, args.obs_h, args.obs_w).astype(np.float32)  # (100,100,3)
+    frames = dataset["frames"]
+    num_frames = len(frames)
+    
+    # Load goal frames with frame_offsets to match training (same as get_observations)
+    # This ensures goals are frame-stacked with temporal context, not just replicated
+    goal_frame_stack = []
+    for offset in config.frame_offsets:
+        goal_idx = args.goal_frame_index + offset
+        # Clamp to valid range (can't go before first frame or after last)
+        goal_idx = max(0, min(goal_idx, num_frames - 1))
+        gi_raw = np.asarray(frames[goal_idx])  # possibly already (100,100,3)
+        gi_frame = fit_to_hw(gi_raw, args.obs_h, args.obs_w).astype(np.float32)  # (100,100,3)
+        # Normalize to [0, 1] to match training
+        if np.max(gi_frame) > 1.0:
+            gi_frame = gi_frame / 255.0
+        goal_frame_stack.append(gi_frame)
+    
+    # Stack frames along channel dimension to match training format
+    goal_stacked = np.concatenate(goal_frame_stack, axis=-1)  # (100, 100, 3*len(frame_offsets))
+    
+    # Use first frame (offset=0) for header display
+    gi_obs = goal_frame_stack[0]  # (100, 100, 3)
 
     # optional goal (x,y)
     goal_xy = None
@@ -136,21 +215,8 @@ def main():
                 goal_xy = (float(arr[0]), float(arr[1]))
                 break
 
-    # stack goal along channels to match network's goal branch (if used)
-    goal = gi_obs
-    if np.max(gi_obs) > 1.0:
-        goal = goal / 255.0
-    GOAL_HISTORY = deque(maxlen=(config.frame_offsets[-1] * (-1) + 1))
-    GOAL_HISTORY.append(goal)
-    g = len(GOAL_HISTORY)
-    raw = -1 + np.array(config.frame_offsets, dtype=int)
-    raw = np.maximum(-g, raw)
-    idx = [(g + i) if i < 0 else int(i) for i in raw.tolist()]
-    goal_stack = [GOAL_HISTORY[k] / 255.0 for k in idx]
-    goal_stacked = jnp.concatenate(goal_stack, axis=-1)
-    goal_fixed = []
-    goal_fixed.append(goal_stacked.copy())
-    goal_fixed = jnp.array(goal_fixed)
+    # Load goal for header (use first frame for display)
+    goal_fixed_header = jnp.array(gi_obs[None, ...])  # Single goal image: (1, 100, 100, 3) float32 [0..1]
 
     print("Goal loaded")
     # ---- Socket setup ----
@@ -179,15 +245,31 @@ def main():
         print(f"[WARN] failed to send goal header: {e}")
 
     # ---- Runtime buffers ----
-    FRAME_STACK = config.frame_stack
-    obs_stack = deque(maxlen=FRAME_STACK)
-    HISTORY = deque(maxlen=(config.frame_offsets[-1] * (-1) + 1))
+    # Match train.py: use frame_offsets, NOT frame_stack
+    # HISTORY needs to hold enough frames for the most negative offset
+    max_offset = abs(min(config.frame_offsets)) if config.frame_offsets else 0
+    max_offset = int(max_offset)
+    HISTORY = deque(maxlen=max_offset + 1)  # +1 for current frame
+    
+    # Direct module access (matching your previous working pattern)
     actor_module = agent.network.model_def.modules["actor"]
     actor_params = agent.network.params["modules_actor"]
 
-    print(f"Runtime obs={obs_shape}, stacked={stacked_obs_shape}, stack={FRAME_STACK}")
+    print(f"Runtime config:")
+    print(f"  obs_shape={obs_shape}")
+    print(f"  stacked_obs_shape={stacked_obs_shape}")
+    print(f"  frame_offsets={config.frame_offsets}")
+    print(f"  frame_stack={config.frame_stack} (None, using offsets)")
+    print(f"  block_size={config.block_size}")
+    print(f"  action_chunk_length={config.action_chunk_length}")
+    print(f"  discrete={config.discrete}, multi_discrete={config.multi_discrete}")
+    
+    # Prepare goal once before the loop: use frame-stacked goal to match training
+    # Goal is already frame-stacked with frame_offsets (same as observations) and in [0, 1] range
+    goal_fixed = jnp.array(goal_stacked[None, ...])  # (1, 100, 100, 3*len(frame_offsets)) float32 [0..1]
+    
     t0 = time.perf_counter()
-
+    
     try:
         while True:
             # 1) receive image from client
@@ -203,43 +285,105 @@ def main():
             img_arr = np.asarray(img, dtype=np.float32)
             if img_arr.shape[:2] != (args.obs_h, args.obs_w):
                 img_arr = fit_to_hw(img_arr, args.obs_h, args.obs_w)
-            obs = jnp.array(img_arr).reshape((1, *obs_shape))          # (1,100,100,3)
+            # Match training: _normalize_frames converts uint8 [0,255] → float32 [0,1]
+            # Keep as [0, 1] to match training exactly (dataset normalizes, encoder expects [0,1])
+            if img_arr.max() > 1.0:
+                img_arr = img_arr / 255.0  # Convert [0, 255] to [0, 1] if needed
+            obs = jnp.array(img_arr).reshape((1, *obs_shape))          # (1,100,100,3) float32 [0..1]
 
             HISTORY.append(obs)
             n = len(HISTORY)
-            raw = -1 + np.array(config.frame_offsets, dtype=int)   # -1 is current
-            raw = np.maximum(-n, raw)                              # clamp to oldest available
-
-            # convert negatives to positive indices for deque
-            idx = [(n + i) if i < 0 else int(i) for i in raw.tolist()]
-
-            obs_stack = [HISTORY[k] for k in idx]                  # pick frames by offsets
-            obs_stacked = jnp.concatenate(obs_stack, axis=-1)      # (1,H,W, 3*len(offsets))            
+            
+            # Match train.py frame stacking logic exactly: use frame_offsets with block_size awareness
+            # This matches _get_observations_with_offsets in datasets.py
+            # frame_offsets are relative to current frame (0 = current, -1 = previous, etc.)
+            # In server, we don't have block boundaries since we're streaming, but we match the logic
+            obs_stack = []
+            for offset in config.frame_offsets:
+                # offset: 0 = current, -1 = previous, etc.
+                # Convert to positive index for deque (current frame is at index n-1)
+                hist_idx = n + offset - 1
+                # Clamp to valid range (can't go before first frame)
+                hist_idx = max(0, min(hist_idx, n - 1))
+                frame = HISTORY[hist_idx]
+                obs_stack.append(frame)
+            
+            obs_stacked = jnp.concatenate(obs_stack, axis=-1)  # (1, H, W, 3*len(offsets))            
 
             # ---- match your previously working call pattern ----
             obs_fixed = obs_stacked.copy()
+            # goal_fixed is already prepared before the loop
+
+            # DEBUG: Print observation mean to check if it's changing
+            obs_mean = float(np.array(obs_fixed).mean())
+            print(f"[DEBUG step {n}] obs mean={obs_mean:.6f}")
+
+            # DEBUG: Log input shapes and ranges to match training
+            if n == 1:  # Only log on first iteration to avoid spam
+                print(f"\n[DEBUG] Input shapes and ranges (matching training format):")
+                print(f"  obs_fixed: shape={obs_fixed.shape}, dtype={obs_fixed.dtype}, range=[{obs_fixed.min():.3f}, {obs_fixed.max():.3f}]")
+                print(f"  goal_fixed: shape={goal_fixed.shape}, dtype={goal_fixed.dtype}, range=[{goal_fixed.min():.3f}, {goal_fixed.max():.3f}]")
 
             # 4) forward (explicit kwargs to avoid signature mismatches)
             t_prep = time.perf_counter()
-            action_dist = actor_module.apply(
-                {"params": actor_params},
-                obs_fixed,
-                goal_fixed,
-                goal_encoded=False,
-            )
-            if config['discrete'] == True:
-                if config['multi_discrete']:
+            # Flax apply() requires variables as first positional argument
+            variables = {"params": actor_params}
+            apply_kwargs = {
+                "observations": obs_fixed,
+                "goals": goal_fixed,
+                "goal_encoded": False,
+                "temperature": 1.0,
+            }
+            
+            action_dist = actor_module.apply(variables, **apply_kwargs)
+
+            # Get action from distribution
+            # Use mean() instead of mode() for smoother actions (especially for discrete)
+            # Mean interpolates between bins based on probabilities, reducing jitter
+            if config.get('discrete', False) and config.get('multi_discrete', False):
+                # For multi-discrete, get mode (discrete bin indices)
+                act = action_dist.mode()  # Returns discrete bin indices (batch, chunk_length, 3) or (batch, 3)
+                # Convert discrete bin indices back to continuous actions
+                act = discrete_bins_to_continuous(act, num_bins=32)
+            elif config.get('discrete', False):
+                # For single discrete, use mean if available, otherwise mode
+                if hasattr(action_dist, 'mean'):
                     act = action_dist.mean()
                 else:
                     act = action_dist.mode()
             else:
+                # For continuous, get mean (mode = mean for Gaussian, but mean is more explicit)
                 act = action_dist.mean()
             t_fwd = time.perf_counter()
-
-            # 5) send action (12 bytes: 3 * float32)
-            act_np = np.array(act[0], dtype=np.float32)
-            print(act_np)
-            conn.sendall(act_np.tobytes())
+            
+            # 5) send action chunk
+            # Handle chunked actions: send full chunk if available, otherwise send single action
+            if act.ndim == 3:
+                # Chunked: (batch=1, chunk_length, action_dim) -> (chunk_length, action_dim)
+                act_chunk = np.array(act[0], dtype=np.float32)  # (chunk_length, action_dim)
+                chunk_length = act_chunk.shape[0]
+            else:
+                # Single action: (batch=1, action_dim) -> (1, action_dim)
+                act_chunk = np.array(act[None, :] if act.ndim == 1 else act, dtype=np.float32)  # (1, action_dim)
+                chunk_length = 1
+            
+            # Optionally use only the first N actions from the chunk
+            if args.n_actions is not None and chunk_length > args.n_actions:
+                original_chunk_length = chunk_length
+                act_chunk = act_chunk[:args.n_actions]
+                chunk_length = args.n_actions
+                print(f"[INFO] Using only first {chunk_length} actions from chunk (model predicted {original_chunk_length} actions)")
+            
+            # Ensure actions are in valid range [0,1] for throttle/brake, [-1,1] for steer
+            act_chunk[:, 0] = np.clip(act_chunk[:, 0], 0.0, 1.0)  # throttle
+            act_chunk[:, 1] = np.clip(act_chunk[:, 1], -1.0, 1.0)  # steer
+            act_chunk[:, 2] = np.clip(act_chunk[:, 2], 0.0, 1.0)  # brake
+            
+            # Send chunk: [4-byte chunk_length] + [chunk_length * 3 * float32]
+            chunk_length_bytes = chunk_length.to_bytes(4, "big")
+            action_bytes = act_chunk.flatten().tobytes()  # Flatten to (chunk_length * 3) float32s
+            print(f"Sending action chunk: shape={act_chunk.shape}, chunk_length={chunk_length}, discrete={config.get('discrete', False)}")
+            conn.sendall(chunk_length_bytes + action_bytes)
             t_send = time.perf_counter()
 
             # Optional perf:
@@ -257,4 +401,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

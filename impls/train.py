@@ -12,11 +12,11 @@ import flax.serialization as fxs
 from flax.core import freeze, unfreeze
 import jax
 import jax.numpy as jnp
-from jax import tree_util
+from jax import tree_util, random
 import ml_collections
 import numpy as np
 import wandb
-from tqdm import trange
+from tqdm import trange, tqdm
 
 from utils.datasets import Dataset, GCDataset
 
@@ -38,6 +38,120 @@ def create_spaced_frame_stack(observations: np.ndarray, frame_offsets: Tuple[int
             frames.append(observations[idx])
         stacked_list.append(np.concatenate(frames, axis=-1))
     return np.array(stacked_list, dtype=np.float32)
+
+def filter_intersection_frames_jax(dataset: Dict[str, jnp.ndarray], throttle_threshold: float = 0.05, brake_threshold: float = 0.1,
+    window_size: int = 5,
+) -> Dict[str, jnp.ndarray]:
+    """Pure JAX version that works on GPU."""
+    actions = dataset['actions']
+    T = len(actions)
+    terminals = dataset.get('terminals', jnp.zeros(T, dtype=bool))
+    
+    # Find terminal locations using JAX
+    terminal_indices = jnp.arange(T)[terminals] if jnp.any(terminals) else jnp.array([], dtype=jnp.int32)
+    terminal_locs = terminal_indices
+    print(f"\n=== FILTERING DEBUG: BEFORE ===")
+    print(f"Total frames: {T}")
+    print(f"Terminal frames: {jnp.sum(terminals)}")
+    if len(terminal_locs) > 0:
+        terminal_locs_arr = jnp.asarray(terminal_locs)
+        print(f"Terminal locations (first 10): {jnp.asarray(terminal_locs_arr[:min(10, len(terminal_locs_arr))])}")
+        if len(terminal_locs_arr) > 10:
+            print(f"Terminal locations (last 10): {jnp.asarray(terminal_locs_arr[-10:])}")
+        print(f"Trajectory boundaries: {len(terminal_locs_arr)} trajectories")
+        if len(terminal_locs_arr) > 0:
+            traj_starts = jnp.concatenate([jnp.array([0]), terminal_locs_arr[:-1] + 1])
+            traj_lengths = terminal_locs_arr + 1 - traj_starts
+            print(f"Trajectory lengths (first 10): {jnp.asarray(traj_lengths[:min(10, len(traj_lengths))])}")
+            print(f"Trajectory lengths (stats): min={jnp.min(traj_lengths)}, max={jnp.max(traj_lengths)}, mean={jnp.mean(traj_lengths):.1f}")
+    
+    throttle = actions[:, 0]
+    brake = actions[:, 2]
+    low_throttle = throttle < throttle_threshold
+    high_brake = brake > brake_threshold
+    intersection_mask = jnp.zeros(T, dtype=bool)
+    intersection_mask = intersection_mask | high_brake
+    
+    # Implement sliding window using JAX operations
+    if window_size > 0 and T >= window_size:
+        # Use convolution to count low_throttle in each window
+        kernel = jnp.ones(window_size, dtype=jnp.float32)
+        low_throttle_float = low_throttle.astype(jnp.float32)
+        window_sums = jnp.convolve(low_throttle_float, kernel, mode='valid')
+        all_low_throttle = (window_sums >= window_size - 1e-6).astype(bool)
+        
+        # Find window starts where all are low using JAX
+        window_starts = jnp.arange(len(all_low_throttle))[all_low_throttle] if jnp.any(all_low_throttle) else jnp.array([], dtype=jnp.int32)
+        if len(window_starts) > 0:
+            # Create indices for all positions in these windows
+            window_starts_expanded = window_starts[:, None] + jnp.arange(window_size)[None, :]
+            mark_indices = window_starts_expanded.ravel()
+            mark_indices = mark_indices[mark_indices < T]
+            intersection_mask = intersection_mask.at[mark_indices].set(True)
+    
+    # Preserve terminals using JAX operations
+    terminal_indices = jnp.arange(T)[terminals] if jnp.any(terminals) else jnp.array([], dtype=jnp.int32)
+    terminals_preserved = 0
+    for i in range(len(terminal_indices)):
+        term_idx = terminal_indices[i]
+        term_val = bool(intersection_mask[term_idx])
+        if term_val:
+            intersection_mask = intersection_mask.at[term_idx].set(False)
+            terminals_preserved += 1
+            if term_idx > 0:
+                intersection_mask = intersection_mask.at[term_idx - 1].set(False)
+    
+    keep_mask = ~intersection_mask
+    n_removed = jnp.sum(intersection_mask)
+    n_kept = jnp.sum(keep_mask)
+    
+    print(f"\n=== FILTERING DEBUG: AFTER ===")
+    print(f"Intersection filtering: removed {int(n_removed)} frames ({100.0*float(n_removed)/T:.1f}%), kept {int(n_kept)} frames")
+    print(f"Terminals preserved from removal: {terminals_preserved}")
+    
+    # Filter arrays using boolean indexing
+    filtered = {}
+    for key, arr in dataset.items():
+        if hasattr(arr, 'shape') and len(arr) == T:
+            filtered[key] = arr[keep_mask]
+        else:
+            filtered[key] = arr
+    
+    # Map terminals using JAX
+    if 'terminals' in dataset:
+        # Build cumulative sum to map old indices to new indices
+        keep_mask_int = keep_mask.astype(jnp.int32)
+        cumsum = jnp.cumsum(keep_mask_int) - 1  # -1 because cumsum starts at 1 for first True
+        
+        # Map terminal indices
+        new_terminals = jnp.zeros(int(n_kept), dtype=bool)
+        terminals_mapped = 0
+        for i in range(len(terminal_indices)):
+            old_term_idx = terminal_indices[i]
+            if keep_mask[old_term_idx]:
+                new_term_idx = cumsum[old_term_idx]
+                new_terminals = new_terminals.at[new_term_idx].set(True)
+                terminals_mapped += 1
+        
+        # Ensure last frame is terminal
+        if len(new_terminals) > 0:
+            new_terminals = new_terminals.at[-1].set(True)
+        
+        filtered['terminals'] = new_terminals
+        
+        new_terminal_locs = jnp.arange(int(n_kept))[new_terminals] if jnp.any(new_terminals) else jnp.array([], dtype=jnp.int32)
+        print(f"Terminals after mapping: {jnp.sum(new_terminals)} (mapped {terminals_mapped} from {len(terminal_indices)} original)")
+        if len(new_terminal_locs) > 0:
+            print(f"New terminal locations (first 10): {jnp.asarray(new_terminal_locs[:min(10, len(new_terminal_locs))])}")
+            if len(new_terminal_locs) > 0:
+                traj_starts = jnp.concatenate([jnp.array([0]), new_terminal_locs[:-1] + 1])
+                new_traj_lengths = new_terminal_locs + 1 - traj_starts
+                print(f"New trajectory lengths (first 10): {jnp.asarray(new_traj_lengths[:min(10, len(new_traj_lengths))])}")
+                print(f"New trajectory lengths (stats): min={jnp.min(new_traj_lengths)}, max={jnp.max(new_traj_lengths)}, mean={jnp.mean(new_traj_lengths):.1f}")
+    
+    print("=" * 50)
+    return filtered
+
 
 def filter_intersection_frames(dataset: Dict[str, np.ndarray], throttle_threshold: float = 0.05, brake_threshold: float = 0.1,
     window_size: int = 5,
@@ -65,26 +179,28 @@ def filter_intersection_frames(dataset: Dict[str, np.ndarray], throttle_threshol
     high_brake = brake > brake_threshold
     intersection_mask = np.zeros(T, dtype=bool)
     intersection_mask = intersection_mask | high_brake
-    for i in range(T - window_size + 1):
-        if np.all(low_throttle[i:i+window_size]):
-            intersection_mask[i:i+window_size] = True
-    
-    # Count how many terminals would be removed BEFORE preserving them
+    from numpy.lib.stride_tricks import sliding_window_view
+    try:
+        windows = sliding_window_view(low_throttle, window_size)
+        all_low_throttle = np.all(windows, axis=1)
+        window_starts = np.where(all_low_throttle)[0]
+        if len(window_starts) > 0:
+            mark_indices = (window_starts[:, None] + np.arange(window_size)[None, :]).ravel()
+            mark_indices = mark_indices[mark_indices < T]
+            intersection_mask[mark_indices] = True
+    except (ImportError, AttributeError):
+        print("WARNING: Using slower loop-based filtering (upgrade NumPy >= 1.20 for faster version)")
+        for i in range(T - window_size + 1):
+            if np.all(low_throttle[i:i+window_size]):
+                intersection_mask[i:i+window_size] = True
     terminals_to_remove = np.sum(intersection_mask[terminal_locs])
     print(f"Terminals that would be removed (before preservation): {terminals_to_remove}")
-    
-    # CRITICAL: Preserve terminal markers - don't remove terminal frames
-    # If a terminal frame would be removed, keep it and mark the frame before as terminal instead
     terminal_indices = np.where(terminals)[0]
-    
-    # Mark terminal frames as "must keep" to preserve trajectory boundaries
     terminals_preserved = 0
     for term_idx in terminal_indices:
         if intersection_mask[term_idx]:
-            # Terminal frame would be removed - keep it to preserve boundary
             intersection_mask[term_idx] = False
             terminals_preserved += 1
-            # Also ensure the frame before terminal is kept (if it exists)
             if term_idx > 0:
                 intersection_mask[term_idx - 1] = False
     
@@ -154,16 +270,27 @@ def _maybe_get_terminals_from_source(data_np: Dict[str, np.ndarray]) -> np.ndarr
     return None
 
 
-def load_dataset_cpu(path: str | Path, frame_offsets: Tuple[int, ...], block_size: int) -> Dict[str, np.ndarray]:
+def load_dataset_cpu(path: str | Path, frame_offsets: Tuple[int, ...], block_size: int, chunk_size: int = 50000, use_mmap: bool = False) -> Dict[str, np.ndarray]:
+    import time
+    start_time = time.time()
     print(f"Loading dataset from {path} ...")
-    data_np = np.load(path)
+    if use_mmap:
+        print("Using memory-mapped loading (saves RAM but may be slower)...")
+        data_np = np.load(path, mmap_mode='r')
+    else:
+        # Note: np.load() loads entire file into memory by default.
+        # Set use_mmap=True for true memory-mapped chunking (saves RAM but may be slower).
+        data_np = np.load(path)
+    print(f"Dataset loaded in {time.time() - start_time:.2f}s")
 
-    obs = np.asarray(data_np["observations"])
-    actions = np.asarray(data_np["actions"], dtype=np.float32)
-    
+    # Get total size first (without loading full arrays)
+    obs_shape = data_np["observations"].shape
+    total_frames = obs_shape[0]
     print(f"\n=== DATASET LOADING DEBUG ===")
-    print(f"Total frames in dataset: {len(obs)}")
+    print(f"Total frames in dataset: {total_frames}")
+    print(f"Processing in chunks of {chunk_size} frames to save memory...")
 
+    # Load terminals first (small array)
     terminals = _maybe_get_terminals_from_source(data_np)
     if terminals is not None:
         terminals = terminals.astype(bool).copy()
@@ -171,9 +298,9 @@ def load_dataset_cpu(path: str | Path, frame_offsets: Tuple[int, ...], block_siz
     else:
         # Fallback: assume fixed-length trajectories (legacy datasets)
         print("WARNING: Dataset missing terminal markers. Falling back to synthetic 1000-step boundaries.")
-        terminals = np.zeros(len(obs), dtype=bool)
+        terminals = np.zeros(total_frames, dtype=bool)
         trajectory_length = 1000
-        terminal_indices = np.arange(trajectory_length - 1, len(obs), trajectory_length, dtype=int)
+        terminal_indices = np.arange(trajectory_length - 1, total_frames, trajectory_length, dtype=int)
         terminals[terminal_indices] = True
 
     # Always mark last frame as terminal to close final trajectory
@@ -191,12 +318,101 @@ def load_dataset_cpu(path: str | Path, frame_offsets: Tuple[int, ...], block_siz
             f"min={traj_lengths.min()}, max={traj_lengths.max()}, mean={traj_lengths.mean():.1f}"
         )
 
-    # Always filter intersection frames (will preserve terminal markers)
-    filtered = filter_intersection_frames({
-        "observations": obs,
-        "actions": actions,
-        "terminals": terminals,
-    })
+    # Process filtering in chunks, keeping trajectories together
+    print(f"Grouping trajectories into chunks of ~{chunk_size} frames...")
+    filter_start = time.time()
+    
+    # Find trajectory boundaries
+    terminal_indices = np.where(terminals)[0]
+    if len(terminal_indices) == 0:
+        # No terminals found, treat as single trajectory
+        trajectory_starts = np.array([0])
+        trajectory_ends = np.array([total_frames])
+        trajectory_lengths = np.array([total_frames])
+    else:
+        # Calculate trajectory start and end indices
+        trajectory_starts = np.concatenate([[0], terminal_indices[:-1] + 1])
+        trajectory_ends = terminal_indices + 1
+        trajectory_lengths = trajectory_ends - trajectory_starts
+    
+    num_trajectories = len(trajectory_starts)
+    print(f"Found {num_trajectories} trajectories (avg length: {trajectory_lengths.mean():.1f} frames)")
+    
+    # Group trajectories into chunks
+    filtered_chunks = []
+    chunk_trajectories = []
+    chunk_frame_count = 0
+    chunk_idx = 0
+    
+    for traj_idx in range(num_trajectories):
+        traj_start = trajectory_starts[traj_idx]
+        traj_end = trajectory_ends[traj_idx]
+        traj_length = traj_end - traj_start
+        
+        # If adding this trajectory would exceed chunk_size, process current chunk first
+        if chunk_frame_count > 0 and chunk_frame_count + traj_length > chunk_size:
+            # Process current chunk
+            chunk_start = trajectory_starts[chunk_trajectories[0]]
+            chunk_end = trajectory_ends[chunk_trajectories[-1]]
+            chunk_slice = slice(chunk_start, chunk_end)
+            
+            print(f"Processing chunk {chunk_idx + 1} ({len(chunk_trajectories)} trajectories, {chunk_frame_count} frames)...", end="\r")
+            
+            # Load chunk from file
+            obs_chunk = np.asarray(data_np["observations"][chunk_slice])
+            actions_chunk = np.asarray(data_np["actions"][chunk_slice], dtype=np.float32)
+            terminals_chunk = terminals[chunk_slice].copy()
+            
+            # Filter this chunk
+            filtered_chunk = filter_intersection_frames({
+                "observations": obs_chunk,
+                "actions": actions_chunk,
+                "terminals": terminals_chunk,
+            })
+            
+            filtered_chunks.append(filtered_chunk)
+            
+            # Start new chunk
+            chunk_trajectories = []
+            chunk_frame_count = 0
+            chunk_idx += 1
+        
+        # Add trajectory to current chunk
+        chunk_trajectories.append(traj_idx)
+        chunk_frame_count += traj_length
+    
+    # Process final chunk if it has trajectories
+    if len(chunk_trajectories) > 0:
+        chunk_start = trajectory_starts[chunk_trajectories[0]]
+        chunk_end = trajectory_ends[chunk_trajectories[-1]]
+        chunk_slice = slice(chunk_start, chunk_end)
+        
+        print(f"Processing chunk {chunk_idx + 1} ({len(chunk_trajectories)} trajectories, {chunk_frame_count} frames)...", end="\r")
+        
+        # Load chunk from file
+        obs_chunk = np.asarray(data_np["observations"][chunk_slice])
+        actions_chunk = np.asarray(data_np["actions"][chunk_slice], dtype=np.float32)
+        terminals_chunk = terminals[chunk_slice].copy()
+        
+        # Filter this chunk
+        filtered_chunk = filter_intersection_frames({
+            "observations": obs_chunk,
+            "actions": actions_chunk,
+            "terminals": terminals_chunk,
+        })
+        
+        filtered_chunks.append(filtered_chunk)
+    
+    print(f"\nFiltering completed in {time.time() - filter_start:.2f}s")
+    print(f"Processed {len(filtered_chunks)} chunks (all trajectories kept intact)")
+    print("Concatenating filtered chunks...")
+    
+    # Concatenate all filtered chunks
+    filtered = {
+        "observations": np.concatenate([chunk["observations"] for chunk in filtered_chunks], axis=0),
+        "actions": np.concatenate([chunk["actions"] for chunk in filtered_chunks], axis=0),
+        "terminals": np.concatenate([chunk["terminals"] for chunk in filtered_chunks], axis=0),
+    }
     obs = filtered["observations"]
     actions = filtered["actions"]
     terminals = filtered["terminals"]
@@ -275,6 +491,114 @@ def _gather_trajectories(
             else {}
         ),
     }
+
+
+def split_dataset_by_terminals_jax(
+    dataset: Dict[str, jnp.ndarray],
+    val_fraction: float,
+    seed: int,
+) -> Tuple[Dict[str, jnp.ndarray], Dict[str, jnp.ndarray] | None]:
+    """Split dataset by actual trajectory boundaries (terminals), working with JAX arrays on GPU."""
+    print(f"\n=== SPLITTING DATASET BY TERMINALS (JAX) ===")
+    terminals = dataset.get('terminals', jnp.zeros(len(dataset["observations"]), dtype=bool))
+    
+    # Find all terminal locations using JAX
+    terminal_locs = jnp.arange(len(terminals))[terminals] if jnp.any(terminals) else jnp.array([], dtype=jnp.int32)
+    
+    print(f"Total frames: {len(dataset['observations'])}")
+    print(f"Terminal locations found: {len(terminal_locs)}")
+    
+    if len(terminal_locs) == 0:
+        print("WARNING: No terminals found! Treating as single trajectory.")
+        empty_shape = (0, *dataset["observations"].shape[1:])
+        return dataset, {
+            "observations": jnp.zeros(empty_shape, dtype=dataset["observations"].dtype),
+            "actions": jnp.zeros((0, *dataset["actions"].shape[1:]), dtype=dataset["actions"].dtype),
+            "terminals": jnp.zeros((0,), dtype=bool),
+        }
+    
+    # Build trajectory boundaries: [start, end) for each trajectory
+    traj_starts = jnp.concatenate([jnp.array([0]), terminal_locs[:-1] + 1])
+    traj_ends = terminal_locs + 1
+    num_trajectories = len(traj_starts)
+    
+    traj_lengths = traj_ends - traj_starts
+    print(f"Number of trajectories: {num_trajectories}")
+    if len(traj_lengths) > 0:
+        print(f"Trajectory lengths (first 10): {jnp.asarray(traj_lengths[:min(10, len(traj_lengths))])}")
+        print(f"Trajectory lengths (stats): min={jnp.min(traj_lengths)}, max={jnp.max(traj_lengths)}, mean={jnp.mean(traj_lengths):.1f}, median={jnp.median(traj_lengths):.1f}")
+    
+    # Shuffle trajectory indices using JAX random
+    key = random.PRNGKey(seed)
+    traj_ids = jnp.arange(num_trajectories)
+    traj_ids = random.permutation(key, traj_ids)
+    
+    # Split trajectories
+    num_val = max(1, int(round(val_fraction * num_trajectories)))
+    num_val = min(num_val, num_trajectories - 1) if num_trajectories > 1 else num_val
+    
+    val_ids = traj_ids[:num_val]
+    train_ids = traj_ids[num_val:] if num_trajectories > num_val else traj_ids[:1]
+    
+    # Gather trajectories by actual boundaries - use JAX operations
+    train_obs_list = []
+    train_act_list = []
+    train_term_list = []
+    
+    val_obs_list = []
+    val_act_list = []
+    val_term_list = []
+    
+    for traj_id in train_ids:
+        start = traj_starts[traj_id]
+        end = traj_ends[traj_id]
+        train_obs_list.append(dataset["observations"][start:end])
+        train_act_list.append(dataset["actions"][start:end])
+        term_chunk = terminals[start:end]
+        if len(term_chunk) > 0:
+            term_chunk = term_chunk.at[-1].set(True)  # Ensure last frame is terminal
+        train_term_list.append(term_chunk)
+    
+    for traj_id in val_ids:
+        start = traj_starts[traj_id]
+        end = traj_ends[traj_id]
+        val_obs_list.append(dataset["observations"][start:end])
+        val_act_list.append(dataset["actions"][start:end])
+        term_chunk = terminals[start:end]
+        if len(term_chunk) > 0:
+            term_chunk = term_chunk.at[-1].set(True)  # Ensure last frame is terminal
+        val_term_list.append(term_chunk)
+    
+    train_data = {
+        "observations": jnp.concatenate(train_obs_list, axis=0) if train_obs_list else jnp.zeros((0, *dataset["observations"].shape[1:]), dtype=dataset["observations"].dtype),
+        "actions": jnp.concatenate(train_act_list, axis=0) if train_act_list else jnp.zeros((0, *dataset["actions"].shape[1:]), dtype=dataset["actions"].dtype),
+        "terminals": jnp.concatenate(train_term_list, axis=0) if train_term_list else jnp.zeros((0,), dtype=bool),
+    }
+    # Ensure last frame of train set is terminal
+    if len(train_data["terminals"]) > 0:
+        train_data["terminals"] = train_data["terminals"].at[-1].set(True)
+    
+    val_data = {
+        "observations": jnp.concatenate(val_obs_list, axis=0) if val_obs_list else jnp.zeros((0, *dataset["observations"].shape[1:]), dtype=dataset["observations"].dtype),
+        "actions": jnp.concatenate(val_act_list, axis=0) if val_act_list else jnp.zeros((0, *dataset["actions"].shape[1:]), dtype=dataset["actions"].dtype),
+        "terminals": jnp.concatenate(val_term_list, axis=0) if val_term_list else jnp.zeros((0,), dtype=bool),
+    } if val_obs_list else None
+    # Ensure last frame of val set is terminal
+    if val_data is not None and len(val_data["terminals"]) > 0:
+        val_data["terminals"] = val_data["terminals"].at[-1].set(True)
+    
+    print(f"\n=== SPLIT COMPLETE ===")
+    print(f"Train: {len(train_data['observations'])} frames, {len(train_ids)} trajectories")
+    if val_data is not None:
+        print(f"Val: {len(val_data['observations'])} frames, {len(val_ids)} trajectories")
+        train_terminal_count = jnp.sum(train_data['terminals'])
+        val_terminal_count = jnp.sum(val_data['terminals'])
+        print(f"Train terminals: {train_terminal_count}, Val terminals: {val_terminal_count}")
+    else:
+        print(f"Val: 0 frames, 0 trajectories")
+    print("=" * 50)
+    
+    return train_data, val_data
 
 
 def split_dataset_by_terminals(
@@ -403,8 +727,9 @@ def enforce_periodic_terminals(data: Dict[str, np.ndarray], period: int) -> Dict
 
 
 def numpy_to_jax(batch: Dict[str, np.ndarray]) -> Dict[str, jnp.ndarray]:
+    """Convert NumPy arrays to JAX arrays. Safe to call on JAX arrays (no-op)."""
     return tree_util.tree_map(
-        lambda x: jnp.asarray(x) if isinstance(x, np.ndarray) else x,
+        lambda x: jnp.asarray(x) if isinstance(x, (np.ndarray, jnp.ndarray)) else x,
         batch,
     )
 
@@ -487,8 +812,8 @@ def compute_validation_loss(agent, val_dataset: GCDataset | None, batch_size: in
         return {}
 
     actual_batch = min(batch_size, val_dataset.size)
-    batch_np = val_dataset.sample(actual_batch, evaluation=True)
-    batch = numpy_to_jax(batch_np)
+    batch = val_dataset.sample(actual_batch, evaluation=True)
+    batch = numpy_to_jax(batch)  # Safety: ensure all arrays are JAX (no-op if already JAX)
 
     for k in ("observations", "actions", "actor_goals", "value_goals"):
         if k in batch and jnp.any(jnp.isnan(batch[k])):
@@ -548,7 +873,7 @@ def main(args: argparse.Namespace) -> None:
     cfg.actor_lr_scale = 1.0
     cfg.frame_stack = None  # Stacking handled on-the-fly via frame_offsets.
     cfg.block_size = args.block_size
-    cfg.frame_offsets = tuple(args.frame_offsets if args.frame_offsets else [0, -10, -20, -50, -80])
+    cfg.frame_offsets = tuple(args.frame_offsets if args.frame_offsets else [0])
     cfg.p_aug = 0.5
     cfg.distance_loss_weight = 0.05
     cfg.distance_head_hidden_dims = (256, 256)
@@ -576,55 +901,97 @@ def main(args: argparse.Namespace) -> None:
 
     np.random.seed(args.seed)
 
-    cpu_dataset = load_dataset_cpu(
-        args.dataset_path,
-        frame_offsets=cfg.frame_offsets,
-        block_size=args.block_size,
-    )
-
-    # Split by actual trajectory boundaries (using terminal markers, not fixed length)
-    # This will respect the variable-length trajectories after filtering
-    train_split, val_split = split_dataset_by_terminals(
-        cpu_dataset,
-        val_fraction=0.2,
-        seed=args.seed,
-    )
-
-    def build_gc_dataset(split: Dict[str, np.ndarray]) -> GCDataset | None:
-        if split["observations"].size == 0:
+    # Load dataset directly to GPU
+    import time
+    with tqdm(total=4, desc="Loading dataset") as pbar:
+        # Load from disk and immediately convert to JAX (moves to GPU)
+        pbar.set_description("Loading from disk and moving to GPU")
+        data_np = np.load(args.dataset_path)
+        obs = jnp.asarray(data_np["observations"])
+        actions = jnp.asarray(data_np["actions"], dtype=jnp.float32)
+        pbar.update(1)
+        
+        # Get terminals and convert to JAX
+        pbar.set_description("Processing terminals")
+        terminals_np = _maybe_get_terminals_from_source(data_np)
+        if terminals_np is None:
+            total_frames = data_np["observations"].shape[0]
+            terminals = jnp.zeros(total_frames, dtype=bool)
+            terminal_indices = jnp.arange(999, total_frames, 1000)
+            terminals = terminals.at[terminal_indices].set(True)
+        else:
+            terminals = jnp.asarray(terminals_np, dtype=bool)
+        terminals = terminals.at[-1].set(True)
+        pbar.update(1)
+        
+        # Filter on GPU (if enabled)
+        if not args.no_filter_intersections:
+            pbar.set_description("Filtering intersection frames")
+            filtered = filter_intersection_frames_jax({
+                "observations": obs,
+                "actions": actions,
+                "terminals": terminals,
+            })
+            obs = filtered["observations"]
+            actions = filtered["actions"]
+            terminals = filtered["terminals"]
+        pbar.update(1)
+        
+        # Split on GPU
+        pbar.set_description("Splitting dataset")
+        train_data, val_data = split_dataset_by_terminals_jax(
+            {"observations": obs, "actions": actions, "terminals": terminals},
+            val_fraction=0.2,
+            seed=args.seed,
+        )
+        if val_data is not None and val_data["observations"].size > 0:
+            val_data = {
+                "observations": val_data["observations"],
+                "actions": val_data["actions"],
+                "terminals": val_data["terminals"],
+            }
+        else:
+            val_data = None
+        pbar.update(1)
+    
+    # Build datasets
+    def build_gc_dataset(data: Dict) -> GCDataset | None:
+        if data["observations"].size == 0:
             return None
         dataset_fields = dict(
-            observations=split["observations"],
-            actions=split["actions"],
-            terminals=split["terminals"],
+            observations=data["observations"],
+            actions=data["actions"],
+            terminals=data["terminals"],
         )
-        if "next_observations" in split:
-            dataset_fields["next_observations"] = split["next_observations"]
-        return GCDataset(Dataset.create(**dataset_fields), cfg)
+        rng = jax.random.PRNGKey(args.seed)
+        return GCDataset(Dataset.create(**dataset_fields), cfg, rng=rng)
+    
+    train_dataset = build_gc_dataset(train_data)
+    val_dataset = build_gc_dataset(val_data) if val_data else None
 
-    train_dataset = build_gc_dataset(train_split)
-    val_dataset = build_gc_dataset(val_split)
-
-    if train_dataset is None or train_dataset.size == 0:
-        raise ValueError("Training dataset is empty after preprocessing.")
-
-    print(
-        f"Dataset summary: train={train_dataset.size} frames, "
-        f"val={(val_dataset.size if val_dataset is not None else 0)} frames"
-    )
 
     example_batch = train_dataset.sample(min(10, cfg.batch_size))
     ex_obs_np = np.asarray(example_batch["observations"])
     ex_act_np = np.asarray(example_batch["actions"])
     print(f"Creating agent with example shapes: obs={ex_obs_np.shape}, actions={ex_act_np.shape}")
-
+    import time
+    agent_start = time.time()
     agent = agent_cls.create(
         seed=args.seed,
         ex_observations=ex_obs_np,
         ex_actions=ex_act_np,
         config=cfg,
     )
-    print("Agent created successfully")
+    print(f"Agent created successfully in {time.time() - agent_start:.2f}s (JIT compilation may happen on first forward pass)")
+    
+    # Pre-compile the update function with a dummy batch to avoid JIT compilation overhead during training
+    print("Pre-compiling update function...")
+    compile_start = time.time()
+    example_batch = train_dataset.sample(min(10, cfg.batch_size))
+    example_batch = numpy_to_jax(example_batch)  # Safety: ensure all arrays are JAX (no-op if already JAX)
+    # Compile by running once (JAX will cache the compiled version)
+    agent, _ = agent.update(example_batch)
+    print(f"Update function compiled in {time.time() - compile_start:.2f}s")
 
     ckpt_dir = Path(args.ckpt_dir)
     ckpt_dir.mkdir(parents=True, exist_ok=True)
@@ -643,28 +1010,46 @@ def main(args: argparse.Namespace) -> None:
             agent = agent.replace(config=freeze(config_dict))
 
         progress = trange(args.steps, dynamic_ncols=True)
-        for step in progress:
+        for step in range(args.steps):
             total_steps += 1
+            progress.update(1)
+            
             t0 = time.time()
-            batch_np = train_dataset.sample(cfg.batch_size)
-            batch = numpy_to_jax(batch_np)
+            batch = train_dataset.sample(cfg.batch_size)
+            batch = numpy_to_jax(batch)  # Safety: ensure all arrays are JAX (no-op if already JAX)
             batch_ms = (time.time() - t0) * 1000.0
 
             t1 = time.time()
             agent, info = agent.update(batch)
             upd_ms = (time.time() - t1) * 1000.0
-
-            # Logging (use total_steps, not step, so logging works across epochs)
             if total_steps % args.log_every == 0:
                 log_dict: Dict[str, object] = {}
-
-                # Log only the requested scalar metrics under clear names.
                 metric_map = [
                     ("actor/bc_loss", "train/actor_bc_loss"),
                     ("actor/q_loss", "train/actor_q_loss"),
                     ("actor/mse", "train/actor_mse"),
                     ("critic/contrastive_loss", "train/critic_loss"),
                     ("critic/categorical_accuracy", "train/critic_categorical_accuracy"),
+                    # DEBUG: Check if embeddings are collapsed
+                    ("critic/phi_psi_similarity_raw", "train/critic_phi_psi_similarity_raw"),
+                    ("critic/phi_batch_std_raw", "train/critic_phi_batch_std_raw"),
+                    ("critic/psi_batch_std_raw", "train/critic_psi_batch_std_raw"),
+                    ("critic/logits_pos_neg_diff", "train/critic_logits_pos_neg_diff"),
+                    # DEBUG: Network output statistics
+                    ("critic/phi_mean", "train/critic_phi_mean"),
+                    ("critic/phi_std", "train/critic_phi_std"),
+                    ("critic/psi_mean", "train/critic_psi_mean"),
+                    ("critic/psi_std", "train/critic_psi_std"),
+                    ("critic/phi_positive_frac", "train/critic_phi_positive_frac"),
+                    ("critic/psi_positive_frac", "train/critic_psi_positive_frac"),
+                    ("critic/v_mean_before_exp", "train/critic_v_mean_before_exp"),
+                    ("critic/pos_neg_diff_raw", "train/critic_pos_neg_diff_raw"),
+                    # Raw logit statistics for scaling diagnosis
+                    ("critic/logits_raw_mean", "train/critic_logits_raw_mean"),
+                    ("critic/logits_raw_std", "train/critic_logits_raw_std"),
+                    ("critic/logits_raw_pos", "train/critic_logits_raw_pos"),
+                    ("critic/logits_raw_neg", "train/critic_logits_raw_neg"),
+                    ("critic/logits_raw_diff", "train/critic_logits_raw_diff"),
                 ]
                 for src_key, dst_name in metric_map:
                     if src_key in info:
@@ -672,8 +1057,6 @@ def main(args: argparse.Namespace) -> None:
 
                 wandb.log(log_dict, step=total_steps)
                 last_log_step = total_steps
-
-            # Progress bar: show primary loss metrics
             postfix = {}
             if "actor/bc_loss" in info:
                 postfix["bc"] = float(info["actor/bc_loss"])
@@ -681,10 +1064,17 @@ def main(args: argparse.Namespace) -> None:
                 postfix["q"] = float(info["actor/q_loss"])
             if "critic/contrastive_loss" in info:
                 postfix["critic"] = float(info["critic/contrastive_loss"])
+            # DEBUG: Print key diagnostic metrics
+            if "critic/categorical_accuracy" in info:
+                postfix["cat_acc"] = f"{float(info['critic/categorical_accuracy']):.4f}"
+            if "critic/phi_psi_similarity_raw" in info:
+                postfix["phi_psi_sim"] = f"{float(info['critic/phi_psi_similarity_raw']):.3f}"
+            if "critic/phi_batch_std_raw" in info:
+                postfix["phi_std"] = f"{float(info['critic/phi_batch_std_raw']):.4f}"
+            if "critic/psi_batch_std_raw" in info:
+                postfix["psi_std"] = f"{float(info['critic/psi_batch_std_raw']):.4f}"
             if postfix:
                 progress.set_postfix(**postfix)
-
-            # checkpoints (use total_steps, not step, so checkpoints work across epochs)
             if args.ckpt_every and total_steps % args.ckpt_every == 0:
                 ckpt_path = ckpt_dir / f"agent_step{total_steps}.pkl"
                 with ckpt_path.open("wb") as f:
@@ -717,8 +1107,8 @@ def main(args: argparse.Namespace) -> None:
 
         # Log at end of epoch if we haven't already this step
         if total_steps != last_log_step:
-            batch_np = train_dataset.sample(cfg.batch_size)
-            batch = numpy_to_jax(batch_np)
+            batch = train_dataset.sample(cfg.batch_size)
+            batch = numpy_to_jax(batch)  # Safety: ensure all arrays are JAX (no-op if already JAX)
             _, info = agent.update(batch)
 
             log_dict: Dict[str, object] = {}
@@ -762,11 +1152,13 @@ if __name__ == "__main__":
     parser.add_argument("--discount", type=float, default=0.99)
     parser.add_argument("--project", default="crl_training")
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--log_every", type=int, default=1000)
+    parser.add_argument("--log_every", type=int, default=100)  # Log more frequently for debugging
     parser.add_argument("--ckpt_every", type=int, default=50_000)
     parser.add_argument("--ckpt_dir", default="checkpoints")
     parser.add_argument("--algorithm", default="CRL")
     parser.add_argument("--block_size", type=int, default=400, help="Block size for block-aware frame stacking and shuffling")
+    parser.add_argument("--chunk_size", type=int, default=50000, help="Process dataset in chunks of ~this many frames (trajectories are kept intact, not split)")
+    parser.add_argument("--use_mmap", action="store_true", help="Use memory-mapped file loading (saves RAM but may be slower)")
     parser.add_argument("--val_every", type=int, default=500)
     parser.add_argument("--obs_h", type=int, default=100)
     parser.add_argument("--obs_w", type=int, default=100)

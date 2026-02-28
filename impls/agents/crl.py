@@ -47,66 +47,46 @@ class CRLAgent(flax.struct.PyTreeNode):
             phi = phi[None, ...]
             psi = psi[None, ...]
         
-        # Normalize phi and psi to unit vectors to prevent representation collapse
-        phi_norm = phi / (jnp.linalg.norm(phi, axis=-1, keepdims=True) + 1e-8)
-        psi_norm = psi / (jnp.linalg.norm(psi, axis=-1, keepdims=True) + 1e-8)
+        # CRITICAL: Clip embeddings to prevent unbounded growth before normalization
+        # This prevents the network from learning to output huge values
+        clip_value = 100.0  # Reasonable upper bound for embeddings
+        phi = jnp.clip(phi, -clip_value, clip_value)
+        psi = jnp.clip(psi, -clip_value, clip_value)
         
-        # Compute logits: similarity between phi[i] and psi[j] for all pairs
-        # Use normalized representations to ensure meaningful similarity scores
+        # Normalize embeddings to unit vectors (prevents explosion in logits)
+        eps = 1e-8
+        phi_norm = phi / (jnp.linalg.norm(phi, axis=-1, keepdims=True) + eps)
+        psi_norm = psi / (jnp.linalg.norm(psi, axis=-1, keepdims=True) + eps)
+        
+        # Compute cosine similarity (range [-1, 1])
         logits = jnp.einsum('eik,ejk->ije', phi_norm, psi_norm)
         # logits.shape is (B, B, e) with one term for positive pair and (B - 1) terms for negative pairs in each row.
+        
+        # Apply sqrt scaling as in original implementation
+        # With normalized embeddings, cosine similarity is in [-1, 1], so sqrt scaling helps
+        #logits = logits / 0.1
+        # logits.shape is (B, B, e) with one term for positive pair and (B - 1) terms for negative pairs in each row.
         I = jnp.eye(batch_size)
-        
-        # Use InfoNCE-style contrastive loss with temperature scaling
-        # Temperature scaling helps the model learn better separations
-        temperature = 0.17  # Standard temperature for contrastive learning
-        logits_scaled = logits / temperature
-        
-        # For each ensemble member, compute InfoNCE loss
-        # For each row i, we want logits[i, i] (positive) to be larger than logits[i, j] for j != i (negatives)
-        def infonce_loss(_logits):
-
-            row_log_probs = jax.nn.log_softmax(_logits, axis=-1)  # Shape: (B, B)
-            
-            pos_log_probs = jnp.diag(row_log_probs)  # Shape: (B,)
-        
-            return -jnp.mean(pos_log_probs)
-        
-        contrastive_loss = jax.vmap(infonce_loss, in_axes=-1, out_axes=-1)(logits_scaled)
+        contrastive_loss = jax.vmap(
+            lambda _logits: optax.softmax_cross_entropy(logits=_logits, labels=I),
+            in_axes=-1,
+            out_axes=-1,
+        )(logits)
         contrastive_loss = jnp.mean(contrastive_loss)
-        
-        # Use original logits (before scaling) for statistics
-        logits_for_stats = logits
 
         # Compute additional statistics.
         v = jnp.exp(v)
-        logits = jnp.mean(logits_for_stats, axis=-1)  # Average over ensemble for stats
+        logits = jnp.mean(logits, axis=-1)
         correct = jnp.argmax(logits, axis=1) == jnp.argmax(I, axis=1)
         logits_pos = jnp.sum(logits * I) / jnp.sum(I)
         logits_neg = jnp.sum(logits * (1 - I)) / jnp.sum(1 - I)
         
-        # Additional diagnostics: check representation diversity
-        phi_mean = jnp.mean(phi_norm, axis=(0, 1))  # Average over ensemble and batch
-        psi_mean = jnp.mean(psi_norm, axis=(0, 1))
-        phi_std = jnp.std(phi_norm, axis=(0, 1))
-        psi_std = jnp.std(psi_norm, axis=(0, 1))
-        phi_psi_diff = jnp.mean(jnp.abs(phi_mean - psi_mean))
-        
-        # Check for representation collapse: if all representations are similar, std will be low
-        # Average std across batch dimension for each ensemble member, then average over ensemble
-        phi_batch_std = jnp.mean(jnp.std(phi_norm, axis=1))  # Shape: (e, latent_dim) -> mean over e and latent_dim
-        psi_batch_std = jnp.mean(jnp.std(psi_norm, axis=1))
-        
-        # Check if positive pairs are actually more similar than negatives
-        pos_similarities = jnp.diag(logits)  # Positive pair similarities (B,)
-        neg_similarities = logits * (1 - I)  # All negative pairs (B, B)
-        neg_similarities_mean = jnp.sum(neg_similarities) / jnp.sum(1 - I)
-        pos_neg_gap = jnp.mean(pos_similarities) - neg_similarities_mean
+        # Debug: log raw logit statistics to diagnose scaling
+        logits_raw_mean = jnp.mean(logits, axis=-1)  # Average over ensemble
+        logits_raw_pos = jnp.sum(logits_raw_mean * I) / jnp.sum(I)
+        logits_raw_neg = jnp.sum(logits_raw_mean * (1 - I)) / jnp.sum(1 - I)
 
-        distance_weight = float(self.config.get('distance_loss_weight', 0.0))
-        distance_loss = 0.0
-
-        stats = {
+        return contrastive_loss, {
             'contrastive_loss': contrastive_loss,
             'v_mean': v.mean(),
             'v_max': v.max(),
@@ -116,67 +96,12 @@ class CRLAgent(flax.struct.PyTreeNode):
             'logits_pos': logits_pos,
             'logits_neg': logits_neg,
             'logits': logits.mean(),
-            'logits_std': jnp.std(logits),
-            'logits_pos_neg_diff': logits_pos - logits_neg,  # Should be positive if working
-            'phi_mean_norm': jnp.linalg.norm(phi_mean),
-            'psi_mean_norm': jnp.linalg.norm(psi_mean),
-            'phi_std_mean': jnp.mean(phi_std),
-            'psi_std_mean': jnp.mean(psi_std),
-            'phi_psi_diff': phi_psi_diff,
-            # Representation collapse diagnostics
-            'phi_batch_std': phi_batch_std,  # Low (< 0.05) = representation collapse
-            'psi_batch_std': psi_batch_std,  # Low (< 0.05) = representation collapse
-            'pos_neg_gap': pos_neg_gap,  # Should be positive and increasing (target: > 0.2)
-            'pos_similarity_mean': jnp.mean(pos_similarities),
-            'neg_similarity_mean': neg_similarities_mean,
+            'logits_raw_mean': jnp.mean(logits),
+            'logits_raw_std': jnp.std(logits),
+            'logits_raw_pos': logits_raw_pos,
+            'logits_raw_neg': logits_raw_neg,
+            'logits_raw_diff': logits_raw_pos - logits_raw_neg,  # Should be positive for separation
         }
-
-        if (
-            module_name == 'critic'
-            and distance_weight > 0.0
-            and 'distance_head' in grad_params
-            and 'value_goal_deltas' in batch
-        ):
-            targets = batch['value_goal_deltas']
-            mask = batch.get('value_goal_delta_mask')
-            if mask is None:
-                mask = jnp.ones_like(targets)
-            
-            # Only apply distance loss if we have enough valid samples (mask fraction > 0.1)
-            # This prevents the head from interfering when using random goals
-            mask_fraction = jnp.mean(mask)
-            if mask_fraction > 0.1:
-                phi_mean = jnp.mean(phi, axis=0)
-                psi_mean = jnp.mean(psi, axis=0)
-                distance_pred = self.network.select('distance_head')(
-                    phi_mean,
-                    psi_mean,
-                    params=grad_params,
-                )
-                mse = (distance_pred - targets) ** 2
-                distance_loss = jnp.sum(mask * mse) / (jnp.sum(mask) + 1e-6)
-                contrastive_loss = contrastive_loss + distance_weight * distance_loss
-
-                stats.update(
-                    {
-                        'distance_loss': distance_loss,
-                        'distance_pred_mean': jnp.mean(distance_pred),
-                        'distance_target_mean': jnp.mean(targets),
-                        'distance_mask_fraction': mask_fraction,
-                    }
-                )
-            else:
-                # Log that we're skipping the distance head due to low mask fraction
-                stats.update(
-                    {
-                        'distance_loss': 0.0,
-                        'distance_pred_mean': 0.0,
-                        'distance_target_mean': jnp.mean(targets),
-                        'distance_mask_fraction': mask_fraction,
-                    }
-                )
-
-        return contrastive_loss, stats
 
     def actor_loss(self, batch, grad_params, rng=None):
         """Compute the actor loss (AWR or DDPG+BC)."""
@@ -249,7 +174,7 @@ class CRLAgent(flax.struct.PyTreeNode):
         """Compute the total loss."""
         info = {}
         rng = rng if rng is not None else self.rng
-
+        
         critic_loss, critic_info = self.contrastive_loss(batch, grad_params, 'critic')
         for k, v in critic_info.items():
             info[f'critic/{k}'] = v
@@ -417,6 +342,7 @@ def get_config():
             # Agent hyperparameters.
             agent_name='crl',  # Agent name.
             lr=3e-4,  # Learning rate.
+            full_stats_frequency=0.01,  # Frequency (0-1) of computing full diagnostic stats. 0.01 = 1% of steps. Set to 1.0 for always, 0.0 for never.
             batch_size=1024,  # Batch size.
             actor_hidden_dims=(512, 512, 512),  # Actor network hidden dimensions.
             value_hidden_dims=(512, 512, 512),  # Value network hidden dimensions.

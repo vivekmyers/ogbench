@@ -7,5 +7,41 @@ dist/
 .idea/
 .ruff_cache/
 # Wandb logs and artifacts
+wandb/
 impls/wandb/
 .wandb/
+# Checkpoints
+checkpoints/
+**/checkpoints/
+*.ckpt
+*.pth
+*.pt
+
+# Large data files
+*.npz
+*.npy
+*.h5
+*.hdf5
+*.pkl
+*.pickle
+*.zip
+*.tar
+*.tar.gz
+*.gz
+*.bz2
+*.xz
+
+# Video files
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.webm
+
+# Large image datasets (but keep assets/)
+*.png
+*.jpg
+*.jpeg
+!assets/**/*.png
+!assets/**/*.jpg
+!assets/**/*.jpeg
