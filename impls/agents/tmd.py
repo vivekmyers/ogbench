@@ -125,8 +125,13 @@ class TMDAgent(flax.struct.PyTreeNode):
         dw = self.config['diag_backup']
         divergence = divergence * (1 - dw) + jnp.diagonal(divergence, axis1=1, axis2=2)[..., None] * dw
         backup_loss = jnp.mean(divergence)
-
-        critic_loss = contrastive_loss + self.config['zeta'] * action_invariance_loss + self.config['zeta'] * backup_loss
+        if self.config['dual_descent']:
+            optim_backup = 1 - jax.lax.stop_gradient(dist_next) + jnp.log(gamma)
+            backup_optim_loss= jnp.mean(divergence - optim_backup)
+            val = jnp.exp(-(jax.lax.stop_gradient(backup_optim_loss) + jax.lax.stop_gradient(action_invariance_loss)))
+            critic_loss = val * contrastive_loss + backup_loss + action_invariance_loss
+        else:
+            critic_loss = contrastive_loss + self.config['zeta'] * action_invariance_loss + self.config['zeta'] * backup_loss
 
         logits = jnp.mean(logits, axis=0)
         correct = jnp.argmax(logits, axis=1) == jnp.argmax(I, axis=1)
@@ -404,6 +409,7 @@ def get_config():
             freeze_enc_for_actor_grad=False,  # Whether to stop grad for actor when using encoder
             use_action_for_distance=True,  # Whether to use action for distance computation
             frame_stack=ml_collections.config_dict.placeholder(int),  # Number of frames to stack.
+            dual_descent=False,
         )
     )
     return config
