@@ -128,7 +128,7 @@ class TMDAgent(flax.struct.PyTreeNode):
         if self.config['dual_descent']:
             optim_backup = 1 - jax.lax.stop_gradient(dist_next) + jnp.log(gamma)
             backup_optim_loss= jnp.mean(divergence - optim_backup)
-            val = jnp.exp(-(jax.lax.stop_gradient(backup_optim_loss) + jax.lax.stop_gradient(action_invariance_loss)) / 10)
+            val = jnp.exp(-(jax.lax.stop_gradient(backup_optim_loss) + jax.lax.stop_gradient(action_invariance_loss)))
             critic_loss = val * contrastive_loss + backup_loss + action_invariance_loss
         else:
             critic_loss = contrastive_loss + self.config['zeta'] * action_invariance_loss + self.config['zeta'] * backup_loss
