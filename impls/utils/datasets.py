@@ -9,56 +9,30 @@ from flax.core.frozen_dict import FrozenDict
 
 
 def get_size(data):
-    """Return the size of the dataset."""
     sizes = jax.tree_util.tree_map(lambda arr: len(arr), data)
     return max(jax.tree_util.tree_leaves(sizes))
 
 
 @partial(jax.jit, static_argnames=('padding',))
 def random_crop(img, crop_from, padding):
-    """Randomly crop an image.
-
-    Args:
-        img: Image to crop.
-        crop_from: Coordinates to crop from.
-        padding: Padding size.
-    """
     padded_img = jnp.pad(img, ((padding, padding), (padding, padding), (0, 0)), mode='edge')
     return jax.lax.dynamic_slice(padded_img, crop_from, img.shape)
 
 
 @partial(jax.jit, static_argnames=('padding',))
 def batched_random_crop(imgs, crop_froms, padding):
-    """Batched version of random_crop."""
     return jax.vmap(random_crop, (0, 0, None))(imgs, crop_froms, padding)
 
 
 class Dataset(FrozenDict):
-    """Dataset class.
-
-    This class supports both regular datasets (i.e., storing both observations and next_observations) and
-    compact datasets (i.e., storing only observations). It assumes 'observations' is always present in the keys. If
-    'next_observations' is not present, it will be inferred from 'observations' by shifting the indices by 1. In this
-    case, set 'valids' appropriately to mask out the last state of each trajectory.
-    """
-
     @classmethod
     def create(cls, freeze=True, **fields):
-        """Create a dataset from the fields.
-
-        Args:
-            freeze: Whether to freeze the arrays.
-            **fields: Keys and values of the dataset.
-        """
         data = fields
         assert 'observations' in data
         if freeze:
-            # JAX arrays are already immutable, so no need to set flags
-            # Only set flags for NumPy arrays if any exist
             def _setflags_if_numpy(arr):
                 if isinstance(arr, np.ndarray):
                     arr.setflags(write=False)
-                # JAX arrays are immutable by design, no action needed
             jax.tree_util.tree_map(_setflags_if_numpy, data)
         return cls(data)
 
@@ -66,69 +40,41 @@ class Dataset(FrozenDict):
         super().__init__(*args, **kwargs)
         self.size = get_size(self._dict)
         if 'valids' in self._dict:
-            self.valid_idxs = jnp.where(self['valids'] > 0)[0]
+            (self.valid_idxs,) = np.nonzero(self['valids'] > 0)
 
-    def get_random_idxs(self, num_idxs, rng=None):
-        """Return `num_idxs` random indices using JAX random."""
-        if rng is None:
-            rng = jax.random.PRNGKey(0)
+    def get_random_idxs(self, num_idxs):
         if 'valids' in self._dict:
-            valid_len = len(self.valid_idxs)
-            idxs = jax.random.randint(rng, (num_idxs,), 0, valid_len)
-            return self.valid_idxs[idxs]
+            return self.valid_idxs[np.random.randint(len(self.valid_idxs), size=num_idxs)]
         else:
-            return jax.random.randint(rng, (num_idxs,), 0, self.size)
+            return np.random.randint(self.size, size=num_idxs)
 
-    def sample(self, batch_size: int, idxs=None, rng=None):
-        """Sample a batch of transitions."""
+    def sample(self, batch_size, idxs=None):
         if idxs is None:
-            idxs = self.get_random_idxs(batch_size, rng)
+            idxs = self.get_random_idxs(batch_size)
         return self.get_subset(idxs)
 
     def get_subset(self, idxs):
-        """Return a subset of the dataset given the indices."""
         result = jax.tree_util.tree_map(lambda arr: arr[idxs], self._dict)
         if 'next_observations' not in result:
-            result['next_observations'] = self._dict['observations'][jnp.minimum(idxs + 1, self.size - 1)]
+            result['next_observations'] = self._dict['observations'][np.minimum(idxs + 1, self.size - 1)]
         return result
 
 
 class ReplayBuffer(Dataset):
-    """Replay buffer class.
-
-    This class extends Dataset to support adding transitions.
-    """
-
     @classmethod
     def create(cls, transition, size):
-        """Create a replay buffer from the example transition.
-
-        Args:
-            transition: Example transition (dict).
-            size: Size of the replay buffer.
-        """
-
         def create_buffer(example):
             example = np.array(example)
             return np.zeros((size, *example.shape), dtype=example.dtype)
-
         buffer_dict = jax.tree_util.tree_map(create_buffer, transition)
         return cls(buffer_dict)
 
     @classmethod
     def create_from_initial_dataset(cls, init_dataset, size):
-        """Create a replay buffer from the initial dataset.
-
-        Args:
-            init_dataset: Initial dataset.
-            size: Size of the replay buffer.
-        """
-
         def create_buffer(init_buffer):
             buffer = np.zeros((size, *init_buffer.shape[1:]), dtype=init_buffer.dtype)
             buffer[: len(init_buffer)] = init_buffer
             return buffer
-
         buffer_dict = jax.tree_util.tree_map(create_buffer, init_dataset)
         dataset = cls(buffer_dict)
         dataset.size = dataset.pointer = get_size(init_dataset)
@@ -136,386 +82,230 @@ class ReplayBuffer(Dataset):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-
         self.max_size = get_size(self._dict)
         self.size = 0
         self.pointer = 0
 
     def add_transition(self, transition):
-        """Add a transition to the replay buffer."""
-
         def set_idx(buffer, new_element):
             buffer[self.pointer] = new_element
-
         jax.tree_util.tree_map(set_idx, self._dict, transition)
         self.pointer = (self.pointer + 1) % self.max_size
         self.size = max(self.pointer, self.size)
 
     def clear(self):
-        """Clear the replay buffer."""
         self.size = self.pointer = 0
 
 
 @dataclasses.dataclass
 class GCDataset:
-    """Dataset class for goal-conditioned RL.
-
-    This class provides a method to sample a batch of transitions with goals (value_goals and actor_goals) from the
-    dataset. The goals are sampled from the current state, future states in the same trajectory, and random states.
-    It also supports frame stacking and random-cropping image augmentation.
-
-    It reads the following keys from the config:
-    - discount: Discount factor for geometric sampling.
-    - value_p_curgoal: Probability of using the current state as the value goal.
-    - value_p_trajgoal: Probability of using a future state in the same trajectory as the value goal.
-    - value_p_randomgoal: Probability of using a random state as the value goal.
-    - value_geom_sample: Whether to use geometric sampling for future value goals.
-    - actor_p_curgoal: Probability of using the current state as the actor goal.
-    - actor_p_trajgoal: Probability of using a future state in the same trajectory as the actor goal.
-    - actor_p_randomgoal: Probability of using a random state as the actor goal.
-    - actor_geom_sample: Whether to use geometric sampling for future actor goals.
-    - gc_negative: Whether to use '0 if s == g else -1' (True) or '1 if s == g else 0' (False) as the reward.
-    - p_aug: Probability of applying image augmentation.
-    - frame_stack: Number of frames to stack.
-
-    Attributes:
-        dataset: Dataset object.
-        config: Configuration dictionary.
-        preprocess_frame_stack: Whether to preprocess frame stacks. If False, frame stacks are computed on-the-fly. This
-            saves memory but may slow down training.
-    """
-
     dataset: Dataset
     config: Any
     preprocess_frame_stack: bool = True
-    rng: Any = None
 
     def __post_init__(self):
         self.size = self.dataset.size
-        
-        # Initialize random key if not provided
-        if self.rng is None:
-            self.rng = jax.random.PRNGKey(0)
 
-        # Pre-compute trajectory boundaries using JAX.
-        terminals = self.dataset['terminals']
-        terminal_locs = jnp.where(terminals)[0]
-        self.terminal_locs = terminal_locs
-        self.initial_locs = jnp.concatenate([jnp.array([0]), terminal_locs[:-1] + 1])
-        assert int(terminal_locs[-1]) == self.size - 1
-        # Trajectory id for each frame (same length as dataset).
-        self.traj_ids = jnp.searchsorted(terminal_locs, jnp.arange(self.size), side='left')
+        (self.terminal_locs,) = np.nonzero(self.dataset['terminals'] > 0)
+        self.initial_locs = np.concatenate([[0], self.terminal_locs[:-1] + 1])
+        assert self.terminal_locs[-1] == self.size - 1
 
-        # Frame stacking / dtype metadata.
-        self.frame_offsets = tuple(self.config.get('frame_offsets', ()))
-        self.block_size = int(self.config.get('block_size', 400))
-        # Keep as JAX array
-        self._obs_array = self.dataset['observations']
-        self._obs_is_uint8 = self._obs_array.dtype == jnp.uint8
+        # --- FIX 1: Pre-compute per-index trajectory lookups ---
+        # O(1) lookup instead of searchsorted every sample call
+        self.idx_to_terminal = np.empty(self.size, dtype=np.int64)
+        self.idx_to_initial = np.empty(self.size, dtype=np.int64)
+        for i, (start, end) in enumerate(zip(self.initial_locs, self.terminal_locs)):
+            self.idx_to_terminal[start:end + 1] = end
+            self.idx_to_initial[start:end + 1] = start
 
-        # Assert probabilities sum to 1.
-        assert abs(
-            self.config['value_p_curgoal'] + self.config['value_p_trajgoal'] + self.config['value_p_randomgoal'] - 1.0
-        ) < 1e-6
-        assert abs(
-            self.config['actor_p_curgoal'] + self.config['actor_p_trajgoal'] + self.config['actor_p_randomgoal'] - 1.0
-        ) < 1e-6
+        assert np.isclose(
+            self.config['value_p_curgoal'] + self.config['value_p_trajgoal'] + self.config['value_p_randomgoal'], 1.0
+        )
+        assert np.isclose(
+            self.config['actor_p_curgoal'] + self.config['actor_p_trajgoal'] + self.config['actor_p_randomgoal'], 1.0
+        )
 
         if self.config['frame_stack'] is not None:
-            # Only support compact (observation-only) datasets.
             assert 'next_observations' not in self.dataset
             if self.preprocess_frame_stack:
-                stacked_observations = self.get_stacked_observations(jnp.arange(self.size))
+                stacked_observations = self.get_stacked_observations(np.arange(self.size))
                 self.dataset = Dataset(self.dataset.copy(dict(observations=stacked_observations)))
 
-    def sample(self, batch_size: int, idxs=None, evaluation=False):
-        """Sample a batch of transitions with goals.
-
-        This method samples a batch of transitions with goals (value_goals and actor_goals) from the dataset. They are
-        stored in the keys 'value_goals' and 'actor_goals', respectively. It also computes the 'rewards' and 'masks'
-        based on the indices of the goals.
-
-        Args:
-            batch_size: Batch size.
-            idxs: Indices of the transitions to sample. If None, random indices are sampled.
-            evaluation: Whether to sample for evaluation. If True, image augmentation is not applied.
-        """
-        # Split RNG for this sample
-        self.rng, sample_rng = jax.random.split(self.rng)
-        
+    def sample(self, batch_size, idxs=None, evaluation=False):
         if idxs is None:
-            idxs = self.dataset.get_random_idxs(batch_size, sample_rng)
-        idxs = jnp.asarray(idxs, dtype=jnp.int32)
+            idxs = self.dataset.get_random_idxs(batch_size)
 
-        batch = self.dataset.sample(batch_size, idxs, sample_rng)
-
-        use_frame_offsets = len(self.frame_offsets) > 0
-        needs_runtime_stack = use_frame_offsets or (self.config['frame_stack'] is not None and not self.preprocess_frame_stack)
-        if needs_runtime_stack:
-            next_idxs = jnp.minimum(idxs + 1, self.size - 1)
+        batch = self.dataset.sample(batch_size, idxs)
+        if self.config['frame_stack'] is not None:
             batch['observations'] = self.get_observations(idxs)
-            batch['next_observations'] = self.get_observations(next_idxs)
-        elif self._obs_is_uint8:
-            batch['observations'] = batch['observations'].astype(jnp.float32) / 255.0
-            if 'next_observations' in batch:
-                batch['next_observations'] = batch['next_observations'].astype(jnp.float32) / 255.0
+            batch['next_observations'] = self.get_observations(idxs + 1)
 
-        self.rng, goal_rng = jax.random.split(self.rng)
         value_goal_idxs = self.sample_goals(
             idxs,
             self.config['value_p_curgoal'],
             self.config['value_p_trajgoal'],
             self.config['value_p_randomgoal'],
             self.config['value_geom_sample'],
-            goal_rng,
         )
-        self.rng, goal_rng = jax.random.split(self.rng)
         actor_goal_idxs = self.sample_goals(
             idxs,
             self.config['actor_p_curgoal'],
             self.config['actor_p_trajgoal'],
             self.config['actor_p_randomgoal'],
             self.config['actor_geom_sample'],
-            goal_rng,
         )
 
-        batch['value_goals'] = self.get_observations(value_goal_idxs)
-        batch['actor_goals'] = self.get_observations(actor_goal_idxs)
-        successes = (idxs == value_goal_idxs).astype(jnp.float32)
+        # --- FIX 2: Batch observation gathering ---
+        # Single indexing pass for all goal observations instead of separate tree_maps
+        all_goal_idxs = np.stack([value_goal_idxs, actor_goal_idxs])  # (2, batch_size)
+        all_goals = self._batch_get_observations(all_goal_idxs)
+        batch['value_goals'] = jax.tree_util.tree_map(lambda x: x[0], all_goals)
+        batch['actor_goals'] = jax.tree_util.tree_map(lambda x: x[1], all_goals)
+
+        successes = (idxs == value_goal_idxs).astype(np.float32)
         batch['masks'] = 1.0 - successes
         batch['rewards'] = successes - (1.0 if self.config['gc_negative'] else 0.0)
 
-        # Goal-distance supervision (in frames).
-        value_goal_deltas = jnp.maximum(value_goal_idxs - idxs, 0)
-        same_traj = self.traj_ids[value_goal_idxs] == self.traj_ids[idxs]
-        future_goal = value_goal_idxs >= idxs
-        distance_mask = (same_traj & future_goal).astype(jnp.float32)
-        batch['value_goal_deltas'] = value_goal_deltas.astype(jnp.float32)
-        batch['value_goal_delta_mask'] = distance_mask
-
         if self.config['p_aug'] is not None and not evaluation:
-            self.rng, aug_rng = jax.random.split(self.rng)
-            if jax.random.uniform(aug_rng) < self.config['p_aug']:
-                self.rng, crop_rng = jax.random.split(self.rng)
-                self.augment(batch, ['observations', 'next_observations', 'value_goals', 'actor_goals'], crop_rng)
+            if np.random.rand() < self.config['p_aug']:
+                self.augment(batch, ['observations', 'next_observations', 'value_goals', 'actor_goals'])
 
         return batch
 
-    def sample_goals(self, idxs, p_curgoal, p_trajgoal, p_randomgoal, geom_sample, rng):
-        """Sample goals for the given indices using JAX random."""
+    def _batch_get_observations(self, idx_sets):
+        """Gather observations for multiple index arrays in one pass.
+
+        Args:
+            idx_sets: (num_sets, batch_size) array of indices.
+
+        Returns:
+            Tree of arrays with shape (num_sets, batch_size, ...).
+        """
+        flat_idxs = idx_sets.ravel()
+        if self.config['frame_stack'] is None or self.preprocess_frame_stack:
+            flat_obs = jax.tree_util.tree_map(lambda arr: arr[flat_idxs], self.dataset['observations'])
+        else:
+            flat_obs = self.get_stacked_observations(flat_idxs)
+        num_sets, batch_size = idx_sets.shape
+        return jax.tree_util.tree_map(lambda arr: arr.reshape(num_sets, batch_size, *arr.shape[1:]), flat_obs)
+
+    def sample_goals(self, idxs, p_curgoal, p_trajgoal, p_randomgoal, geom_sample):
         batch_size = len(idxs)
-        rng, random_rng = jax.random.split(rng)
 
-        # Random goals.
-        random_goal_idxs = self.dataset.get_random_idxs(batch_size, random_rng)
+        random_goal_idxs = self.dataset.get_random_idxs(batch_size)
 
-        # Goals from the same trajectory (excluding the current state, unless it is the final state).
-        final_state_idxs = self.terminal_locs[jnp.searchsorted(self.terminal_locs, idxs)]
-        rng, geom_rng = jax.random.split(rng)
+        # --- FIX 1 continued: Use pre-computed lookup instead of searchsorted ---
+        final_state_idxs = self.idx_to_terminal[idxs]
+
         if geom_sample:
-            # Geometric sampling using JAX.
-            p = 1 - self.config['discount']
-            # JAX doesn't have geometric, so we use: floor(log(U) / log(1-p)) + 1
-            u = jax.random.uniform(geom_rng, (batch_size,))
-            offsets = jnp.floor(jnp.log(u + 1e-10) / jnp.log(1 - p + 1e-10)).astype(jnp.int32) + 1
-            middle_goal_idxs = jnp.minimum(idxs + offsets, final_state_idxs)
+            offsets = np.random.geometric(p=1 - self.config['discount'], size=batch_size)
+            traj_goal_idxs = np.minimum(idxs + offsets, final_state_idxs)
         else:
-            # Uniform sampling.
-            rng, uniform_rng = jax.random.split(rng)
-            distances = jax.random.uniform(uniform_rng, (batch_size,))  # in [0, 1)
-            middle_goal_idxs = jnp.round(
-                (jnp.minimum(idxs + 1, final_state_idxs) * distances + final_state_idxs * (1 - distances))
-            ).astype(jnp.int32)
-        
-        # First decide: current goal vs not current goal
-        rng, rand1_rng = jax.random.split(rng)
-        rand1 = jax.random.uniform(rand1_rng, (batch_size,))
-        is_current = rand1 < p_curgoal
-        
-        # For non-current goals, decide between trajectory and random using p_randomgoal explicitly
-        # P(trajectory | not current) = p_trajgoal / (1 - p_curgoal)
-        # P(random | not current) = p_randomgoal / (1 - p_curgoal)
-        not_current_prob = 1.0 - p_curgoal
-        if not_current_prob > 1e-6:
-            rng, rand2_rng = jax.random.split(rng)
-            rand2 = jax.random.uniform(rand2_rng, (batch_size,))
-            # Use p_randomgoal explicitly
-            use_random = rand2 < (p_randomgoal / not_current_prob)
-            goal_idxs = jnp.where(
-                is_current,
-                idxs,  # Current goal
-                jnp.where(use_random, random_goal_idxs, middle_goal_idxs)  # Random or trajectory
-            )
-        else:
-            # p_curgoal is 1.0, so all goals are current
+            distances = np.random.rand(batch_size)
+            traj_goal_idxs = np.round(
+                (np.minimum(idxs + 1, final_state_idxs) * distances + final_state_idxs * (1 - distances))
+            ).astype(int)
+
+        if p_curgoal == 1.0:
             goal_idxs = idxs
+        else:
+            goal_idxs = np.where(
+                np.random.rand(batch_size) < p_trajgoal / (1.0 - p_curgoal), traj_goal_idxs, random_goal_idxs
+            )
+            goal_idxs = np.where(np.random.rand(batch_size) < p_curgoal, idxs, goal_idxs)
 
         return goal_idxs
 
-    def augment(self, batch, keys, rng):
-        """Apply image augmentation to the given keys using JAX random."""
+    def augment(self, batch, keys):
+        """Apply image augmentation — stay in JAX, no round-trip."""
         padding = 3
         batch_size = len(batch[keys[0]])
-        crop_froms = jax.random.randint(rng, (batch_size, 2), 0, 2 * padding + 1)
-        crop_froms = jnp.concatenate([crop_froms, jnp.zeros((batch_size, 1), dtype=jnp.int32)], axis=1)
+        crop_froms = np.random.randint(0, 2 * padding + 1, (batch_size, 2))
+        crop_froms = np.concatenate([crop_froms, np.zeros((batch_size, 1), dtype=np.int64)], axis=1)
+        # --- FIX 3: Convert crop_froms to jnp once, avoid per-key np.array() conversion ---
+        crop_froms_jnp = jnp.array(crop_froms)
         for key in keys:
             batch[key] = jax.tree_util.tree_map(
-                lambda arr: batched_random_crop(arr, crop_froms, padding) if len(arr.shape) == 4 else arr,
+                lambda arr: np.asarray(batched_random_crop(arr, crop_froms_jnp, padding))
+                if arr.ndim == 4 else arr,
                 batch[key],
             )
 
     def get_observations(self, idxs):
-        """Return the observations for the given indices."""
-        idxs = jnp.asarray(idxs, dtype=jnp.int32)
-        if len(self.frame_offsets) > 0:
-            return self._get_observations_with_offsets(idxs)
-        if self.config['frame_stack'] is not None and not self.preprocess_frame_stack:
+        if self.config['frame_stack'] is None or self.preprocess_frame_stack:
+            return jax.tree_util.tree_map(lambda arr: arr[idxs], self.dataset['observations'])
+        else:
             return self.get_stacked_observations(idxs)
-        return self._normalize_frames(self._obs_array[idxs])
-
-    def _normalize_frames(self, frames):
-        if frames.dtype == jnp.uint8:
-            return frames.astype(jnp.float32) / 255.0
-        return frames
-
-    def _get_observations_with_offsets(self, idxs):
-        block_size = max(1, self.block_size)
-        block_start = (idxs // block_size) * block_size
-        block_end = jnp.minimum(block_start + block_size - 1, self.size - 1)
-
-        num_offsets = len(self.frame_offsets)
-        if num_offsets == 0:
-            return self._normalize_frames(self._obs_array[idxs])
-
-        H, W, C = self._obs_array.shape[1:]
-        
-        # JAX version - operations stay on GPU
-        idxs_expanded = idxs[:, None]  # (batch_size, 1)
-        offsets_array = jnp.array(self.frame_offsets)[None, :]  # (1, num_offsets)
-        block_start_expanded = block_start[:, None]  # (batch_size, 1)
-        block_end_expanded = block_end[:, None]  # (batch_size, 1)
-        
-        # Compute all offset indices: (batch_size, num_offsets)
-        offset_idxs_all = jnp.clip(idxs_expanded + offsets_array, block_start_expanded, block_end_expanded)
-        
-        # Index into array for all offsets at once: (batch_size, num_offsets, H, W, C)
-        frames_all = self._obs_array[offset_idxs_all]  # Advanced indexing
-        
-        # Reshape and concatenate: (batch_size, H, W, C * num_offsets)
-        stacked = frames_all.transpose(0, 2, 3, 1, 4).reshape(len(idxs), H, W, C * num_offsets)
-
-        return self._normalize_frames(stacked)
 
     def get_stacked_observations(self, idxs):
-        """Return the frame-stacked observations for the given indices."""
-        initial_state_idxs = self.initial_locs[jnp.searchsorted(self.initial_locs, idxs, side='right') - 1]
+        # --- FIX 1 continued: Use pre-computed lookup ---
+        initial_state_idxs = self.idx_to_initial[idxs]
         rets = []
         for i in reversed(range(self.config['frame_stack'])):
-            cur_idxs = jnp.maximum(idxs - i, initial_state_idxs)
+            cur_idxs = np.maximum(idxs - i, initial_state_idxs)
             rets.append(jax.tree_util.tree_map(lambda arr: arr[cur_idxs], self.dataset['observations']))
-        return jax.tree_util.tree_map(lambda *args: jnp.concatenate(args, axis=-1), *rets)
+        return jax.tree_util.tree_map(lambda *args: np.concatenate(args, axis=-1), *rets)
 
 
 @dataclasses.dataclass
 class HGCDataset(GCDataset):
-    """Dataset class for hierarchical goal-conditioned RL.
 
-    This class extends GCDataset to support high-level actor goals and prediction targets. It reads the following
-    additional key from the config:
-    - subgoal_steps: Subgoal steps (i.e., the number of steps to reach the low-level goal).
-    """
-
-    def sample(self, batch_size: int, idxs=None, evaluation=False):
-        """Sample a batch of transitions with goals.
-
-        This method samples a batch of transitions with goals from the dataset. The goals are stored in the keys
-        'value_goals', 'low_actor_goals', 'high_actor_goals', and 'high_actor_targets'. It also computes the 'rewards'
-        and 'masks' based on the indices of the goals.
-
-        Args:
-            batch_size: Batch size.
-            idxs: Indices of the transitions to sample. If None, random indices are sampled.
-            evaluation: Whether to sample for evaluation. If True, image augmentation is not applied.
-        """
-        # Split RNG for this sample
-        self.rng, sample_rng = jax.random.split(self.rng)
-        
+    def sample(self, batch_size, idxs=None, evaluation=False):
         if idxs is None:
-            idxs = self.dataset.get_random_idxs(batch_size, sample_rng)
-        idxs = jnp.asarray(idxs, dtype=jnp.int32)
+            idxs = self.dataset.get_random_idxs(batch_size)
 
-        batch = self.dataset.sample(batch_size, idxs, sample_rng)
+        batch = self.dataset.sample(batch_size, idxs)
         if self.config['frame_stack'] is not None:
             batch['observations'] = self.get_observations(idxs)
             batch['next_observations'] = self.get_observations(idxs + 1)
 
-        # Sample value goals.
-        self.rng, goal_rng = jax.random.split(self.rng)
         value_goal_idxs = self.sample_goals(
             idxs,
             self.config['value_p_curgoal'],
             self.config['value_p_trajgoal'],
             self.config['value_p_randomgoal'],
             self.config['value_geom_sample'],
-            goal_rng,
         )
         batch['value_goals'] = self.get_observations(value_goal_idxs)
 
-        successes = (idxs == value_goal_idxs).astype(jnp.float32)
+        successes = (idxs == value_goal_idxs).astype(np.float32)
         batch['masks'] = 1.0 - successes
         batch['rewards'] = successes - (1.0 if self.config['gc_negative'] else 0.0)
 
-        # Set low-level actor goals.
-        final_state_idxs = self.terminal_locs[jnp.searchsorted(self.terminal_locs, idxs)]
-        low_goal_idxs = jnp.minimum(idxs + self.config['subgoal_steps'], final_state_idxs)
-        batch['low_actor_goals'] = self.get_observations(low_goal_idxs)
+        # --- FIX 1 continued: Use pre-computed lookup ---
+        final_state_idxs = self.idx_to_terminal[idxs]
+        low_goal_idxs = np.minimum(idxs + self.config['subgoal_steps'], final_state_idxs)
 
-        # Sample high-level actor goals and set prediction targets.
-        # High-level future goals.
-        self.rng, geom_rng = jax.random.split(self.rng)
         if self.config['actor_geom_sample']:
-            # Geometric sampling using JAX.
-            p = 1 - self.config['discount']
-            u = jax.random.uniform(geom_rng, (batch_size,))
-            offsets = jnp.floor(jnp.log(u + 1e-10) / jnp.log(1 - p + 1e-10)).astype(jnp.int32) + 1
-            high_traj_goal_idxs = jnp.minimum(idxs + offsets, final_state_idxs)
+            offsets = np.random.geometric(p=1 - self.config['discount'], size=batch_size)
+            high_traj_goal_idxs = np.minimum(idxs + offsets, final_state_idxs)
         else:
-            # Uniform sampling.
-            self.rng, uniform_rng = jax.random.split(self.rng)
-            distances = jax.random.uniform(uniform_rng, (batch_size,))  # in [0, 1)
-            high_traj_goal_idxs = jnp.round(
-                (jnp.minimum(idxs + 1, final_state_idxs) * distances + final_state_idxs * (1 - distances))
-            ).astype(jnp.int32)
-        high_traj_target_idxs = jnp.minimum(idxs + self.config['subgoal_steps'], high_traj_goal_idxs)
+            distances = np.random.rand(batch_size)
+            high_traj_goal_idxs = np.round(
+                (np.minimum(idxs + 1, final_state_idxs) * distances + final_state_idxs * (1 - distances))
+            ).astype(int)
+        high_traj_target_idxs = np.minimum(idxs + self.config['subgoal_steps'], high_traj_goal_idxs)
 
-        # High-level random goals.
-        self.rng, random_rng = jax.random.split(self.rng)
-        high_random_goal_idxs = self.dataset.get_random_idxs(batch_size, random_rng)
-        high_random_target_idxs = jnp.minimum(idxs + self.config['subgoal_steps'], final_state_idxs)
+        high_random_goal_idxs = self.dataset.get_random_idxs(batch_size)
+        high_random_target_idxs = np.minimum(idxs + self.config['subgoal_steps'], final_state_idxs)
 
-        # Pick between high-level future goals and random goals.
-        self.rng, pick_rng = jax.random.split(self.rng)
-        pick_random = jax.random.uniform(pick_rng, (batch_size,)) < self.config['actor_p_randomgoal']
-        high_goal_idxs = jnp.where(pick_random, high_random_goal_idxs, high_traj_goal_idxs)
-        high_target_idxs = jnp.where(pick_random, high_random_target_idxs, high_traj_target_idxs)
+        pick_random = np.random.rand(batch_size) < self.config['actor_p_randomgoal']
+        high_goal_idxs = np.where(pick_random, high_random_goal_idxs, high_traj_goal_idxs)
+        high_target_idxs = np.where(pick_random, high_random_target_idxs, high_traj_target_idxs)
 
-        batch['high_actor_goals'] = self.get_observations(high_goal_idxs)
-        batch['high_actor_targets'] = self.get_observations(high_target_idxs)
+        # --- FIX 2: Batch all observation gathering ---
+        all_idx_sets = np.stack([low_goal_idxs, high_goal_idxs, high_target_idxs])  # (3, batch_size)
+        all_obs = self._batch_get_observations(all_idx_sets)
+        batch['low_actor_goals'] = jax.tree_util.tree_map(lambda x: x[0], all_obs)
+        batch['high_actor_goals'] = jax.tree_util.tree_map(lambda x: x[1], all_obs)
+        batch['high_actor_targets'] = jax.tree_util.tree_map(lambda x: x[2], all_obs)
 
         if self.config['p_aug'] is not None and not evaluation:
-            self.rng, aug_rng = jax.random.split(self.rng)
-            if jax.random.uniform(aug_rng) < self.config['p_aug']:
-                self.rng, crop_rng = jax.random.split(self.rng)
+            if np.random.rand() < self.config['p_aug']:
                 self.augment(
                     batch,
-                    [
-                        'observations',
-                        'next_observations',
-                        'value_goals',
-                        'low_actor_goals',
-                        'high_actor_goals',
-                        'high_actor_targets',
-                    ],
-                    crop_rng,
+                    ['observations', 'next_observations', 'value_goals', 'low_actor_goals',
+                     'high_actor_goals', 'high_actor_targets'],
                 )
+
         return batch

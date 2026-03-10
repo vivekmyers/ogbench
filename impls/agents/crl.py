@@ -43,29 +43,18 @@ class CRLAgent(flax.struct.PyTreeNode):
             info=True,
             params=grad_params,
         )
+
+        # Ensure ensemble dimension is present: (ensemble, batch, dim).
         if len(phi.shape) == 2:  # Non-ensemble.
             phi = phi[None, ...]
             psi = psi[None, ...]
-        
-        # CRITICAL: Clip embeddings to prevent unbounded growth before normalization
-        # This prevents the network from learning to output huge values
-        clip_value = 100.0  # Reasonable upper bound for embeddings
-        phi = jnp.clip(phi, -clip_value, clip_value)
-        psi = jnp.clip(psi, -clip_value, clip_value)
-        
-        # Normalize embeddings to unit vectors (prevents explosion in logits)
-        eps = 1e-8
-        phi_norm = phi / (jnp.linalg.norm(phi, axis=-1, keepdims=True) + eps)
-        psi_norm = psi / (jnp.linalg.norm(psi, axis=-1, keepdims=True) + eps)
-        
-        # Compute cosine similarity (range [-1, 1])
-        logits = jnp.einsum('eik,ejk->ije', phi_norm, psi_norm)
-        # logits.shape is (B, B, e) with one term for positive pair and (B - 1) terms for negative pairs in each row.
-        
-        # Apply sqrt scaling as in original implementation
-        # With normalized embeddings, cosine similarity is in [-1, 1], so sqrt scaling helps
-        #logits = logits / 0.1
-        # logits.shape is (B, B, e) with one term for positive pair and (B - 1) terms for negative pairs in each row.
+
+        # IMPORTANT: Use the *same* bilinear form for logits as for v inside GCBilinearValue.
+        # Phi and psi are already L2-normalized in the module; we only apply the
+        # same temperature here so that v is the diagonal of logits.
+        temperature = 1.0
+        logits = jnp.einsum('eik,ejk->ije', phi, psi) / temperature
+
         I = jnp.eye(batch_size)
         contrastive_loss = jax.vmap(
             lambda _logits: optax.softmax_cross_entropy(logits=_logits, labels=I),
@@ -76,31 +65,21 @@ class CRLAgent(flax.struct.PyTreeNode):
 
         # Compute additional statistics.
         v = jnp.exp(v)
-        logits = jnp.mean(logits, axis=-1)
-        correct = jnp.argmax(logits, axis=1) == jnp.argmax(I, axis=1)
-        logits_pos = jnp.sum(logits * I) / jnp.sum(I)
-        logits_neg = jnp.sum(logits * (1 - I)) / jnp.sum(1 - I)
-        
-        # Debug: log raw logit statistics to diagnose scaling
-        logits_raw_mean = jnp.mean(logits, axis=-1)  # Average over ensemble
-        logits_raw_pos = jnp.sum(logits_raw_mean * I) / jnp.sum(I)
-        logits_raw_neg = jnp.sum(logits_raw_mean * (1 - I)) / jnp.sum(1 - I)
+        logits_mean = jnp.mean(logits, axis=-1)  # (batch, batch)
+        correct = jnp.argmax(logits_mean, axis=1) == jnp.argmax(I, axis=1)
+        logits_pos = jnp.sum(logits_mean * I) / jnp.sum(I)
+        logits_neg = jnp.sum(logits_mean * (1 - I)) / jnp.sum(1 - I)
 
         return contrastive_loss, {
             'contrastive_loss': contrastive_loss,
             'v_mean': v.mean(),
             'v_max': v.max(),
             'v_min': v.min(),
-            'binary_accuracy': jnp.mean((logits > 0) == I),
+            'binary_accuracy': jnp.mean((logits_mean > 0) == I),
             'categorical_accuracy': jnp.mean(correct),
             'logits_pos': logits_pos,
             'logits_neg': logits_neg,
-            'logits': logits.mean(),
-            'logits_raw_mean': jnp.mean(logits),
-            'logits_raw_std': jnp.std(logits),
-            'logits_raw_pos': logits_raw_pos,
-            'logits_raw_neg': logits_raw_neg,
-            'logits_raw_diff': logits_raw_pos - logits_raw_neg,  # Should be positive for separation
+            'logits': logits_mean.mean(),
         }
 
     def actor_loss(self, batch, grad_params, rng=None):
@@ -341,7 +320,7 @@ def get_config():
         dict(
             # Agent hyperparameters.
             agent_name='crl',  # Agent name.
-            lr=3e-4,  # Learning rate.
+            lr=5e-5,  # Learning rate.
             full_stats_frequency=0.01,  # Frequency (0-1) of computing full diagnostic stats. 0.01 = 1% of steps. Set to 1.0 for always, 0.0 for never.
             batch_size=1024,  # Batch size.
             actor_hidden_dims=(512, 512, 512),  # Actor network hidden dimensions.

@@ -207,7 +207,7 @@ class GCActor(nn.Module):
                 log_stds = jnp.zeros_like(means)
             else:
                 log_stds = self.log_stds
-
+        
         log_stds = jnp.clip(log_stds, self.log_std_min, self.log_std_max)
 
         distribution = distrax.MultivariateNormalDiag(loc=means, scale_diag=jnp.exp(log_stds) * temperature)
@@ -476,8 +476,12 @@ class GCBilinearValue(nn.Module):
         """
         if self.state_encoder is not None:
             observations = self.state_encoder(observations)
+            # Clip encoder outputs to prevent numerical instability in cuDNN
+            observations = jnp.clip(observations, -50.0, 50.0)
         if self.goal_encoder is not None:
             goals = self.goal_encoder(goals)
+            # Clip encoder outputs to prevent numerical instability in cuDNN
+            goals = jnp.clip(goals, -50.0, 50.0)
 
         if actions is None:
             phi_inputs = observations
@@ -487,7 +491,13 @@ class GCBilinearValue(nn.Module):
         phi = self.phi(phi_inputs)
         psi = self.psi(goals)
 
-        v = (phi * psi / jnp.sqrt(self.latent_dim)).sum(axis=-1)
+        # L2 normalize embeddings so that v and contrastive logits share a scale.
+        phi = phi / (jnp.linalg.norm(phi, axis=-1, keepdims=True) + 1e-8)
+        psi = psi / (jnp.linalg.norm(psi, axis=-1, keepdims=True) + 1e-8)
+
+        # Temperature-scaled bilinear value.
+        temperature = 0.1
+        v = (phi * psi).sum(axis=-1) / temperature
 
         if self.value_exp:
             v = jnp.exp(v)

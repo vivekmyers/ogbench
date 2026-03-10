@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import argparse
+import json
 import time
+from datetime import datetime
 from importlib import import_module
 from pathlib import Path
 from typing import Dict, Tuple
 from queue import Queue
 from threading import Thread
 
+import cv2
 import flax.serialization as fxs
 from flax.core import freeze, unfreeze
 import jax
@@ -726,14 +729,6 @@ def enforce_periodic_terminals(data: Dict[str, np.ndarray], period: int) -> Dict
     return data
 
 
-def numpy_to_jax(batch: Dict[str, np.ndarray]) -> Dict[str, jnp.ndarray]:
-    """Convert NumPy arrays to JAX arrays. Safe to call on JAX arrays (no-op)."""
-    return tree_util.tree_map(
-        lambda x: jnp.asarray(x) if isinstance(x, (np.ndarray, jnp.ndarray)) else x,
-        batch,
-    )
-
-
 # =============================
 # Validation
 # =============================
@@ -813,21 +808,25 @@ def compute_validation_loss(agent, val_dataset: GCDataset | None, batch_size: in
 
     actual_batch = min(batch_size, val_dataset.size)
     batch = val_dataset.sample(actual_batch, evaluation=True)
-    batch = numpy_to_jax(batch)  # Safety: ensure all arrays are JAX (no-op if already JAX)
-
-    for k in ("observations", "actions", "actor_goals", "value_goals"):
-        if k in batch and jnp.any(jnp.isnan(batch[k])):
-            print(f"WARNING: NaN detected in validation field '{k}'")
 
     # Compute actor loss (all agents have this)
     actor_loss, actor_info = agent.actor_loss(batch, agent.network.params)
 
-    # Compute critic loss only if the agent has it (CRL agents)
+    # Compute critic loss - check for both contrastive_loss (CRL) and critic_loss (TMD)
+    critic_loss = 0.0
+    critic_info = {}
     if hasattr(agent, 'contrastive_loss'):
+        # CRL agents
         critic_loss, critic_info = agent.contrastive_loss(batch, agent.network.params)
-    else:
-        critic_loss = 0.0
-        critic_info = {}
+    elif hasattr(agent, 'critic_loss'):
+        # TMD agents - returns (losses_tuple, critic_loss, info_dict)
+        critic_result = agent.critic_loss(batch, agent.network.params)
+        if isinstance(critic_result, tuple) and len(critic_result) == 3:
+            _, critic_loss, critic_info = critic_result
+        else:
+            # Fallback if signature is different
+            critic_loss = critic_result[0] if isinstance(critic_result, tuple) else critic_result
+            critic_info = critic_result[1] if isinstance(critic_result, tuple) and len(critic_result) > 1 else {}
 
     metrics: Dict[str, object] = {}
 
@@ -839,13 +838,23 @@ def compute_validation_loss(agent, val_dataset: GCDataset | None, batch_size: in
     if "mse" in actor_info:
         metrics["val/actor_mse"] = float(actor_info["mse"])
 
-    # Critic metrics: keep only contrastive loss and categorical accuracy.
-    if hasattr(agent, "contrastive_loss"):
+    # Critic metrics: log critic loss and other relevant metrics
+    if hasattr(agent, "contrastive_loss") or hasattr(agent, "critic_loss"):
         metrics["val/critic_loss"] = float(critic_loss)
-        metrics["val/critic_categorical_accuracy"] = float(
-            critic_info.get("categorical_accuracy", 0.0)
-        )
-
+        if "categorical_accuracy" in critic_info:
+            metrics["val/critic_categorical_accuracy"] = float(critic_info["categorical_accuracy"])
+        # TMD-specific metrics
+        if "logits_pos" in critic_info:
+            metrics["val/critic_logits_pos"] = float(critic_info["logits_pos"])
+        if "logits_neg" in critic_info:
+            metrics["val/critic_logits_neg"] = float(critic_info["logits_neg"])
+        if "dual_descent_val" in critic_info:
+            metrics["val/dual_descent_val"] = float(critic_info["dual_descent_val"])
+        if "backup_optim_loss" in critic_info:
+            metrics["val/backup_optim_loss"] = float(critic_info["backup_optim_loss"])
+        if "val_times_contrastive" in critic_info:
+            metrics["val/val_times_contrastive"] = float(critic_info["val_times_contrastive"])
+    
     return metrics
 
 
@@ -864,7 +873,7 @@ def main(args: argparse.Namespace) -> None:
     cfg.expectile = 0.7
     cfg.discount = args.discount
     cfg.alpha = 0.5
-    cfg.encoder = "impala_large"
+    cfg.encoder = "impala_small"
     cfg.lr = 3e-4  # Increased LR to help critic learn (was 1e-4)
     cfg.actor_hidden_dims = (512, 512, 512)
     cfg.value_hidden_dims = (512, 512, 512)
@@ -873,7 +882,7 @@ def main(args: argparse.Namespace) -> None:
     cfg.actor_lr_scale = 1.0
     cfg.frame_stack = None  # Stacking handled on-the-fly via frame_offsets.
     cfg.block_size = args.block_size
-    cfg.frame_offsets = tuple(args.frame_offsets if args.frame_offsets else [0])
+    cfg.frame_offsets = tuple(args.frame_offsets if args.frame_offsets else [0, -1, -2])
     cfg.p_aug = 0.5
     cfg.distance_loss_weight = 0.05
     cfg.distance_head_hidden_dims = (256, 256)
@@ -882,8 +891,8 @@ def main(args: argparse.Namespace) -> None:
     cfg.steer_thresh = 0.1
     cfg.throttle_thresh = 0.3
     cfg.brake_thresh = 0.1
-    cfg.p_randomgoal = 1.0
-    cfg.p_trajgoal = 0.0
+    cfg.p_randomgoal = 0.0
+    cfg.p_trajgoal = 1.0
     cfg.p_curgoal = 0.0
     # GCDataset requires these parameters (use same values for value and actor goals)
     cfg.value_p_curgoal = cfg.p_curgoal
@@ -901,33 +910,47 @@ def main(args: argparse.Namespace) -> None:
 
     np.random.seed(args.seed)
 
-    # Load dataset directly to GPU
+    # Load dataset and keep it in NumPy (CPU), matching original OGBench main.py.
+    # All sampling logic in utils/datasets.py expects NumPy arrays and runs on CPU.
     import time
-    with tqdm(total=4, desc="Loading dataset") as pbar:
-        # Load from disk and immediately convert to JAX (moves to GPU)
-        pbar.set_description("Loading from disk and moving to GPU")
+    with tqdm(total=4, desc="Loading dataset (NumPy)") as pbar:
+        # 1) Load from disk as NumPy
+        pbar.set_description("Loading from disk (NumPy)")
         data_np = np.load(args.dataset_path)
-        obs = jnp.asarray(data_np["observations"])
-        actions = jnp.asarray(data_np["actions"], dtype=jnp.float32)
+        obs = np.asarray(data_np["observations"])
+        actions = np.asarray(data_np["actions"], dtype=np.float32)
+        
+        # Resize observations to 64x64x3
+        pbar.set_description("Resizing observations to 64x64")
+        # Process in batches for efficiency
+        batch_size = 1000
+        obs_resized = np.zeros((obs.shape[0], 64, 64, 3), dtype=obs.dtype)
+        for i in range(0, obs.shape[0], batch_size):
+            end_idx = min(i + batch_size, obs.shape[0])
+            batch = obs[i:end_idx]
+            # Resize each frame in the batch
+            for j in range(len(batch)):
+                obs_resized[i + j] = cv2.resize(batch[j], (64, 64), interpolation=cv2.INTER_AREA)
+        obs = obs_resized
         pbar.update(1)
         
-        # Get terminals and convert to JAX
-        pbar.set_description("Processing terminals")
+        # 2) Get terminals as NumPy
+        pbar.set_description("Processing terminals (NumPy)")
         terminals_np = _maybe_get_terminals_from_source(data_np)
         if terminals_np is None:
-            total_frames = data_np["observations"].shape[0]
-            terminals = jnp.zeros(total_frames, dtype=bool)
-            terminal_indices = jnp.arange(999, total_frames, 1000)
-            terminals = terminals.at[terminal_indices].set(True)
+            total_frames = obs.shape[0]
+            terminals = np.zeros(total_frames, dtype=bool)
+            terminal_indices = np.arange(999, total_frames, 1000, dtype=int)
+            terminals[terminal_indices] = True
         else:
-            terminals = jnp.asarray(terminals_np, dtype=bool)
-        terminals = terminals.at[-1].set(True)
+            terminals = terminals_np.astype(bool).copy()
+        terminals[-1] = True
         pbar.update(1)
         
-        # Filter on GPU (if enabled)
+        # 3) Optional filtering on CPU
         if not args.no_filter_intersections:
-            pbar.set_description("Filtering intersection frames")
-            filtered = filter_intersection_frames_jax({
+            pbar.set_description("Filtering intersection frames (NumPy)")
+            filtered = filter_intersection_frames({
                 "observations": obs,
                 "actions": actions,
                 "terminals": terminals,
@@ -937,35 +960,34 @@ def main(args: argparse.Namespace) -> None:
             terminals = filtered["terminals"]
         pbar.update(1)
         
-        # Split on GPU
-        pbar.set_description("Splitting dataset")
-        train_data, val_data = split_dataset_by_terminals_jax(
+        # 4) Split dataset on CPU by terminals
+        pbar.set_description("Splitting dataset (NumPy)")
+        train_data, val_data = split_dataset_by_terminals(
             {"observations": obs, "actions": actions, "terminals": terminals},
             val_fraction=0.2,
             seed=args.seed,
         )
-        if val_data is not None and val_data["observations"].size > 0:
-            val_data = {
-                "observations": val_data["observations"],
-                "actions": val_data["actions"],
-                "terminals": val_data["terminals"],
-            }
-        else:
-            val_data = None
         pbar.update(1)
     
     # Build datasets
     def build_gc_dataset(data: Dict) -> GCDataset | None:
+        """Construct a goal-conditioned dataset from raw arrays.
+
+        Important: `GCDataset` is written assuming NumPy arrays (like the original
+        OGBench code). Here we explicitly convert the JAX arrays produced by
+        `split_dataset_by_terminals_jax` back to NumPy before creating
+        the `Dataset`, so that all sampling code runs purely on CPU/NumPy.
+        This avoids costly JAX <-> NumPy/device transfers in the data loader.
+        """
         if data["observations"].size == 0:
             return None
         dataset_fields = dict(
-            observations=data["observations"],
-            actions=data["actions"],
-            terminals=data["terminals"],
+            observations=np.asarray(data["observations"]),
+            actions=np.asarray(data["actions"]),
+            terminals=np.asarray(data["terminals"]),
         )
-        rng = jax.random.PRNGKey(args.seed)
-        return GCDataset(Dataset.create(**dataset_fields), cfg, rng=rng)
-    
+        return GCDataset(Dataset.create(**dataset_fields), cfg)
+
     train_dataset = build_gc_dataset(train_data)
     val_dataset = build_gc_dataset(val_data) if val_data else None
 
@@ -976,25 +998,37 @@ def main(args: argparse.Namespace) -> None:
     print(f"Creating agent with example shapes: obs={ex_obs_np.shape}, actions={ex_act_np.shape}")
     import time
     agent_start = time.time()
-    agent = agent_cls.create(
-        seed=args.seed,
-        ex_observations=ex_obs_np,
-        ex_actions=ex_act_np,
-        config=cfg,
-    )
+    create_kwargs = {
+        'seed': args.seed,
+        'ex_observations': ex_obs_np,
+        'ex_actions': ex_act_np,
+        'config': cfg,
+    }
+    # TMD agent requires steps argument
+    if args.algorithm.upper() == 'TMD':
+        create_kwargs['steps'] = args.train_steps * args.epochs
+    agent = agent_cls.create(**create_kwargs)
     print(f"Agent created successfully in {time.time() - agent_start:.2f}s (JIT compilation may happen on first forward pass)")
     
     # Pre-compile the update function with a dummy batch to avoid JIT compilation overhead during training
     print("Pre-compiling update function...")
     compile_start = time.time()
     example_batch = train_dataset.sample(min(10, cfg.batch_size))
-    example_batch = numpy_to_jax(example_batch)  # Safety: ensure all arrays are JAX (no-op if already JAX)
     # Compile by running once (JAX will cache the compiled version)
     agent, _ = agent.update(example_batch)
     print(f"Update function compiled in {time.time() - compile_start:.2f}s")
 
-    ckpt_dir = Path(args.ckpt_dir)
+    # Create checkpoint directory with algorithm and date
+    date_str = datetime.now().strftime("%Y%m%d")
+    ckpt_dir = Path(args.ckpt_dir) / f"{args.algorithm}_{date_str}"
     ckpt_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Save config to checkpoint directory
+    config_path = ckpt_dir / "config.json"
+    with config_path.open("w") as f:
+        json.dump(cfg.to_dict(), f, indent=2)
+    print(f"Saved config to {config_path}")
+    
     wandb.init(project=args.project, config=cfg.to_dict())
 
     total_steps = 0
@@ -1004,37 +1038,45 @@ def main(args: argparse.Namespace) -> None:
 
     for epoch in range(args.epochs):
         print(f"\nStarting epoch {epoch + 1}/{args.epochs}")
-        if float(agent.config['alpha']) != float(cfg.alpha):
-            config_dict = unfreeze(agent.config)
-            config_dict['alpha'] = float(cfg.alpha)
-            agent = agent.replace(config=freeze(config_dict))
-
-        progress = trange(args.steps, dynamic_ncols=True)
-        for step in range(args.steps):
+        progress = trange(args.train_steps, dynamic_ncols=True)
+        for step in range(args.train_steps):
             total_steps += 1
+            t_progress_start = time.time()
             progress.update(1)
+            t_progress_end = time.time()
+            progress_ms = (t_progress_end - t_progress_start) * 1000.0
             
-            t0 = time.time()
+            # Timing breakdown
+            t_sample_start = time.time()
             batch = train_dataset.sample(cfg.batch_size)
-            batch = numpy_to_jax(batch)  # Safety: ensure all arrays are JAX (no-op if already JAX)
-            batch_ms = (time.time() - t0) * 1000.0
+            t_sample_end = time.time()
+            sample_ms = (t_sample_end - t_sample_start) * 1000.0
 
-            t1 = time.time()
+            t_update_start = time.time()
             agent, info = agent.update(batch)
-            upd_ms = (time.time() - t1) * 1000.0
+            t_update_end = time.time()
+            update_ms = (t_update_end - t_update_start) * 1000.0
+            
+            total_iter_ms = (t_update_end - t_sample_start) * 1000.0
+
             if total_steps % args.log_every == 0:
+                t_wandb_start = time.time()
+                print(f"\n[Timing @ step {total_steps}] progress={progress_ms:.2f}ms, sample={sample_ms:.1f}ms, update={update_ms:.1f}ms, total={total_iter_ms:.1f}ms ({1000.0/total_iter_ms:.2f} it/s)")
                 log_dict: Dict[str, object] = {}
                 metric_map = [
                     ("actor/bc_loss", "train/actor_bc_loss"),
                     ("actor/q_loss", "train/actor_q_loss"),
                     ("actor/mse", "train/actor_mse"),
                     ("critic/contrastive_loss", "train/critic_loss"),
+                    ("critic/critic_loss", "train/critic_loss"),  # TMD uses this key
                     ("critic/categorical_accuracy", "train/critic_categorical_accuracy"),
                     # DEBUG: Check if embeddings are collapsed
                     ("critic/phi_psi_similarity_raw", "train/critic_phi_psi_similarity_raw"),
                     ("critic/phi_batch_std_raw", "train/critic_phi_batch_std_raw"),
                     ("critic/psi_batch_std_raw", "train/critic_psi_batch_std_raw"),
                     ("critic/logits_pos_neg_diff", "train/critic_logits_pos_neg_diff"),
+                    ("critic/logits_pos", "train/critic_logits_pos"),
+                    ("critic/logits_neg", "train/critic_logits_neg"),
                     # DEBUG: Network output statistics
                     ("critic/phi_mean", "train/critic_phi_mean"),
                     ("critic/phi_std", "train/critic_phi_std"),
@@ -1056,39 +1098,45 @@ def main(args: argparse.Namespace) -> None:
                         log_dict[dst_name] = float(info[src_key])
 
                 wandb.log(log_dict, step=total_steps)
+                t_wandb_end = time.time()
+                wandb_ms = (t_wandb_end - t_wandb_start) * 1000.0
+                print(f"[Wandb logging] took {wandb_ms:.1f}ms")
                 last_log_step = total_steps
-            postfix = {}
-            if "actor/bc_loss" in info:
-                postfix["bc"] = float(info["actor/bc_loss"])
-            if "actor/q_loss" in info:
-                postfix["q"] = float(info["actor/q_loss"])
-            if "critic/contrastive_loss" in info:
-                postfix["critic"] = float(info["critic/contrastive_loss"])
-            # DEBUG: Print key diagnostic metrics
-            if "critic/categorical_accuracy" in info:
-                postfix["cat_acc"] = f"{float(info['critic/categorical_accuracy']):.4f}"
-            if "critic/phi_psi_similarity_raw" in info:
-                postfix["phi_psi_sim"] = f"{float(info['critic/phi_psi_similarity_raw']):.3f}"
-            if "critic/phi_batch_std_raw" in info:
-                postfix["phi_std"] = f"{float(info['critic/phi_batch_std_raw']):.4f}"
-            if "critic/psi_batch_std_raw" in info:
-                postfix["psi_std"] = f"{float(info['critic/psi_batch_std_raw']):.4f}"
-            if postfix:
-                progress.set_postfix(**postfix)
+
+            t_ckpt_start = time.time()
             if args.ckpt_every and total_steps % args.ckpt_every == 0:
                 ckpt_path = ckpt_dir / f"agent_step{total_steps}.pkl"
                 with ckpt_path.open("wb") as f:
                     f.write(fxs.to_bytes(agent))
                 last_ckpt_step = total_steps
+            t_ckpt_end = time.time()
+            ckpt_ms = (t_ckpt_end - t_ckpt_start) * 1000.0
+            if ckpt_ms > 1.0 and total_steps % args.log_every == 0:
+                print(f"[Checkpoint] took {ckpt_ms:.1f}ms")
 
             # validation (use total_steps, not step, so validation works across epochs)
+            t_val_check_start = time.time()
             if val_dataset is not None and total_steps % args.val_every == 0:
+                t_val_start = time.time()
                 val_metrics = compute_validation_loss(agent, val_dataset, batch_size=cfg.batch_size)
+                t_val_end = time.time()
+                val_ms = (t_val_end - t_val_start) * 1000.0
+                wandb.log(val_metrics, step=total_steps)
                 # Filter out non-numeric values (like wandb.Table) when printing
                 numeric_metrics = {k: v for k, v in val_metrics.items() if isinstance(v, (int, float, np.number))}
                 print(f"\nValidation @ step {total_steps}: " + ", ".join(f"{k}={v:.4f}" for k, v in numeric_metrics.items()))
-                wandb.log(val_metrics, step=total_steps)
+                print(f"[Validation timing] took {val_ms:.1f}ms ({val_ms/1000:.2f}s)")
                 last_val_step = total_steps
+            t_val_check_end = time.time()
+            val_check_ms = (t_val_check_end - t_val_check_start) * 1000.0
+            if val_check_ms > 1.0 and total_steps % args.log_every == 0:
+                print(f"[Validation check] took {val_check_ms:.1f}ms")
+            
+            # Total step time including everything
+            t_step_end = time.time()
+            total_step_ms = (t_step_end - t_progress_start) * 1000.0
+            if total_steps % args.log_every == 0:
+                print(f"[Total step time] {total_step_ms:.1f}ms ({1000.0/total_step_ms:.2f} it/s including all overhead)")
 
         # After epoch ends, checkpoint/validate/log if we haven't already this step
         if args.ckpt_every and total_steps != last_ckpt_step:
@@ -1100,6 +1148,7 @@ def main(args: argparse.Namespace) -> None:
 
         if val_dataset is not None and total_steps != last_val_step:
             val_metrics = compute_validation_loss(agent, val_dataset, batch_size=cfg.batch_size)
+            wandb.log(val_metrics, step=total_steps)
             numeric_metrics = {k: v for k, v in val_metrics.items() if isinstance(v, (int, float, np.number))}
             print(f"\nValidation @ step {total_steps} (end of epoch {epoch + 1}): " + ", ".join(f"{k}={v:.4f}" for k, v in numeric_metrics.items()))
             wandb.log(val_metrics, step=total_steps)
@@ -1108,7 +1157,6 @@ def main(args: argparse.Namespace) -> None:
         # Log at end of epoch if we haven't already this step
         if total_steps != last_log_step:
             batch = train_dataset.sample(cfg.batch_size)
-            batch = numpy_to_jax(batch)  # Safety: ensure all arrays are JAX (no-op if already JAX)
             _, info = agent.update(batch)
 
             log_dict: Dict[str, object] = {}
@@ -1127,7 +1175,7 @@ def main(args: argparse.Namespace) -> None:
             last_log_step = total_steps
 
     # save final
-    final_model_path = Path(args.ckpt_dir) / "final_model.pkl"
+    final_model_path = ckpt_dir / "final_model.pkl"
     print(f"Saving final model to {final_model_path}")
     with final_model_path.open("wb") as f:
         f.write(fxs.to_bytes(agent))
@@ -1145,12 +1193,12 @@ def main(args: argparse.Namespace) -> None:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="CRL/GCBC offline training (clean CPU-bypass design)")
     parser.add_argument("--dataset_path", type=str, required=True, help="Path to .npz offline dataset")
-    parser.add_argument("--steps", type=int, default=800_000, help="Total gradient steps")
+    parser.add_argument("--train_steps", type=int, default=800_000, help="Total gradient steps")
     parser.add_argument("--epochs", type=int, default=2, help="Number of epochs to train")
     parser.add_argument("--batch_size", type=int, default=256)
     parser.add_argument("--actor_loss", choices=["awr", "ddpgbc"], default="ddpgbc")
     parser.add_argument("--discount", type=float, default=0.99)
-    parser.add_argument("--project", default="crl_training")
+    parser.add_argument("--project", default="tmd-training")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--log_every", type=int, default=100)  # Log more frequently for debugging
     parser.add_argument("--ckpt_every", type=int, default=50_000)

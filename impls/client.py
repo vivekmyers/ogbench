@@ -111,8 +111,22 @@ def try_receive_goal_header(sock: socket.socket, timeout: float = 2.0):
 
     goal_img, goal_xy = None, None
     if isinstance(obj, dict):
-        if "goal_img" in obj: goal_img = obj["goal_img"]
-        if "goal_xy"  in obj:
+        # New format: {'goal_img': {'shape': [H,W,C], 'dtype': 'uint8', 'data': [...]}, 'goal_xy': (x,y)}
+        if "goal_img" in obj and isinstance(obj["goal_img"], dict) and "data" in obj["goal_img"]:
+            gi_meta = obj["goal_img"]
+            shape = tuple(int(x) for x in gi_meta.get("shape", []))
+            flat = gi_meta.get("data", [])
+            try:
+                arr = np.array(flat, dtype=np.uint8).reshape(shape)
+                goal_img = arr
+            except Exception as e:
+                print(f"[NET] Failed to reconstruct goal_img from header: {e}")
+                goal_img = None
+        elif "goal_img" in obj:
+            # Backward-compat: server sent raw numpy array
+            goal_img = obj["goal_img"]
+
+        if "goal_xy" in obj:
             try:
                 goal_xy = (float(obj["goal_xy"][0]), float(obj["goal_xy"][1]))
             except Exception:
@@ -128,10 +142,13 @@ def try_receive_goal_header(sock: socket.socket, timeout: float = 2.0):
         if goal_img.dtype != np.uint8:
             g = goal_img.astype(np.float32)
             mx = float(np.nanmax(g)) if g.size else 1.0
-            if mx <= 1.0: g = np.clip(g * 255.0, 0.0, 255.0)
+            if mx <= 1.0:
+                g = np.clip(g * 255.0, 0.0, 255.0)
             goal_img = g.astype(np.uint8)
-        print(f"[NET] goal_img shape={goal_img.shape}, dtype={goal_img.dtype} "
-              f"min/max=({goal_img.min()},{goal_img.max()})")
+        print(
+            f"[NET] goal_img shape={goal_img.shape}, dtype={goal_img.dtype} "
+            f"min/max=({goal_img.min()},{goal_img.max()})"
+        )
     else:
         print("[NET] No goal image in header.")
 
@@ -179,9 +196,9 @@ def main():
     )
     ego, chosen_tf = None, None
     for tf in random.sample(spawns, k=min(20, len(spawns))):
-        #ego = world.try_spawn_actor(ego_bp, tf)
-        spawn_point.rotation.yaw += 270.0 
-        ego = world.try_spawn_actor(ego_bp, spawn_point)
+        ego = world.try_spawn_actor(ego_bp, tf)
+        #spawn_point.rotation.yaw += 270.0 
+        #ego = world.try_spawn_actor(ego_bp, spawn_point)
         if ego is not None:
             chosen_tf = tf
             break
@@ -215,7 +232,7 @@ def main():
     # Synchronous world
     settings = world.get_settings()
     settings.synchronous_mode = True
-    settings.fixed_delta_seconds = 0.017  # 20 FPS
+    settings.fixed_delta_seconds = 1.0 / 50.0  # 50 FPS
     world.apply_settings(settings)
     fps_out = int(round(1.0 / settings.fixed_delta_seconds))
     print(f"[CARLA] ✓ Synchronous mode set (dt={settings.fixed_delta_seconds}, fps≈{fps_out}).")
@@ -408,10 +425,27 @@ def main():
                 ax.scatter(mx, my, s=2, c="#cccccc", alpha=0.3, label="map")
             if traj_pts:
                 tx, ty = zip(*traj_pts)
-                ax.scatter(tx, ty, s=20, c="#4e79a7", label="traj")
+                # Draw trajectory as a thin line
+                ax.plot(tx, ty, c="#4e79a7", linewidth=0.5, alpha=0.8, label="traj", zorder=2)
+                
+                # Add arrows to show direction (every 5th point, or at least every 10 points if trajectory is short)
+                if len(traj_pts) > 1:
+                    arrow_interval = max(1, len(traj_pts) // 10)  # Show ~10 arrows total
+                    for i in range(0, len(traj_pts) - 1, arrow_interval):
+                        x1, y1 = traj_pts[i]
+                        x2, y2 = traj_pts[i + 1]
+                        dx = x2 - x1
+                        dy = y2 - y1
+                        # Only draw arrow if there's meaningful movement
+                        if abs(dx) > 0.01 or abs(dy) > 0.01:
+                            ax.annotate('', xy=(x2, y2), xytext=(x1, y1),
+                                       arrowprops=dict(arrowstyle='->', lw=2.5, 
+                                                      color='#4e79a7', alpha=0.9,
+                                                      mutation_scale=25),  # Large arrow head (default is ~10)
+                                       zorder=3)
             if goal_pts:
                 gx, gy = zip(*goal_pts)
-                ax.scatter(gx, gy, marker="*", s=220, c="#f28e2b", label="goal")
+                ax.scatter(gx, gy, marker="*", s=220, c="#f28e2b", label="goal", zorder=4)
 
             ax.set_aspect("equal")
             ax.set_xlabel("x")

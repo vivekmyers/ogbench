@@ -5,6 +5,8 @@ import pickle
 import argparse
 import time
 import inspect
+import json
+from pathlib import Path
 from collections import deque
 import importlib
 
@@ -13,9 +15,7 @@ import jax
 import jax.numpy as jnp
 from flax.serialization import from_bytes, to_state_dict, from_state_dict, msgpack_restore
 import optax
-
-# Import discrete action conversion functions
-from agents.gcbc import discrete_bins_to_continuous
+import ml_collections
 
 # ---------------- XLA memory knobs (same as your setup) ----------------
 os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
@@ -79,15 +79,18 @@ def main():
     p.add_argument("--agent", default="gcbc", choices=["crl", "cmd", "gcbc", "gciql", "tmd"])
     p.add_argument("--model_path",
                    default="/global/scratch/users/achyuthkv76/tmd_models/run2.pkl")
+    p.add_argument("--config_path", type=str, default=None,
+                   help="Path to config.json file (saved during training). If provided, agent will be created based on this config.")
     p.add_argument("--dataset_path",
-                   default="/global/scratch/users/achyuthkv76/carla_test_scripts/goals.npz")
-    p.add_argument("--goal_frame_index", type=int, default=1)
+                   default="/nfs/kun2/users/achyuth/carla_test_scripts/goals.npz")
+    p.add_argument("--goal_frame_index", type=int, default=1000)
     p.add_argument("--host", default="localhost")
     p.add_argument("--port", type=int, default=5050)
     
     # Match train.py arguments EXACTLY (same names, same defaults, same help text)
-    p.add_argument("--obs_h", type=int, default=100)
-    p.add_argument("--obs_w", type=int, default=100)
+    # Note: Training resizes to 64x64x3, so server should match that
+    p.add_argument("--obs_h", type=int, default=64)
+    p.add_argument("--obs_w", type=int, default=64)
     p.add_argument("--obs_c", type=int, default=3)
     p.add_argument("--frame_offsets", nargs="*", type=int, default=None, help="e.g., --frame_offsets 0 -5 -10 -20")
     p.add_argument("--block_size", type=int, default=400, help="Block size for block-aware frame stacking and shuffling")
@@ -103,57 +106,80 @@ def main():
     Agent = getattr(module, f"{agent_str.upper()}Agent")
     get_config = getattr(module, "get_config")
 
+    # Load config from file if provided, otherwise use defaults
     config = get_config()
-    # Match train.py configuration EXACTLY
-    config.encoder = "impala_large"  # Match train.py line 332
-    config.actor_loss = "ddpgbc"  # Match train.py line 329
-    config.discrete = args.use_discrete  # Match train.py line 327
-    config.multi_discrete = args.use_discrete  # Match train.py line 328
-    config.frame_stack = None  # Match train.py line 337 (NOT using frame_stack)
-    config.frame_offsets = tuple(args.frame_offsets if args.frame_offsets else [0, -1])  # Match train.py line 430
-    config.block_size = args.block_size  # Match train.py line 338
-    config.actor_hidden_dims = (512, 512, 512)  # Match train.py line 334
-    config.value_hidden_dims = (512, 512, 512)  # Match train.py line 335
-    config.latent_dim = 2048  # Match train.py line 336
-    config.alpha = 0.1  # Match train.py line 331
-    config.action_chunk_length = args.action_chunk_length  # Match train.py line 352
-    config.layer_norm = False
-    
-    config.lr = 3e-4  # Match train.py default
+    if args.config_path:
+        config_path = Path(args.config_path)
+        if config_path.exists():
+            print(f"Loading config from {config_path}")
+            with config_path.open("r") as f:
+                config_dict = json.load(f)
+            # Update config with values from file
+            for key, value in config_dict.items():
+                # Handle tuple/list conversion for fields like frame_offsets, hidden_dims, etc.
+                if isinstance(value, list) and key in [
+                    "frame_offsets",
+                    "actor_hidden_dims",
+                    "value_hidden_dims",
+                    "distance_head_hidden_dims",
+                ]:
+                    value = tuple(value)
+                # For ml_collections.ConfigDict, allow creating new fields directly
+                if isinstance(config, ml_collections.ConfigDict):
+                    config[key] = value
+                else:
+                    setattr(config, key, value)
+            print(f"Loaded config from file: {len(config_dict)} keys")
+        else:
+            print(f"Warning: config file {config_path} not found, using defaults")
+    else:
+        print("No config file provided, using defaults from agent.get_config()")
 
-    obs_shape = (args.obs_h, args.obs_w, args.obs_c)  # (100,100,3)
+    obs_shape = (args.obs_h, args.obs_w, args.obs_c)  # (64,64,3) - matches training
     # Use frame_offsets to determine actual stacked shape (matching train.py)
     num_frame_offsets = len(config.frame_offsets)
-    stacked_obs_shape = (args.obs_h, args.obs_w, args.obs_c * num_frame_offsets)  # e.g., (100,100,6) with [0, -1]
+    stacked_obs_shape = (args.obs_h, args.obs_w, args.obs_c * num_frame_offsets)  # e.g., (64,64,6) with [0, -1]
     act_shape = (3,)
     action_dim = act_shape[0]  # 3
 
-    # Load checkpoint first to get saved config, then create agent with matching structure
+    # Load checkpoint bytes.
+    # New-style checkpoints (train.py) save pure Flax bytes via fxs.to_bytes(agent),
+    # so we read raw bytes. For backwards compatibility, if this somehow loads a
+    # pickled dict, fall back gracefully.
     with open(args.model_path, "rb") as f:
-        checkpoint_dict = pickle.load(f)
-    
-    # Extract config and agent bytes from checkpoint (matches train.py format)
-    if isinstance(checkpoint_dict, dict) and 'agent' in checkpoint_dict and 'config' in checkpoint_dict:
-        saved_config = checkpoint_dict['config']
-        checkpoint_bytes = checkpoint_dict['agent']
-        
-        # Update config with saved values (this ensures agent structure matches checkpoint)
-        if isinstance(saved_config, dict):
-            for key, value in saved_config.items():
-                if hasattr(config, key):
-                    setattr(config, key, value)
-            print(f"[INFO] Loaded config from checkpoint: {len(saved_config)} keys")
-    else:
-        # Old format: raw bytes (fallback for compatibility)
-        checkpoint_bytes = checkpoint_dict if isinstance(checkpoint_dict, bytes) else pickle.dumps(checkpoint_dict)
+        raw = f.read()
+    try:
+        # If it's actually a pickled dict, handle the old format.
+        maybe_dict = pickle.loads(raw)
+        if isinstance(maybe_dict, dict) and "agent" in maybe_dict:
+            checkpoint_bytes = maybe_dict["agent"]
+            # Optional: config fallback from checkpoint if no config_path
+            if not args.config_path and "config" in maybe_dict:
+                saved_config = maybe_dict["config"]
+                if isinstance(saved_config, dict):
+                    for key, value in saved_config.items():
+                        if isinstance(value, list) and key in [
+                            "frame_offsets",
+                            "actor_hidden_dims",
+                            "value_hidden_dims",
+                            "distance_head_hidden_dims",
+                        ]:
+                            value = tuple(value)
+                        if isinstance(config, ml_collections.ConfigDict):
+                            config[key] = value
+                        else:
+                            setattr(config, key, value)
+                    print(f"[INFO] Loaded config from checkpoint (fallback): {len(saved_config)} keys")
+        else:
+            # Not a dict; assume raw is already Flax bytes
+            checkpoint_bytes = raw
+    except Exception:
+        # Not a pickle; assume raw is Flax bytes (current format)
+        checkpoint_bytes = raw
     
     # Initialize with *stacked* shape (this must match runtime)
     dummy_obs = jnp.zeros((1, *stacked_obs_shape), dtype=jnp.float32)
-    # Create dummy_act with correct chunk shape for actor initialization (use config.action_chunk_length from checkpoint)
-    if config.action_chunk_length > 1:
-        dummy_act = jnp.zeros((1, config.action_chunk_length, *act_shape), dtype=jnp.float32)  # (1, 10, 3) for chunk_length=10
-    else:
-        dummy_act = jnp.zeros((1, *act_shape), dtype=jnp.float32)  # (1, 3) for single action
+    dummy_act = jnp.zeros((1, *act_shape), dtype=jnp.float32)  # (1, 3)
     
     # Create agent with config that matches checkpoint (structure will match)
     agent = Agent.create(
@@ -181,7 +207,7 @@ def main():
     print("Model loaded and agent initialized")
     
     print(args.goal_frame_index)
-    # ---- Load dataset & goal (stay at 100x100; crop/pad if needed) ----
+    # ---- Load dataset & goal (resize to match training: 64x64x3) ----
     dataset = np.load(args.dataset_path)
     frames = dataset["frames"]
     num_frames = len(frames)
@@ -193,12 +219,15 @@ def main():
         goal_idx = args.goal_frame_index + offset
         # Clamp to valid range (can't go before first frame or after last)
         goal_idx = max(0, min(goal_idx, num_frames - 1))
-        gi_raw = np.asarray(frames[goal_idx])  # possibly already (100,100,3)
-        gi_frame = fit_to_hw(gi_raw, args.obs_h, args.obs_w).astype(np.float32)  # (100,100,3)
-        # Normalize to [0, 1] to match training
-        if np.max(gi_frame) > 1.0:
-            gi_frame = gi_frame / 255.0
-        goal_frame_stack.append(gi_frame)
+        gi_raw = np.asarray(frames[goal_idx])
+        gi_frame = fit_to_hw(gi_raw, args.obs_h, args.obs_w)  # (64,64,3)
+        # IMPORTANT: Keep as uint8 [0, 255] to match training (encoder normalizes internally)
+        if gi_frame.dtype != np.uint8:
+            if gi_frame.max() <= 1.0:
+                gi_frame = (gi_frame * 255.0).astype(np.uint8)
+            else:
+                gi_frame = np.clip(gi_frame, 0, 255).astype(np.uint8)
+        goal_frame_stack.append(gi_frame.astype(np.float32))  # float32 but [0, 255] range
     
     # Stack frames along channel dimension to match training format
     goal_stacked = np.concatenate(goal_frame_stack, axis=-1)  # (100, 100, 3*len(frame_offsets))
@@ -228,7 +257,9 @@ def main():
     conn, addr = server_sock.accept()
     print(f"Connection established with client: {addr}")
 
-    # send one-time header: goal image (uint8, 100x100x3) + (x,y)
+    # send one-time header: goal image + (x,y), but using ONLY plain Python
+    # types (no numpy objects) to avoid pickle depending on numpy internals
+    # on the client side.
     try:
         gi_send = gi_obs
         # convert float32 [0..1] or [0..255] into uint8 safely
@@ -238,7 +269,19 @@ def main():
         else:
             gi_u8 = np.clip(gi_send, 0.0, 255.0)
         gi_u8 = (gi_u8 + 0.5).astype(np.uint8)
-        header = {"goal_img": gi_u8, "goal_xy": goal_xy}
+
+        # Encode as a pure-Python dict:
+        # - 'shape': (H, W, C)
+        # - 'dtype': 'uint8'
+        # - 'data': flat list of ints
+        header = {
+            "goal_img": {
+                "shape": list(gi_u8.shape),
+                "dtype": "uint8",
+                "data": gi_u8.reshape(-1).tolist(),
+            },
+            "goal_xy": goal_xy,
+        }
         send_len_pickled(conn, header)
         print(f"Sent goal header (img {gi_u8.shape}, xy={goal_xy})")
     except Exception as e:
@@ -255,14 +298,14 @@ def main():
     actor_module = agent.network.model_def.modules["actor"]
     actor_params = agent.network.params["modules_actor"]
 
-    print(f"Runtime config:")
+    print("Runtime config:")
     print(f"  obs_shape={obs_shape}")
     print(f"  stacked_obs_shape={stacked_obs_shape}")
     print(f"  frame_offsets={config.frame_offsets}")
     print(f"  frame_stack={config.frame_stack} (None, using offsets)")
-    print(f"  block_size={config.block_size}")
-    print(f"  action_chunk_length={config.action_chunk_length}")
-    print(f"  discrete={config.discrete}, multi_discrete={config.multi_discrete}")
+    # block_size may or may not be present depending on training config.
+    if hasattr(config, "block_size"):
+        print(f"  block_size={config.block_size}")
     
     # Prepare goal once before the loop: use frame-stacked goal to match training
     # Goal is already frame-stacked with frame_offsets (same as observations) and in [0, 1] range
@@ -280,35 +323,38 @@ def main():
             data = recvall(conn, msg_len, timeout=30.0)
             t_recv = time.perf_counter()
 
-            # 2) deserialize; ensure (100,100,3) via crop/pad (no cv2)
-            img = pickle.loads(data)                                   # (H,W,3) float32 [0..1]
-            img_arr = np.asarray(img, dtype=np.float32)
+            # 2) deserialize; resize to (64,64,3) to match training
+            img = pickle.loads(data)                                   # (H,W,3) could be uint8 [0,255] or float32 [0,1]
+            img_arr = np.asarray(img)
+            
+            # Resize if needed
             if img_arr.shape[:2] != (args.obs_h, args.obs_w):
                 img_arr = fit_to_hw(img_arr, args.obs_h, args.obs_w)
-            # Match training: _normalize_frames converts uint8 [0,255] → float32 [0,1]
-            # Keep as [0, 1] to match training exactly (dataset normalizes, encoder expects [0,1])
-            if img_arr.max() > 1.0:
-                img_arr = img_arr / 255.0  # Convert [0, 255] to [0, 1] if needed
-            obs = jnp.array(img_arr).reshape((1, *obs_shape))          # (1,100,100,3) float32 [0..1]
+            
+            # IMPORTANT: ImpalaEncoder normalizes internally (divides by 255.0)
+            # So we should pass uint8 [0, 255] to match training, NOT [0, 1]
+            # Training: dataset has uint8 [0, 255] → encoder normalizes → [0, 1]
+            # Server: should also pass uint8 [0, 255] → encoder normalizes → [0, 1]
+            if img_arr.dtype != np.uint8:
+                # If we received float32 [0, 1], convert back to uint8 [0, 255]
+                if img_arr.max() <= 1.0:
+                    img_arr = (img_arr * 255.0).astype(np.uint8)
+                else:
+                    img_arr = np.clip(img_arr, 0, 255).astype(np.uint8)
+            
+            # Convert to float32 but keep [0, 255] range (encoder will normalize)
+            obs = jnp.array(img_arr.astype(np.float32)).reshape((1, *obs_shape))  # (1,64,64,3) float32 [0..255]
 
             HISTORY.append(obs)
             n = len(HISTORY)
-            
-            # Match train.py frame stacking logic exactly: use frame_offsets with block_size awareness
-            # This matches _get_observations_with_offsets in datasets.py
-            # frame_offsets are relative to current frame (0 = current, -1 = previous, etc.)
-            # In server, we don't have block boundaries since we're streaming, but we match the logic
             obs_stack = []
             for offset in config.frame_offsets:
-                # offset: 0 = current, -1 = previous, etc.
-                # Convert to positive index for deque (current frame is at index n-1)
                 hist_idx = n + offset - 1
-                # Clamp to valid range (can't go before first frame)
                 hist_idx = max(0, min(hist_idx, n - 1))
                 frame = HISTORY[hist_idx]
                 obs_stack.append(frame)
             
-            obs_stacked = jnp.concatenate(obs_stack, axis=-1)  # (1, H, W, 3*len(offsets))            
+            obs_stacked = jnp.concatenate(obs_stack, axis=-1)          
 
             # ---- match your previously working call pattern ----
             obs_fixed = obs_stacked.copy()
@@ -338,22 +384,9 @@ def main():
             action_dist = actor_module.apply(variables, **apply_kwargs)
 
             # Get action from distribution
-            # Use mean() instead of mode() for smoother actions (especially for discrete)
-            # Mean interpolates between bins based on probabilities, reducing jitter
-            if config.get('discrete', False) and config.get('multi_discrete', False):
-                # For multi-discrete, get mode (discrete bin indices)
-                act = action_dist.mode()  # Returns discrete bin indices (batch, chunk_length, 3) or (batch, 3)
-                # Convert discrete bin indices back to continuous actions
-                act = discrete_bins_to_continuous(act, num_bins=32)
-            elif config.get('discrete', False):
-                # For single discrete, use mean if available, otherwise mode
-                if hasattr(action_dist, 'mean'):
-                    act = action_dist.mean()
-                else:
-                    act = action_dist.mode()
-            else:
-                # For continuous, get mean (mode = mean for Gaussian, but mean is more explicit)
-                act = action_dist.mean()
+            # Your current TMD setup is continuous; just use the mean action.
+            # (If a discrete policy is ever used here, this may need revisiting.)
+            act = action_dist.mean()
             t_fwd = time.perf_counter()
             
             # 5) send action chunk
