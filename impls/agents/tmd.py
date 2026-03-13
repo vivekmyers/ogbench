@@ -127,6 +127,7 @@ class TMDAgent(flax.struct.PyTreeNode):
         backup_loss = jnp.mean(divergence)
         if self.config['dual_descent']:
             optim_backup = 1 - jax.lax.stop_gradient(dist_next) + jnp.log(gamma)
+            optim_backup = optim_backup * (1 - dw) + jnp.diagonal(optim_backup, axis1=1, axis2=2)[..., None] * dw
             backup_optim_loss= jnp.mean(divergence - optim_backup)
             val = jnp.exp(-(jax.lax.stop_gradient(backup_optim_loss) + jax.lax.stop_gradient(action_invariance_loss)))
             critic_loss = val * contrastive_loss + backup_loss + action_invariance_loss
