@@ -880,9 +880,13 @@ def main(args: argparse.Namespace) -> None:
     cfg.latent_dim = 512
     cfg.critic_lr_scale = 1.0
     cfg.actor_lr_scale = 1.0
-    cfg.frame_stack = None  # Stacking handled on-the-fly via frame_offsets.
+    if args.frame_offsets is not None:
+        cfg.frame_offsets = tuple(args.frame_offsets)
+        cfg.frame_stack = len(args.frame_offsets)
+    else:
+        cfg.frame_offsets = (0, -1, -2)
+        cfg.frame_stack = 3
     cfg.block_size = args.block_size
-    cfg.frame_offsets = tuple(args.frame_offsets if args.frame_offsets else [0, -1, -2])
     cfg.p_aug = 0.5
     cfg.distance_loss_weight = 0.05
     cfg.distance_head_hidden_dims = (256, 256)
@@ -904,6 +908,7 @@ def main(args: argparse.Namespace) -> None:
     cfg.value_geom_sample = True  # Use geometric sampling for value goals
     cfg.actor_geom_sample = False  # Use uniform sampling for actor goals
     cfg.gc_negative = True  # Use '0 if s == g else -1' reward format
+    cfg.action_chunk_length = args.action_chunk_length
     cfg.use_mrn_metric = args.use_mrn_metric
     if args.mrn_components is not None:
         cfg.mrn_components = args.mrn_components
@@ -920,17 +925,14 @@ def main(args: argparse.Namespace) -> None:
         obs = np.asarray(data_np["observations"])
         actions = np.asarray(data_np["actions"], dtype=np.float32)
         
-        # Resize observations to 64x64x3
-        pbar.set_description("Resizing observations to 64x64")
-        # Process in batches for efficiency
+        pbar.set_description(f"Resizing observations to {args.obs_h}x{args.obs_w}")
         batch_size = 1000
-        obs_resized = np.zeros((obs.shape[0], 64, 64, 3), dtype=obs.dtype)
+        obs_resized = np.zeros((obs.shape[0], args.obs_h, args.obs_w, 3), dtype=obs.dtype)
         for i in range(0, obs.shape[0], batch_size):
             end_idx = min(i + batch_size, obs.shape[0])
             batch = obs[i:end_idx]
-            # Resize each frame in the batch
             for j in range(len(batch)):
-                obs_resized[i + j] = cv2.resize(batch[j], (64, 64), interpolation=cv2.INTER_AREA)
+                obs_resized[i + j] = cv2.resize(batch[j], (args.obs_w, args.obs_h), interpolation=cv2.INTER_AREA)
         obs = obs_resized
         pbar.update(1)
         
@@ -988,8 +990,15 @@ def main(args: argparse.Namespace) -> None:
         )
         return GCDataset(Dataset.create(**dataset_fields), cfg)
 
+    print(f"\nBuilding train dataset ({len(train_data['observations'])} frames, frame_stack={cfg.frame_stack})...", flush=True)
+    t0 = time.time()
     train_dataset = build_gc_dataset(train_data)
+    print(f"  Done in {time.time() - t0:.1f}s", flush=True)
+
+    print(f"Building val dataset ({len(val_data['observations']) if val_data else 0} frames)...", flush=True)
+    t0 = time.time()
     val_dataset = build_gc_dataset(val_data) if val_data else None
+    print(f"  Done in {time.time() - t0:.1f}s", flush=True)
 
 
     example_batch = train_dataset.sample(min(10, cfg.batch_size))
@@ -1065,8 +1074,13 @@ def main(args: argparse.Namespace) -> None:
                 log_dict: Dict[str, object] = {}
                 metric_map = [
                     ("actor/bc_loss", "train/actor_bc_loss"),
+                    ("actor/bc_log_prob", "train/actor_bc_log_prob"),
                     ("actor/q_loss", "train/actor_q_loss"),
                     ("actor/mse", "train/actor_mse"),
+                    ("actor/mse_std", "train/actor_mse_std"),
+                    ("actor/mse_max", "train/actor_mse_max"),
+                    ("actor/mse_first", "train/actor_mse_first"),
+                    ("actor/std", "train/actor_std"),
                     ("critic/contrastive_loss", "train/critic_loss"),
                     ("critic/critic_loss", "train/critic_loss"),  # TMD uses this key
                     ("critic/categorical_accuracy", "train/critic_categorical_accuracy"),
@@ -1198,7 +1212,11 @@ if __name__ == "__main__":
     parser.add_argument("--batch_size", type=int, default=256)
     parser.add_argument("--actor_loss", choices=["awr", "ddpgbc"], default="ddpgbc")
     parser.add_argument("--discount", type=float, default=0.99)
-    parser.add_argument("--project", default="tmd-training")
+    parser.add_argument(
+        "--project",
+        default=None,
+        help="W&B project name (default: <algorithm>-training, e.g. CRL-training)",
+    )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--log_every", type=int, default=100)  # Log more frequently for debugging
     parser.add_argument("--ckpt_every", type=int, default=50_000)
@@ -1212,9 +1230,12 @@ if __name__ == "__main__":
     parser.add_argument("--obs_w", type=int, default=100)
     parser.add_argument("--obs_c", type=int, default=3)
     parser.add_argument("--frame_offsets", nargs="*", type=int, default=None, help="e.g., --frame_offsets 0 -5 -10 -20")
+    parser.add_argument("--action_chunk_length", type=int, default=1, help="Number of consecutive actions to predict (1 = no chunking)")
     parser.add_argument("--no_filter_intersections", action="store_true", help="Disable filtering of intersection/stationary frames")
     parser.add_argument("--use_mrn_metric", action="store_true", help="Enable MRN distance inside CRL contrastive loss")
     parser.add_argument("--mrn_components", type=int, default=None, help="Number of MRN components (requires --use_mrn_metric)")
 
     args = parser.parse_args()
+    if args.project is None:
+        args.project = f"{args.algorithm}-training"
     main(args)

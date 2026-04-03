@@ -128,7 +128,7 @@ class GCDataset:
         if self.config['frame_stack'] is not None:
             assert 'next_observations' not in self.dataset
             if self.preprocess_frame_stack:
-                stacked_observations = self.get_stacked_observations(np.arange(self.size))
+                stacked_observations = self._preprocess_frame_stack()
                 self.dataset = Dataset(self.dataset.copy(dict(observations=stacked_observations)))
 
     def sample(self, batch_size, idxs=None, evaluation=False):
@@ -138,7 +138,8 @@ class GCDataset:
         batch = self.dataset.sample(batch_size, idxs)
         if self.config['frame_stack'] is not None:
             batch['observations'] = self.get_observations(idxs)
-            batch['next_observations'] = self.get_observations(idxs + 1)
+            next_idxs = np.minimum(idxs + 1, self.size - 1)
+            batch['next_observations'] = self.get_observations(next_idxs)
 
         value_goal_idxs = self.sample_goals(
             idxs,
@@ -165,6 +166,15 @@ class GCDataset:
         successes = (idxs == value_goal_idxs).astype(np.float32)
         batch['masks'] = 1.0 - successes
         batch['rewards'] = successes - (1.0 if self.config['gc_negative'] else 0.0)
+
+        chunk_len = self.config.get('action_chunk_length', 1)
+        if chunk_len > 1:
+            offsets = np.arange(chunk_len)
+            chunk_idxs = idxs[:, None] + offsets[None, :]
+            chunk_idxs = np.minimum(chunk_idxs, self.idx_to_terminal[idxs][:, None])
+            batch['action_chunks'] = self.dataset['actions'][chunk_idxs]  # (B, chunk_len, action_dim)
+        else:
+            batch['action_chunks'] = batch['actions'][:, None, :]  # (B, 1, action_dim)
 
         if self.config['p_aug'] is not None and not evaluation:
             if np.random.rand() < self.config['p_aug']:
@@ -231,6 +241,39 @@ class GCDataset:
                 batch[key],
             )
 
+    def _preprocess_frame_stack(self):
+        """Pre-stack all observations. Oldest-first along channels.
+
+        Uses direct array slicing per trajectory instead of fancy indexing
+        over the entire dataset, which avoids multiple full-array copies.
+        """
+        obs = self.dataset['observations']
+        N = self.size
+        k = int(self.config['frame_stack'])
+        C = obs.shape[-1]
+        spatial = obs.shape[1:-1]
+        out = np.empty((N, *spatial, C * k), dtype=obs.dtype)
+
+        for traj_start, traj_end in zip(self.initial_locs, self.terminal_locs):
+            traj_len = traj_end - traj_start + 1
+            traj_obs = obs[traj_start:traj_end + 1]          # (L, *spatial, C)
+            for j in range(k):
+                lag = k - 1 - j
+                src_start = max(0, 0 - lag)                    # always 0 when lag < traj_len
+                # For each frame t in [0, traj_len), the source is max(0, t - lag)
+                # Build the shifted view: pad the beginning by repeating frame 0
+                pad_len = min(lag, traj_len)
+                body_start = lag                               # first frame that doesn't need clamping
+                ch_slice = slice(j * C, (j + 1) * C)
+                # Frames [0, pad_len) all map to traj_obs[0]
+                if pad_len > 0:
+                    out[traj_start:traj_start + pad_len, ..., ch_slice] = traj_obs[0:1]
+                # Frames [pad_len, traj_len) map to traj_obs[t - lag]
+                if body_start < traj_len:
+                    out[traj_start + body_start:traj_end + 1, ..., ch_slice] = \
+                        traj_obs[:traj_len - body_start]
+        return out
+
     def get_observations(self, idxs):
         if self.config['frame_stack'] is None or self.preprocess_frame_stack:
             return jax.tree_util.tree_map(lambda arr: arr[idxs], self.dataset['observations'])
@@ -257,7 +300,8 @@ class HGCDataset(GCDataset):
         batch = self.dataset.sample(batch_size, idxs)
         if self.config['frame_stack'] is not None:
             batch['observations'] = self.get_observations(idxs)
-            batch['next_observations'] = self.get_observations(idxs + 1)
+            next_idxs = np.minimum(idxs + 1, self.size - 1)
+            batch['next_observations'] = self.get_observations(next_idxs)
 
         value_goal_idxs = self.sample_goals(
             idxs,
@@ -299,6 +343,15 @@ class HGCDataset(GCDataset):
         batch['low_actor_goals'] = jax.tree_util.tree_map(lambda x: x[0], all_obs)
         batch['high_actor_goals'] = jax.tree_util.tree_map(lambda x: x[1], all_obs)
         batch['high_actor_targets'] = jax.tree_util.tree_map(lambda x: x[2], all_obs)
+
+        chunk_len = self.config.get('action_chunk_length', 1)
+        if chunk_len > 1:
+            offsets = np.arange(chunk_len)
+            chunk_idxs = idxs[:, None] + offsets[None, :]
+            chunk_idxs = np.minimum(chunk_idxs, final_state_idxs[:, None])
+            batch['action_chunks'] = self.dataset['actions'][chunk_idxs]
+        else:
+            batch['action_chunks'] = batch['actions'][:, None, :]
 
         if self.config['p_aug'] is not None and not evaluation:
             if np.random.rand() < self.config['p_aug']:

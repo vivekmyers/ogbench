@@ -135,10 +135,9 @@ def main():
     else:
         print("No config file provided, using defaults from agent.get_config()")
 
-    obs_shape = (args.obs_h, args.obs_w, args.obs_c)  # (64,64,3) - matches training
-    # Use frame_offsets to determine actual stacked shape (matching train.py)
-    num_frame_offsets = len(config.frame_offsets)
-    stacked_obs_shape = (args.obs_h, args.obs_w, args.obs_c * num_frame_offsets)  # e.g., (64,64,6) with [0, -1]
+    obs_shape = (args.obs_h, args.obs_w, args.obs_c)
+    frame_stack_k = int(config.get('frame_stack', len(config.frame_offsets)))
+    stacked_obs_shape = (args.obs_h, args.obs_w, args.obs_c * frame_stack_k)
     act_shape = (3,)
     action_dim = act_shape[0]  # 3
 
@@ -212,28 +211,23 @@ def main():
     frames = dataset["frames"]
     num_frames = len(frames)
     
-    # Load goal frames with frame_offsets to match training (same as get_observations)
-    # This ensures goals are frame-stacked with temporal context, not just replicated
+    # Stack goal frames using contiguous history, oldest-first (matches GCDataset).
+    # Goal at index g gets frames [g-(k-1), ..., g-1, g], clamped to trajectory start.
     goal_frame_stack = []
-    for offset in config.frame_offsets:
-        goal_idx = args.goal_frame_index + offset
-        # Clamp to valid range (can't go before first frame or after last)
+    for j in range(frame_stack_k):
+        goal_idx = args.goal_frame_index - (frame_stack_k - 1 - j)
         goal_idx = max(0, min(goal_idx, num_frames - 1))
         gi_raw = np.asarray(frames[goal_idx])
-        gi_frame = fit_to_hw(gi_raw, args.obs_h, args.obs_w)  # (64,64,3)
-        # IMPORTANT: Keep as uint8 [0, 255] to match training (encoder normalizes internally)
+        gi_frame = fit_to_hw(gi_raw, args.obs_h, args.obs_w)
         if gi_frame.dtype != np.uint8:
             if gi_frame.max() <= 1.0:
                 gi_frame = (gi_frame * 255.0).astype(np.uint8)
             else:
                 gi_frame = np.clip(gi_frame, 0, 255).astype(np.uint8)
-        goal_frame_stack.append(gi_frame.astype(np.float32))  # float32 but [0, 255] range
-    
-    # Stack frames along channel dimension to match training format
-    goal_stacked = np.concatenate(goal_frame_stack, axis=-1)  # (100, 100, 3*len(frame_offsets))
-    
-    # Use first frame (offset=0) for header display
-    gi_obs = goal_frame_stack[0]  # (100, 100, 3)
+        goal_frame_stack.append(gi_frame)
+
+    goal_stacked = np.concatenate(goal_frame_stack, axis=-1)  # (H, W, 3*k) uint8
+    gi_obs = goal_frame_stack[-1]  # current frame for display
 
     # optional goal (x,y)
     goal_xy = None
@@ -245,7 +239,7 @@ def main():
                 break
 
     # Load goal for header (use first frame for display)
-    goal_fixed_header = jnp.array(gi_obs[None, ...])  # Single goal image: (1, 100, 100, 3) float32 [0..1]
+    goal_fixed_header = gi_obs  # uint8 (H,W,3) for header display only
 
     print("Goal loaded")
     # ---- Socket setup ----
@@ -261,19 +255,7 @@ def main():
     # types (no numpy objects) to avoid pickle depending on numpy internals
     # on the client side.
     try:
-        gi_send = gi_obs
-        # convert float32 [0..1] or [0..255] into uint8 safely
-        mx = float(np.max(gi_send)) if gi_send.size else 1.0
-        if mx <= 1.0:
-            gi_u8 = np.clip(gi_send, 0.0, 1.0)*255.0
-        else:
-            gi_u8 = np.clip(gi_send, 0.0, 255.0)
-        gi_u8 = (gi_u8 + 0.5).astype(np.uint8)
-
-        # Encode as a pure-Python dict:
-        # - 'shape': (H, W, C)
-        # - 'dtype': 'uint8'
-        # - 'data': flat list of ints
+        gi_u8 = np.asarray(gi_obs, dtype=np.uint8)
         header = {
             "goal_img": {
                 "shape": list(gi_u8.shape),
@@ -288,11 +270,10 @@ def main():
         print(f"[WARN] failed to send goal header: {e}")
 
     # ---- Runtime buffers ----
-    # Match train.py: use frame_offsets, NOT frame_stack
-    # HISTORY needs to hold enough frames for the most negative offset
-    max_offset = abs(min(config.frame_offsets)) if config.frame_offsets else 0
-    max_offset = int(max_offset)
-    HISTORY = deque(maxlen=max_offset + 1)  # +1 for current frame
+    # Match GCDataset: contiguous frame stack of length frame_stack.
+    # Oldest-first: [t-(k-1), ..., t-1, t] concatenated along channels.
+    frame_stack_k = int(config.get('frame_stack', len(config.frame_offsets)))
+    HISTORY = deque(maxlen=frame_stack_k)
     
     # Direct module access (matching your previous working pattern)
     actor_module = agent.network.model_def.modules["actor"]
@@ -301,15 +282,10 @@ def main():
     print("Runtime config:")
     print(f"  obs_shape={obs_shape}")
     print(f"  stacked_obs_shape={stacked_obs_shape}")
-    print(f"  frame_offsets={config.frame_offsets}")
-    print(f"  frame_stack={config.frame_stack} (None, using offsets)")
-    # block_size may or may not be present depending on training config.
-    if hasattr(config, "block_size"):
-        print(f"  block_size={config.block_size}")
+    print(f"  frame_stack={frame_stack_k}")
     
-    # Prepare goal once before the loop: use frame-stacked goal to match training
-    # Goal is already frame-stacked with frame_offsets (same as observations) and in [0, 1] range
-    goal_fixed = jnp.array(goal_stacked[None, ...])  # (1, 100, 100, 3*len(frame_offsets)) float32 [0..1]
+    # Goal must be uint8 [0,255] — same as training observations. ImpalaEncoder normalises.
+    goal_fixed = jnp.array(goal_stacked[None, ...])  # (1, H, W, 3*k) uint8
     
     t0 = time.perf_counter()
     
@@ -323,38 +299,33 @@ def main():
             data = recvall(conn, msg_len, timeout=30.0)
             t_recv = time.perf_counter()
 
-            # 2) deserialize; resize to (64,64,3) to match training
-            img = pickle.loads(data)                                   # (H,W,3) could be uint8 [0,255] or float32 [0,1]
+            # 2) deserialize; resize to (obs_h, obs_w, 3) to match training
+            img = pickle.loads(data)
             img_arr = np.asarray(img)
-            
-            # Resize if needed
+
             if img_arr.shape[:2] != (args.obs_h, args.obs_w):
                 img_arr = fit_to_hw(img_arr, args.obs_h, args.obs_w)
-            
-            # IMPORTANT: ImpalaEncoder normalizes internally (divides by 255.0)
-            # So we should pass uint8 [0, 255] to match training, NOT [0, 1]
-            # Training: dataset has uint8 [0, 255] → encoder normalizes → [0, 1]
-            # Server: should also pass uint8 [0, 255] → encoder normalizes → [0, 1]
+
+            # Ensure uint8 [0,255] — ImpalaEncoder does /255.0 internally.
+            # Training stores uint8 and passes directly; we must do the same.
             if img_arr.dtype != np.uint8:
-                # If we received float32 [0, 1], convert back to uint8 [0, 255]
                 if img_arr.max() <= 1.0:
-                    img_arr = (img_arr * 255.0).astype(np.uint8)
+                    img_arr = np.clip(img_arr * 255.0, 0, 255).astype(np.uint8)
                 else:
                     img_arr = np.clip(img_arr, 0, 255).astype(np.uint8)
-            
-            # Convert to float32 but keep [0, 255] range (encoder will normalize)
-            obs = jnp.array(img_arr.astype(np.float32)).reshape((1, *obs_shape))  # (1,64,64,3) float32 [0..255]
+
+            obs = jnp.array(img_arr).reshape((1, *obs_shape))  # (1,H,W,3) uint8
 
             HISTORY.append(obs)
-            n = len(HISTORY)
+            # Contiguous frame stack, oldest-first (matches GCDataset.get_stacked_observations).
+            # If we have fewer than k frames, repeat the oldest available.
             obs_stack = []
-            for offset in config.frame_offsets:
-                hist_idx = n + offset - 1
-                hist_idx = max(0, min(hist_idx, n - 1))
-                frame = HISTORY[hist_idx]
-                obs_stack.append(frame)
-            
-            obs_stacked = jnp.concatenate(obs_stack, axis=-1)          
+            n = len(HISTORY)
+            for j in range(frame_stack_k):
+                idx = max(0, n - frame_stack_k + j)
+                obs_stack.append(HISTORY[idx])
+
+            obs_stacked = jnp.concatenate(obs_stack, axis=-1)
 
             # ---- match your previously working call pattern ----
             obs_fixed = obs_stacked.copy()
@@ -382,23 +353,17 @@ def main():
             }
             
             action_dist = actor_module.apply(variables, **apply_kwargs)
-
-            # Get action from distribution
-            # Your current TMD setup is continuous; just use the mean action.
-            # (If a discrete policy is ever used here, this may need revisiting.)
-            act = action_dist.mean()
+            act = action_dist.mean()       # (1, action_dim * chunk_len) flat
             t_fwd = time.perf_counter()
-            
-            # 5) send action chunk
-            # Handle chunked actions: send full chunk if available, otherwise send single action
-            if act.ndim == 3:
-                # Chunked: (batch=1, chunk_length, action_dim) -> (chunk_length, action_dim)
-                act_chunk = np.array(act[0], dtype=np.float32)  # (chunk_length, action_dim)
-                chunk_length = act_chunk.shape[0]
+
+            # Reshape flat output to (chunk_len, action_dim)
+            chunk_len = int(config.get('action_chunk_length', 1))
+            act_np = np.array(act[0], dtype=np.float32)  # (action_dim * chunk_len,)
+            if chunk_len > 1:
+                act_chunk = act_np.reshape(chunk_len, -1)  # (chunk_len, action_dim)
             else:
-                # Single action: (batch=1, action_dim) -> (1, action_dim)
-                act_chunk = np.array(act[None, :] if act.ndim == 1 else act, dtype=np.float32)  # (1, action_dim)
-                chunk_length = 1
+                act_chunk = act_np.reshape(1, -1)           # (1, action_dim)
+            chunk_length = act_chunk.shape[0]
             
             # Optionally use only the first N actions from the chunk
             if args.n_actions is not None and chunk_length > args.n_actions:

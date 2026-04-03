@@ -21,8 +21,11 @@ class GCBCAgent(flax.struct.PyTreeNode):
     config: Any = nonpytree_field()
 
     def actor_loss(self, batch, grad_params, rng=None):
+        chunk_len = self.config.get('action_chunk_length', 1)
         dist = self.network.select('actor')(batch['observations'], batch['actor_goals'], params=grad_params)
-        log_prob = dist.log_prob(batch['actions'])
+
+        action_targets = batch['action_chunks'].reshape(batch['action_chunks'].shape[0], -1)  # (B, chunk_len * action_dim)
+        log_prob = dist.log_prob(action_targets)
 
         actor_loss = -log_prob.mean()
 
@@ -31,12 +34,18 @@ class GCBCAgent(flax.struct.PyTreeNode):
             'bc_log_prob': log_prob.mean(),
         }
         if not self.config['discrete']:
-            actor_info.update(
-                {
-                    'mse': jnp.mean((dist.mode() - batch['actions']) ** 2),
-                    'std': jnp.mean(dist.scale_diag),
-                }
-            )
+            predicted = dist.mode()  # (B, chunk_len * action_dim)
+            mse_per_sample = jnp.mean((predicted - action_targets) ** 2, axis=-1)  # (B,)
+            actor_info['mse'] = jnp.mean(mse_per_sample)
+            actor_info['mse_std'] = jnp.std(mse_per_sample)
+            actor_info['mse_max'] = jnp.max(mse_per_sample)
+            actor_info['std'] = jnp.mean(dist.scale_diag)
+
+            if chunk_len > 1:
+                action_dim = batch['actions'].shape[-1]
+                pred_first = predicted[:, :action_dim]
+                target_first = action_targets[:, :action_dim]
+                actor_info['mse_first'] = jnp.mean((pred_first - target_first) ** 2)
 
         return actor_loss, actor_info
 
@@ -72,10 +81,15 @@ class GCBCAgent(flax.struct.PyTreeNode):
         seed=None,
         temperature=1.0,
     ):
+        chunk_len = self.config.get('action_chunk_length', 1)
         dist = self.network.select('actor')(observations, goals, temperature=temperature)
         actions = dist.sample(seed=seed)
         if not self.config['discrete']:
             actions = jnp.clip(actions, -1, 1)
+        if chunk_len > 1:
+            action_dim = actions.shape[-1] // chunk_len
+            actions = actions.reshape(*actions.shape[:-1], chunk_len, action_dim)
+            actions = actions[..., 0, :]  # first action only
         return actions
 
     @classmethod
@@ -128,6 +142,7 @@ class GCBCAgent(flax.struct.PyTreeNode):
             actor_def = GCActor(
                 hidden_dims=config['actor_hidden_dims'],
                 action_dim=action_dim,
+                chunk_length=config.get('action_chunk_length', 1),
                 state_dependent_std=False,
                 const_std=config['const_std'],
                 gc_encoder=encoders.get('actor'),

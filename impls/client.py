@@ -291,15 +291,15 @@ def main():
             else:
                 rgb = rgb_from_image(im); last_rgb = rgb
 
-            # preprocess (100x100 float32 [0,1])
-            img_100 = cv2.resize(rgb, (100, 100), interpolation=cv2.INTER_AREA)
-            video_frames.append(img_100)
-            img_norm = (img_100.astype(np.float32) / 255.0)
+            # Resize to match server's expected obs size.
+            # Send as uint8 [0,255] — ImpalaEncoder normalizes internally.
+            img_resized = cv2.resize(rgb, (100, 100), interpolation=cv2.INTER_AREA)
+            video_frames.append(img_resized)
+            img_send = img_resized.astype(np.uint8)
 
             # Request new action chunk if we've exhausted the current one
             if current_action_chunk is None or chunk_index >= len(current_action_chunk):
-                # serialize once (we may re-use this if we must reconnect)
-                payload = pickle.dumps(img_norm, protocol=pickle.HIGHEST_PROTOCOL)
+                payload = pickle.dumps(img_send, protocol=pickle.HIGHEST_PROTOCOL)
 
                 # send → recv with auto-reconnect; re-send same payload on success
                 try:

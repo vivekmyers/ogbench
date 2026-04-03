@@ -157,6 +157,7 @@ class GCActor(nn.Module):
 
     hidden_dims: Sequence[int]
     action_dim: int
+    chunk_length: int = 1
     log_std_min: Optional[float] = -5
     log_std_max: Optional[float] = 2
     tanh_squash: bool = False
@@ -166,14 +167,14 @@ class GCActor(nn.Module):
     gc_encoder: nn.Module = None
 
     def setup(self):
+        output_dim = self.action_dim * self.chunk_length
         self.actor_net = MLP(self.hidden_dims, activate_final=True)
-        self.mean_net = nn.Dense(self.action_dim, kernel_init=default_init(self.final_fc_init_scale))
+        self.mean_net = nn.Dense(output_dim, kernel_init=default_init(self.final_fc_init_scale))
         if self.state_dependent_std:
-            # Initialize with smaller standard deviations for better BC learning
-            self.log_std_net = nn.Dense(self.action_dim, kernel_init=default_init(self.final_fc_init_scale * 0.1))
+            self.log_std_net = nn.Dense(output_dim, kernel_init=default_init(self.final_fc_init_scale * 0.1))
         else:
             if not self.const_std:
-                self.log_stds = self.param('log_stds', nn.initializers.zeros, (self.action_dim,))
+                self.log_stds = self.param('log_stds', nn.initializers.zeros, (output_dim,))
 
     def __call__(
         self,
@@ -184,11 +185,10 @@ class GCActor(nn.Module):
     ):
         """Return the action distribution.
 
-        Args:
-            observations: Observations.
-            goals: Goals (optional).
-            goal_encoded: Whether the goals are already encoded.
-            temperature: Scaling factor for the standard deviation.
+        When ``chunk_length > 1`` the distribution operates on *flattened*
+        action vectors of size ``action_dim * chunk_length``.  Callers that
+        need ``(B, chunk_length, action_dim)`` should reshape ``dist.mode()``
+        or ``dist.sample()`` accordingly.
         """
         if self.gc_encoder is not None:
             inputs = self.gc_encoder(observations, goals, goal_encoded=goal_encoded)
@@ -207,7 +207,7 @@ class GCActor(nn.Module):
                 log_stds = jnp.zeros_like(means)
             else:
                 log_stds = self.log_stds
-        
+
         log_stds = jnp.clip(log_stds, self.log_std_min, self.log_std_max)
 
         distribution = distrax.MultivariateNormalDiag(loc=means, scale_diag=jnp.exp(log_stds) * temperature)
