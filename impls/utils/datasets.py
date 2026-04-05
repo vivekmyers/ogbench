@@ -131,9 +131,54 @@ class GCDataset:
                 stacked_observations = self._preprocess_frame_stack()
                 self.dataset = Dataset(self.dataset.copy(dict(observations=stacked_observations)))
 
+        self._sampling_weights = self._build_sampling_weights()
+
+    def _build_sampling_weights(self):
+        """Precompute per-frame sampling weights for action upsampling."""
+        mode = self.config.get('upsample_mode', 'none')
+        if mode == 'none' or 'actions' not in self.dataset._dict:
+            return None
+
+        actions = self.dataset['actions']
+        steer = actions[:, 1]
+        throttle = actions[:, 0]
+        brake = actions[:, 2]
+
+        steer_thresh = self.config.get('steer_thresh', 0.05)
+        throttle_thresh = self.config.get('throttle_thresh', 0.3)
+        brake_thresh = self.config.get('brake_thresh', 0.1)
+        w = float(self.config.get('upsample_weight', 3.0))
+
+        if mode == 'turns_high':
+            is_target = np.abs(steer) > steer_thresh
+        elif mode == 'turns_low':
+            is_target = np.abs(steer) < steer_thresh
+        elif mode == 'throttle_high':
+            is_target = throttle > throttle_thresh
+        elif mode == 'throttle_low':
+            is_target = throttle < throttle_thresh
+        elif mode == 'brake_high':
+            is_target = brake > brake_thresh
+        elif mode == 'brake_low':
+            is_target = brake < brake_thresh
+        else:
+            return None
+
+        weights = np.where(is_target, w, 1.0).astype(np.float64)
+        weights /= weights.sum()
+        n_target = int(np.sum(is_target))
+        print(
+            f"[GCDataset] upsample_mode={mode}: {n_target}/{self.size} "
+            f"({100.0 * n_target / self.size:.1f}%) frames get weight {w}x"
+        )
+        return weights
+
     def sample(self, batch_size, idxs=None, evaluation=False):
         if idxs is None:
-            idxs = self.dataset.get_random_idxs(batch_size)
+            if self._sampling_weights is not None and not evaluation:
+                idxs = np.random.choice(self.size, batch_size, replace=True, p=self._sampling_weights)
+            else:
+                idxs = self.dataset.get_random_idxs(batch_size)
 
         batch = self.dataset.sample(batch_size, idxs)
         if self.config['frame_stack'] is not None:
@@ -295,7 +340,10 @@ class HGCDataset(GCDataset):
 
     def sample(self, batch_size, idxs=None, evaluation=False):
         if idxs is None:
-            idxs = self.dataset.get_random_idxs(batch_size)
+            if self._sampling_weights is not None and not evaluation:
+                idxs = np.random.choice(self.size, batch_size, replace=True, p=self._sampling_weights)
+            else:
+                idxs = self.dataset.get_random_idxs(batch_size)
 
         batch = self.dataset.sample(batch_size, idxs)
         if self.config['frame_stack'] is not None:

@@ -83,11 +83,15 @@ def recvall(sock: socket.socket, n: int, timeout: float = 10.0) -> bytes:
         buf += chunk
     return buf
 
-def try_receive_goal_header(sock: socket.socket, timeout: float = 2.0):
-    """Read one-time header: pickled dict {'goal_img': uint8(H,W,3), 'goal_xy': (x,y)|None}.
-       Returns (goal_img | None, goal_xy | None).
+def try_receive_goal_header(sock: socket.socket, timeout: float = 2.0) -> dict:
+    """Read one-time header from server.
+
+    Returns a dict with optional keys:
+      goal_img (uint8 H,W,3), goal_xy, start_xy, start_yaw_deg,
+      start_frame_index, goal_frame_index (ints),
+      obs_h, obs_w, obs_c, frame_stack (from server training config).
     """
-    print("[NET] Waiting for one-time goal header …")
+    print("[NET] Waiting for one-time eval header …")
     sock.settimeout(timeout)
 
     # Try to peek 4-byte length (if MSG_PEEK exists)
@@ -98,7 +102,7 @@ def try_receive_goal_header(sock: socket.socket, timeout: float = 2.0):
 
     if len(hdr) < 4:
         print("[NET] No header available yet.")
-        return None, None
+        return {}
 
     # Consume header + payload
     n = int.from_bytes(recvall(sock, 4, timeout=timeout), "big")
@@ -109,9 +113,20 @@ def try_receive_goal_header(sock: socket.socket, timeout: float = 2.0):
 
     obj = pickle.loads(payload)
 
-    goal_img, goal_xy = None, None
+    out: dict = {
+        "goal_img": None,
+        "goal_xy": None,
+        "start_xy": None,
+        "start_yaw_deg": None,
+        "start_frame_index": None,
+        "goal_frame_index": None,
+        "obs_h": None,
+        "obs_w": None,
+        "obs_c": None,
+        "frame_stack": None,
+    }
+    goal_img = None
     if isinstance(obj, dict):
-        # New format: {'goal_img': {'shape': [H,W,C], 'dtype': 'uint8', 'data': [...]}, 'goal_xy': (x,y)}
         if "goal_img" in obj and isinstance(obj["goal_img"], dict) and "data" in obj["goal_img"]:
             gi_meta = obj["goal_img"]
             shape = tuple(int(x) for x in gi_meta.get("shape", []))
@@ -123,21 +138,35 @@ def try_receive_goal_header(sock: socket.socket, timeout: float = 2.0):
                 print(f"[NET] Failed to reconstruct goal_img from header: {e}")
                 goal_img = None
         elif "goal_img" in obj:
-            # Backward-compat: server sent raw numpy array
             goal_img = obj["goal_img"]
 
-        if "goal_xy" in obj:
+        if "goal_xy" in obj and obj["goal_xy"] is not None:
             try:
-                goal_xy = (float(obj["goal_xy"][0]), float(obj["goal_xy"][1]))
+                out["goal_xy"] = (float(obj["goal_xy"][0]), float(obj["goal_xy"][1]))
             except Exception:
-                goal_xy = None
+                pass
+        if "start_xy" in obj and obj["start_xy"] is not None:
+            try:
+                out["start_xy"] = (float(obj["start_xy"][0]), float(obj["start_xy"][1]))
+            except Exception:
+                pass
+        if obj.get("start_yaw_deg") is not None:
+            try:
+                out["start_yaw_deg"] = float(obj["start_yaw_deg"])
+            except Exception:
+                pass
+        for k in ("start_frame_index", "goal_frame_index", "obs_h", "obs_w", "obs_c", "frame_stack"):
+            if k in obj and obj[k] is not None:
+                try:
+                    out[k] = int(obj[k])
+                except Exception:
+                    pass
     elif isinstance(obj, (list, tuple, np.ndarray)) and len(obj) >= 2:
         try:
-            goal_xy = (float(obj[0]), float(obj[1]))
+            out["goal_xy"] = (float(obj[0]), float(obj[1]))
         except Exception:
-            goal_xy = None
+            pass
 
-    # Try to coerce image to uint8 if it came as float [0..1]
     if isinstance(goal_img, np.ndarray):
         if goal_img.dtype != np.uint8:
             g = goal_img.astype(np.float32)
@@ -152,8 +181,31 @@ def try_receive_goal_header(sock: socket.socket, timeout: float = 2.0):
     else:
         print("[NET] No goal image in header.")
 
-    print(f"[NET] goal_xy={goal_xy}")
-    return goal_img, goal_xy
+    out["goal_img"] = goal_img
+    print(
+        f"[NET] goal_xy={out['goal_xy']} start_xy={out['start_xy']} start_yaw_deg={out['start_yaw_deg']} "
+        f"obs_hw=({out['obs_h']},{out['obs_w']}) frame_stack={out['frame_stack']}"
+    )
+    return out
+
+
+def spawn_ego_at_dataset_xy(world, ego_bp, start_xy, start_yaw_deg=None):
+    """Spawn ego at dataset (x,y). Snap Z using CARLA map waypoint; yaw from header or road."""
+    carla_map = world.get_map()
+    x, y = float(start_xy[0]), float(start_xy[1])
+    probe = carla.Location(x=x, y=y, z=500.0)
+    wp = carla_map.get_waypoint(
+        probe, project_to_road=True, lane_type=carla.LaneType.Driving
+    )
+    if wp is None:
+        print(f"[CARLA] No driving waypoint near ({x:.2f},{y:.2f}); spawn failed.")
+        return None, None
+    tf = wp.transform
+    tf.location.z += 0.35
+    if start_yaw_deg is not None:
+        tf.rotation = carla.Rotation(pitch=0.0, yaw=float(start_yaw_deg), roll=0.0)
+    ego = world.try_spawn_actor(ego_bp, tf)
+    return ego, tf
 
 # ================= Main =================
 
@@ -165,10 +217,25 @@ def main():
     ap.add_argument("--server-host", type=str, default="localhost")
     ap.add_argument("--server-port", type=int, default=5050)
     ap.add_argument("--no-video", action="store_true")
-    ap.add_argument("--wandb-project", type=str, default="cmd_carla_eval")
+    ap.add_argument(
+        "--algorithm",
+        type=str,
+        default="gcbc",
+        help="Training/eval algorithm name; default W&B project is '<algorithm>-eval' (e.g. gcbc -> gcbc-eval).",
+    )
+    ap.add_argument(
+        "--wandb-project",
+        type=str,
+        default=None,
+        help="W&B project (default: <algorithm>-eval from --algorithm).",
+    )
     ap.add_argument("--wandb-run", type=str, default="sync_run")
     ap.add_argument("--print-every", type=int, default=20)
     args = ap.parse_args()
+    if args.wandb_project is None:
+        alg = (args.algorithm or "gcbc").strip().lower()
+        args.wandb_project = f"{alg}-eval" if alg else "carla_eval"
+    print(f"[W&B] project={args.wandb_project} (algorithm={args.algorithm})")
 
     # ---- CARLA ----
     print(f"[CARLA] Connecting to {args.carla_host}:{args.carla_port} …")
@@ -180,28 +247,40 @@ def main():
 
     clear_dynamic_actors(world)
 
-    # Ego: force Tesla Model 3
     ego_bp = bp.find("vehicle.tesla.model3")
     if ego_bp.has_attribute("role_name"):
         ego_bp.set_attribute("role_name", "hero")
 
-    spawns = world.get_map().get_spawn_points()
-    print(f"[CARLA] #spawn points = {len(spawns)}")
-    if not spawns:
-        raise RuntimeError("No spawn points available")
+    # ---- Server header first (start_xy / goal from same .npz as training) ----
+    sock = connect_eval(args.server_host, args.server_port, timeout=10.0)
+    hdr = try_receive_goal_header(sock, timeout=30.0)
+    goal_img = hdr.get("goal_img")
+    goal_xy = hdr.get("goal_xy")
+    start_xy = hdr.get("start_xy")
+    start_yaw_deg = hdr.get("start_yaw_deg")
+    send_obs_w = hdr.get("obs_w")
+    send_obs_h = hdr.get("obs_h")
+    if send_obs_w is None or send_obs_h is None:
+        send_obs_w, send_obs_h = 100, 100
+        print(f"[NET] Header missing obs_h/obs_w; resizing camera frames to {send_obs_w}x{send_obs_h} (legacy default).")
+    else:
+        print(f"[NET] Server expects camera frames at {send_obs_w}x{send_obs_h} (from config).")
 
-    spawn_point = carla.Transform(
-        carla.Location(x=-100, y=-50, z=0.5),   # coordinates in world space
-        carla.Rotation(pitch=0.0, yaw=180.0, roll=0.0)  # orientation
-    )
     ego, chosen_tf = None, None
-    for tf in random.sample(spawns, k=min(20, len(spawns))):
-        ego = world.try_spawn_actor(ego_bp, tf)
-        #spawn_point.rotation.yaw += 270.0 
-        #ego = world.try_spawn_actor(ego_bp, spawn_point)
-        if ego is not None:
-            chosen_tf = tf
-            break
+    if start_xy is not None:
+        ego, chosen_tf = spawn_ego_at_dataset_xy(world, ego_bp, start_xy, start_yaw_deg)
+        if ego is None:
+            print("[CARLA] Dataset spawn failed; falling back to random spawn point.")
+    if ego is None:
+        spawns = world.get_map().get_spawn_points()
+        print(f"[CARLA] #spawn points = {len(spawns)}")
+        if not spawns:
+            raise RuntimeError("No spawn points available")
+        for tf in random.sample(spawns, k=min(20, len(spawns))):
+            ego = world.try_spawn_actor(ego_bp, tf)
+            if ego is not None:
+                chosen_tf = tf
+                break
     if not ego:
         raise RuntimeError("Failed to spawn ego vehicle (tesla.model3)")
     print(f"[CARLA] ✓ Ego vehicle spawned: {ego.type_id} at "
@@ -236,10 +315,6 @@ def main():
     world.apply_settings(settings)
     fps_out = int(round(1.0 / settings.fixed_delta_seconds))
     print(f"[CARLA] ✓ Synchronous mode set (dt={settings.fixed_delta_seconds}, fps≈{fps_out}).")
-
-    # ---- connect to eval server & read the one-time goal header ----
-    sock = connect_eval(args.server_host, args.server_port, timeout=10.0)
-    goal_img, goal_xy = try_receive_goal_header(sock, timeout=2.0)
 
     # Camera queue
     q = Queue(maxsize=1)
@@ -291,9 +366,11 @@ def main():
             else:
                 rgb = rgb_from_image(im); last_rgb = rgb
 
-            # Resize to match server's expected obs size.
+            # Resize to match server's expected obs size (from training config via header).
             # Send as uint8 [0,255] — ImpalaEncoder normalizes internally.
-            img_resized = cv2.resize(rgb, (100, 100), interpolation=cv2.INTER_AREA)
+            img_resized = cv2.resize(
+                rgb, (int(send_obs_w), int(send_obs_h)), interpolation=cv2.INTER_AREA
+            )
             video_frames.append(img_resized)
             img_send = img_resized.astype(np.uint8)
 
@@ -329,11 +406,14 @@ def main():
             action = current_action_chunk[chunk_index]
             chunk_index += 1
             
-            thr  = float(np.clip(action[0], 0.0, 1.0))
-            steer= float(np.clip(action[1], -1.0, 1.0))
-            brk  = float(np.clip(action[2], 0.0, 1.0))
-            if brk < 0.05: brk = 0.0
-            if abs(steer) < 0.03: steer = 0.0
+            thr_raw = float(np.clip(action[0], 0.0, 1.0))
+            steer   = float(np.clip(action[1], -1.0, 1.0))
+            brk_raw = float(np.clip(action[2], 0.0, 1.0))
+            # Mutual exclusion: you're either on gas or brake, not both.
+            if thr_raw >= brk_raw:
+                thr, brk = thr_raw, 0.0
+            else:
+                thr, brk = 0.0, brk_raw
 
             # Apply control
             if i < 0:

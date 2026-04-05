@@ -72,6 +72,75 @@ def fit_to_hw(img: np.ndarray, H: int, W: int) -> np.ndarray:
         cropped = cropped[:H, :W, :]
     return cropped
 
+
+def _dataset_image_stack(dataset):
+    """Training .npz usually has ``observations``; older eval files may use ``frames``."""
+    if "observations" in dataset:
+        return dataset["observations"]
+    if "frames" in dataset:
+        return dataset["frames"]
+    raise KeyError("Dataset must contain 'observations' or 'frames' (RGB per timestep)")
+
+
+def _get_xy_from_dataset(dataset, frame_idx: int):
+    for k in ("position", "poses_xy", "poses", "goal_xy", "loc_xy", "xy", "ego_xy"):
+        if k in dataset:
+            arr = np.asarray(dataset[k][frame_idx]).reshape(-1)
+            if arr.size >= 2:
+                return float(arr[0]), float(arr[1])
+    return None
+
+
+def _cfg_pick(config, key, default=None):
+    """Read key from ml_collections.ConfigDict or dict-like; treat absent/None as default."""
+    try:
+        v = config[key]
+    except (KeyError, TypeError):
+        return default
+    return default if v is None else v
+
+
+def _resolve_eval_dims_from_config(config, args, *, loaded_config_json: bool):
+    """Obs geometry and frame_stack must match the checkpoint (from saved training config)."""
+    if loaded_config_json:
+        obs_h = int(_cfg_pick(config, "obs_h", 64))
+        obs_w = int(_cfg_pick(config, "obs_w", 64))
+        obs_c = int(_cfg_pick(config, "obs_c", 3))
+    elif _cfg_pick(config, "obs_h") is not None:
+        obs_h = int(config["obs_h"])
+        obs_w = int(_cfg_pick(config, "obs_w", obs_h))
+        obs_c = int(_cfg_pick(config, "obs_c", 3))
+    else:
+        obs_h = int(args.obs_h) if args.obs_h is not None else 64
+        obs_w = int(args.obs_w) if args.obs_w is not None else 64
+        obs_c = int(args.obs_c) if args.obs_c is not None else 3
+
+    fs = _cfg_pick(config, "frame_stack", None)
+    if fs is not None:
+        frame_stack_k = int(fs)
+    else:
+        fo = _cfg_pick(config, "frame_offsets", (0, -1, -2))
+        if isinstance(fo, list):
+            fo = tuple(fo)
+        frame_stack_k = len(fo)
+        print(
+            f"[WARN] config has no frame_stack; using len(frame_offsets)={frame_stack_k}. "
+            "Prefer re-training with frame_stack in config or fix config.json."
+        )
+    return obs_h, obs_w, obs_c, frame_stack_k
+
+
+def _get_yaw_deg_from_dataset(dataset, frame_idx: int):
+    for k in ("yaw", "heading", "rotation"):
+        if k in dataset:
+            return float(np.asarray(dataset[k][frame_idx]).reshape(-1)[0])
+    if "position" in dataset:
+        arr = np.asarray(dataset["position"][frame_idx]).reshape(-1)
+        if arr.size >= 4:
+            return float(arr[3])
+    return None
+
+
 # ---------------- main ----------------
 def main():
     p = argparse.ArgumentParser()
@@ -83,18 +152,61 @@ def main():
                    help="Path to config.json file (saved during training). If provided, agent will be created based on this config.")
     p.add_argument("--dataset_path",
                    default="/nfs/kun2/users/achyuth/carla_test_scripts/goals.npz")
-    p.add_argument("--goal_frame_index", type=int, default=1000)
+    p.add_argument(
+        "--goal_frame_index",
+        "--goal_index",
+        type=int,
+        default=1000,
+        dest="goal_frame_index",
+        help="Dataset frame index for goal image stack (alias: --goal_index)",
+    )
+    p.add_argument(
+        "--start_frame_index",
+        type=int,
+        default=0,
+        help="Dataset frame index whose (x,y) [and optional yaw] spawn the ego in CARLA (sent to client in header)",
+    )
     p.add_argument("--host", default="localhost")
     p.add_argument("--port", type=int, default=5050)
     
-    # Match train.py arguments EXACTLY (same names, same defaults, same help text)
-    # Note: Training resizes to 64x64x3, so server should match that
-    p.add_argument("--obs_h", type=int, default=64)
-    p.add_argument("--obs_w", type=int, default=64)
-    p.add_argument("--obs_c", type=int, default=3)
-    p.add_argument("--frame_offsets", nargs="*", type=int, default=None, help="e.g., --frame_offsets 0 -5 -10 -20")
-    p.add_argument("--block_size", type=int, default=400, help="Block size for block-aware frame stacking and shuffling")
-    p.add_argument("--action_chunk_length", type=int, default=1, help="Number of actions to predict in sequence (1 = disabled, typical: 4-16)")
+    p.add_argument(
+        "--obs_h",
+        type=int,
+        default=None,
+        help="Manual override for observation height. If omitted, use config.json (or 64 when no config).",
+    )
+    p.add_argument(
+        "--obs_w",
+        type=int,
+        default=None,
+        help="Manual override for observation width. If omitted, use config.json (or 64 when no config).",
+    )
+    p.add_argument(
+        "--obs_c",
+        type=int,
+        default=None,
+        help="Manual override for channels per frame (usually 3). If omitted, use config.json (or 3 when no config).",
+    )
+    p.add_argument(
+        "--frame_stack",
+        type=int,
+        default=None,
+        help="Manual override for contiguous frame stack depth (must match checkpoint). If omitted, use config.json.",
+    )
+    p.add_argument(
+        "--frame_offsets",
+        nargs="*",
+        type=int,
+        default=None,
+        help="Unused when --config_path is set (stacking depth comes from config frame_stack).",
+    )
+    p.add_argument("--block_size", type=int, default=400, help="Unused for eval I/O when --config_path is set.")
+    p.add_argument(
+        "--action_chunk_length",
+        type=int,
+        default=1,
+        help="Unused when --config_path is set (use action_chunk_length from config.json).",
+    )
     p.add_argument("--n_actions", type=int, default=4, help="Use only the first N actions from the chunk (default: 4 = use first 4 actions). Useful when model was trained with chunking but you want to execute only the first N actions.")
     p.add_argument("--use_discrete", action="store_true", default=False, help="Use discrete actions (multi-discrete mode: discretize throttle/steer/brake into 32 bins each)")
     args = p.parse_args()
@@ -108,9 +220,11 @@ def main():
 
     # Load config from file if provided, otherwise use defaults
     config = get_config()
+    loaded_config_json = False
     if args.config_path:
         config_path = Path(args.config_path)
         if config_path.exists():
+            loaded_config_json = True
             print(f"Loading config from {config_path}")
             with config_path.open("r") as f:
                 config_dict = json.load(f)
@@ -135,9 +249,6 @@ def main():
     else:
         print("No config file provided, using defaults from agent.get_config()")
 
-    obs_shape = (args.obs_h, args.obs_w, args.obs_c)
-    frame_stack_k = int(config.get('frame_stack', len(config.frame_offsets)))
-    stacked_obs_shape = (args.obs_h, args.obs_w, args.obs_c * frame_stack_k)
     act_shape = (3,)
     action_dim = act_shape[0]  # 3
 
@@ -152,8 +263,8 @@ def main():
         maybe_dict = pickle.loads(raw)
         if isinstance(maybe_dict, dict) and "agent" in maybe_dict:
             checkpoint_bytes = maybe_dict["agent"]
-            # Optional: config fallback from checkpoint if no config_path
-            if not args.config_path and "config" in maybe_dict:
+            # Optional: config fallback from checkpoint if no config.json was loaded
+            if not loaded_config_json and "config" in maybe_dict:
                 saved_config = maybe_dict["config"]
                 if isinstance(saved_config, dict):
                     for key, value in saved_config.items():
@@ -175,7 +286,45 @@ def main():
     except Exception:
         # Not a pickle; assume raw is Flax bytes (current format)
         checkpoint_bytes = raw
-    
+
+    obs_h, obs_w, obs_c, frame_stack_k = _resolve_eval_dims_from_config(
+        config, args, loaded_config_json=loaded_config_json
+    )
+    cli_obs_parts = []
+    if args.obs_h is not None:
+        obs_h = int(args.obs_h)
+        cli_obs_parts.append(f"obs_h={obs_h}")
+    if args.obs_w is not None:
+        obs_w = int(args.obs_w)
+        cli_obs_parts.append(f"obs_w={obs_w}")
+    if args.obs_c is not None:
+        obs_c = int(args.obs_c)
+        cli_obs_parts.append(f"obs_c={obs_c}")
+    if cli_obs_parts:
+        print(
+            f"[EVAL] CLI override: {', '.join(cli_obs_parts)} "
+            "(must match checkpoint input shape or forward will fail)"
+        )
+
+    if args.frame_stack is not None:
+        frame_stack_k = int(args.frame_stack)
+        if isinstance(config, ml_collections.ConfigDict):
+            config.frame_stack = frame_stack_k
+        else:
+            config["frame_stack"] = frame_stack_k
+        print(
+            f"[EVAL] CLI override: frame_stack={frame_stack_k} "
+            "(must match the run that produced --model_path; config.json may be from a different experiment)"
+        )
+
+    obs_shape = (obs_h, obs_w, obs_c)
+    stacked_obs_shape = (obs_h, obs_w, obs_c * frame_stack_k)
+    print(
+        f"[EVAL] Resolved from {'config.json' if loaded_config_json else 'config + defaults'}: "
+        f"obs_h={obs_h}, obs_w={obs_w}, obs_c={obs_c}, frame_stack={frame_stack_k}, "
+        f"action_chunk_length={int(_cfg_pick(config, 'action_chunk_length', 1))}"
+    )
+
     # Initialize with *stacked* shape (this must match runtime)
     dummy_obs = jnp.zeros((1, *stacked_obs_shape), dtype=jnp.float32)
     dummy_act = jnp.zeros((1, *act_shape), dtype=jnp.float32)  # (1, 3)
@@ -205,20 +354,24 @@ def main():
     
     print("Model loaded and agent initialized")
     
-    print(args.goal_frame_index)
-    # ---- Load dataset & goal (resize to match training: 64x64x3) ----
+    # ---- Load dataset & goal ----
     dataset = np.load(args.dataset_path)
-    frames = dataset["frames"]
+    frames = _dataset_image_stack(dataset)
     num_frames = len(frames)
+    g_idx = int(np.clip(args.goal_frame_index, 0, num_frames - 1))
+    s_idx = int(np.clip(args.start_frame_index, 0, num_frames - 1))
+    if g_idx != args.goal_frame_index or s_idx != args.start_frame_index:
+        print(f"[WARN] Clamped goal_frame_index={args.goal_frame_index}->{g_idx}, "
+              f"start_frame_index={args.start_frame_index}->{s_idx} (num_frames={num_frames})")
     
     # Stack goal frames using contiguous history, oldest-first (matches GCDataset).
     # Goal at index g gets frames [g-(k-1), ..., g-1, g], clamped to trajectory start.
     goal_frame_stack = []
     for j in range(frame_stack_k):
-        goal_idx = args.goal_frame_index - (frame_stack_k - 1 - j)
+        goal_idx = g_idx - (frame_stack_k - 1 - j)
         goal_idx = max(0, min(goal_idx, num_frames - 1))
         gi_raw = np.asarray(frames[goal_idx])
-        gi_frame = fit_to_hw(gi_raw, args.obs_h, args.obs_w)
+        gi_frame = fit_to_hw(gi_raw, obs_h, obs_w)
         if gi_frame.dtype != np.uint8:
             if gi_frame.max() <= 1.0:
                 gi_frame = (gi_frame * 255.0).astype(np.uint8)
@@ -229,14 +382,14 @@ def main():
     goal_stacked = np.concatenate(goal_frame_stack, axis=-1)  # (H, W, 3*k) uint8
     gi_obs = goal_frame_stack[-1]  # current frame for display
 
-    # optional goal (x,y)
-    goal_xy = None
-    for k in ("goal_xy", "poses_xy", "poses", "goal_locs", "loc_xy", "xy"):
-        if k in dataset:
-            arr = np.asarray(dataset[k][args.goal_frame_index])
-            if arr.size >= 2:
-                goal_xy = (float(arr[0]), float(arr[1]))
-                break
+    goal_xy = _get_xy_from_dataset(dataset, g_idx)
+    start_xy = _get_xy_from_dataset(dataset, s_idx)
+    start_yaw_deg = _get_yaw_deg_from_dataset(dataset, s_idx)
+    if start_xy is not None:
+        print(f"[DATA] start_frame_index={s_idx} -> start_xy={start_xy}, start_yaw_deg={start_yaw_deg}")
+    else:
+        print(f"[DATA] start_frame_index={s_idx} -> no position key found; client will use random spawn")
+    print(f"[DATA] goal_frame_index={g_idx} -> goal_xy={goal_xy}")
 
     # Load goal for header (use first frame for display)
     goal_fixed_header = gi_obs  # uint8 (H,W,3) for header display only
@@ -263,16 +416,24 @@ def main():
                 "data": gi_u8.reshape(-1).tolist(),
             },
             "goal_xy": goal_xy,
+            "start_xy": start_xy,
+            "start_yaw_deg": start_yaw_deg,
+            "start_frame_index": s_idx,
+            "goal_frame_index": g_idx,
+            "obs_h": obs_h,
+            "obs_w": obs_w,
+            "obs_c": obs_c,
+            "frame_stack": frame_stack_k,
         }
         send_len_pickled(conn, header)
-        print(f"Sent goal header (img {gi_u8.shape}, xy={goal_xy})")
+        print(
+            f"Sent eval header (goal img {gi_u8.shape}, goal_xy={goal_xy}, "
+            f"start_xy={start_xy}, start_yaw_deg={start_yaw_deg})"
+        )
     except Exception as e:
         print(f"[WARN] failed to send goal header: {e}")
 
     # ---- Runtime buffers ----
-    # Match GCDataset: contiguous frame stack of length frame_stack.
-    # Oldest-first: [t-(k-1), ..., t-1, t] concatenated along channels.
-    frame_stack_k = int(config.get('frame_stack', len(config.frame_offsets)))
     HISTORY = deque(maxlen=frame_stack_k)
     
     # Direct module access (matching your previous working pattern)
@@ -303,8 +464,8 @@ def main():
             img = pickle.loads(data)
             img_arr = np.asarray(img)
 
-            if img_arr.shape[:2] != (args.obs_h, args.obs_w):
-                img_arr = fit_to_hw(img_arr, args.obs_h, args.obs_w)
+            if img_arr.shape[:2] != (obs_h, obs_w):
+                img_arr = fit_to_hw(img_arr, obs_h, obs_w)
 
             # Ensure uint8 [0,255] — ImpalaEncoder does /255.0 internally.
             # Training stores uint8 and passes directly; we must do the same.
@@ -356,13 +517,22 @@ def main():
             act = action_dist.mean()       # (1, action_dim * chunk_len) flat
             t_fwd = time.perf_counter()
 
-            # Reshape flat output to (chunk_len, action_dim)
-            chunk_len = int(config.get('action_chunk_length', 1))
-            act_np = np.array(act[0], dtype=np.float32)  # (action_dim * chunk_len,)
-            if chunk_len > 1:
-                act_chunk = act_np.reshape(chunk_len, -1)  # (chunk_len, action_dim)
-            else:
-                act_chunk = act_np.reshape(1, -1)           # (1, action_dim)
+            # Reshape to (chunk_len, action_dim). Prefer inferring chunk_len from output
+            # size so old checkpoints and config.json stay consistent.
+            act_np = np.array(act[0], dtype=np.float32).ravel()
+            flat = int(act_np.size)
+            if flat % action_dim != 0:
+                raise ValueError(
+                    f"Actor output length {flat} is not divisible by action_dim={action_dim}."
+                )
+            chunk_len_effective = flat // action_dim
+            cfg_chunk = int(_cfg_pick(config, "action_chunk_length", 1))
+            if cfg_chunk != chunk_len_effective and n <= 3:
+                print(
+                    f"[WARN] config action_chunk_length={cfg_chunk} but actor output implies "
+                    f"chunk_len={chunk_len_effective}; using output shape."
+                )
+            act_chunk = act_np.reshape(chunk_len_effective, action_dim)
             chunk_length = act_chunk.shape[0]
             
             # Optionally use only the first N actions from the chunk

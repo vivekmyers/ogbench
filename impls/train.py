@@ -159,6 +159,10 @@ def filter_intersection_frames_jax(dataset: Dict[str, jnp.ndarray], throttle_thr
 def filter_intersection_frames(dataset: Dict[str, np.ndarray], throttle_threshold: float = 0.05, brake_threshold: float = 0.1,
     window_size: int = 5,
 ) -> Dict[str, np.ndarray]:
+    """Remove frames where the car is stopped/idling (low throttle AND low steer for
+    extended windows). Does NOT remove braking frames that co-occur with turning,
+    because those are exactly the frames we need to learn turns.
+    """
     actions = dataset['actions']
     T = len(actions)
     terminals = dataset.get('terminals', np.zeros(T, dtype=bool))
@@ -177,11 +181,14 @@ def filter_intersection_frames(dataset: Dict[str, np.ndarray], throttle_threshol
         print(f"Trajectory lengths (stats): min={traj_lengths.min()}, max={traj_lengths.max()}, mean={traj_lengths.mean():.1f}")
     
     throttle = actions[:, 0]
+    steer = actions[:, 1]
     brake = actions[:, 2]
     low_throttle = throttle < throttle_threshold
-    high_brake = brake > brake_threshold
+    is_turning = np.abs(steer) > 0.03
+    # Only mark as intersection/idle if braking AND not turning.
+    high_brake_idle = (brake > brake_threshold) & (~is_turning)
     intersection_mask = np.zeros(T, dtype=bool)
-    intersection_mask = intersection_mask | high_brake
+    intersection_mask = intersection_mask | high_brake_idle
     from numpy.lib.stride_tricks import sliding_window_view
     try:
         windows = sliding_window_view(low_throttle, window_size)
@@ -837,6 +844,8 @@ def compute_validation_loss(agent, val_dataset: GCDataset | None, batch_size: in
         metrics["val/actor_q_loss"] = float(actor_info["q_loss"])
     if "mse" in actor_info:
         metrics["val/actor_mse"] = float(actor_info["mse"])
+    if "mse_first" in actor_info:
+        metrics["val/actor_mse_first"] = float(actor_info["mse_first"])
 
     # Critic metrics: log critic loss and other relevant metrics
     if hasattr(agent, "contrastive_loss") or hasattr(agent, "critic_loss"):
@@ -872,9 +881,9 @@ def main(args: argparse.Namespace) -> None:
     cfg.actor_loss = "ddpgbc"
     cfg.expectile = 0.7
     cfg.discount = args.discount
-    cfg.alpha = 0.5
+    cfg.alpha = 1.0
     cfg.encoder = "impala_small"
-    cfg.lr = 3e-4  # Increased LR to help critic learn (was 1e-4)
+    cfg.lr = 1e-4
     cfg.actor_hidden_dims = (512, 512, 512)
     cfg.value_hidden_dims = (512, 512, 512)
     cfg.latent_dim = 512
@@ -886,17 +895,21 @@ def main(args: argparse.Namespace) -> None:
     else:
         cfg.frame_offsets = (0, -1, -2)
         cfg.frame_stack = 3
+    # Saved in config.json so eval server/client match training geometry (no CLI guessing).
+    cfg.obs_h = args.obs_h
+    cfg.obs_w = args.obs_w
+    cfg.obs_c = args.obs_c
     cfg.block_size = args.block_size
     cfg.p_aug = 0.5
     cfg.distance_loss_weight = 0.05
     cfg.distance_head_hidden_dims = (256, 256)
-    cfg.upsample_mode = 'none'  # Disable action component upsampling (was causing instability)
+    cfg.upsample_mode = 'turns_high'
     cfg.upsample_weight = 3.0
-    cfg.steer_thresh = 0.1
+    cfg.steer_thresh = 0.05
     cfg.throttle_thresh = 0.3
     cfg.brake_thresh = 0.1
-    cfg.p_randomgoal = 0.0
-    cfg.p_trajgoal = 1.0
+    cfg.p_randomgoal = 0.1
+    cfg.p_trajgoal = 0.9
     cfg.p_curgoal = 0.0
     # GCDataset requires these parameters (use same values for value and actor goals)
     cfg.value_p_curgoal = cfg.p_curgoal

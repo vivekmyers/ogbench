@@ -174,7 +174,11 @@ class GCActor(nn.Module):
             self.log_std_net = nn.Dense(output_dim, kernel_init=default_init(self.final_fc_init_scale * 0.1))
         else:
             if not self.const_std:
-                self.log_stds = self.param('log_stds', nn.initializers.zeros, (output_dim,))
+                self.log_stds = self.param(
+                    'log_stds',
+                    lambda key, shape: jnp.full(shape, -1.0),
+                    (output_dim,),
+                )
 
     def __call__(
         self,

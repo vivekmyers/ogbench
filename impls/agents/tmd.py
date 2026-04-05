@@ -160,6 +160,9 @@ class TMDAgent(flax.struct.PyTreeNode):
     @jax.jit
     def actor_loss(self, batch, grad_params, rng=None):
         # Maximize log Q if actor_log_q is True (which is default).
+        chunk_len = int(self.config.get('action_chunk_length', 1))
+        action_dim = batch['actions'].shape[-1]
+
         if self.config['use_latent']:
             psi_s, psi_g = (
                 self.network.select('psi')(batch['observations'], params=grad_params),
@@ -174,9 +177,15 @@ class TMDAgent(flax.struct.PyTreeNode):
         else:
             dist = self.network.select('actor')(batch['observations'], batch['actor_goals'], params=grad_params)
         if self.config['const_std']:
-            q_actions = jnp.clip(dist.mode(), -1, 1)
+            q_flat = jnp.clip(dist.mode(), -1, 1)
         else:
-            q_actions = jnp.clip(dist.sample(seed=rng), -1, 1)
+            q_flat = jnp.clip(dist.sample(seed=rng), -1, 1)
+
+        # Phi(s, a) is defined on a single action; use the first step of the chunk for Q.
+        if chunk_len > 1:
+            q_actions = q_flat[:, :action_dim]
+        else:
+            q_actions = q_flat
 
         phi = self.network.select('phi')(batch['observations'], q_actions)
         psi = self.network.select('psi')(batch['actor_goals'])
@@ -185,22 +194,45 @@ class TMDAgent(flax.struct.PyTreeNode):
 
         # Normalize Q values by the absolute mean to make the loss scale invariant.
         q_loss = -q.mean() / jax.lax.stop_gradient(jnp.abs(q).mean() + 1e-6)
-        log_prob = dist.log_prob(batch['actions'])
+
+        if self.config['discrete']:
+            log_prob = dist.log_prob(batch['actions'])
+            bc_loss = -(self.config['alpha'] * log_prob).mean()
+            actor_loss = q_loss + bc_loss
+            pred = dist.mode()
+            return actor_loss, {
+                'actor_loss': actor_loss,
+                'q_loss': q_loss,
+                'bc_loss': bc_loss,
+                'q_mean': q.mean(),
+                'q_abs_mean': jnp.abs(q).mean(),
+                'bc_log_prob': log_prob.mean(),
+                'mse': jnp.mean((pred - batch['actions']) ** 2),
+                'std': jnp.mean(dist.scale_diag),
+            }
+
+        action_targets = batch['action_chunks'].reshape(batch['action_chunks'].shape[0], -1)
+        log_prob = dist.log_prob(action_targets)
 
         bc_loss = -(self.config['alpha'] * log_prob).mean()
 
         actor_loss = q_loss + bc_loss
 
-        return actor_loss, {
+        pred = dist.mode()
+        actor_info = {
             'actor_loss': actor_loss,
             'q_loss': q_loss,
             'bc_loss': bc_loss,
             'q_mean': q.mean(),
             'q_abs_mean': jnp.abs(q).mean(),
             'bc_log_prob': log_prob.mean(),
-            'mse': jnp.mean((dist.mode() - batch['actions']) ** 2),
+            'mse': jnp.mean((pred - action_targets) ** 2),
             'std': jnp.mean(dist.scale_diag),
         }
+        if chunk_len > 1:
+            actor_info['mse_first'] = jnp.mean((pred[:, :action_dim] - action_targets[:, :action_dim]) ** 2)
+
+        return actor_loss, actor_info
 
     @jax.jit
     def total_loss(self, batch, grad_params, rng=None, critic_only=False, step: int=0):
@@ -240,6 +272,7 @@ class TMDAgent(flax.struct.PyTreeNode):
         seed=None,
         temperature=1.0,
     ):
+        chunk_len = int(self.config.get('action_chunk_length', 1))
         if self.config['use_latent']:
             psi_s, psi_g = self.network.select('psi')(observations), self.network.select('psi')(goals)
             if len(psi_s.shape) == 2:  # in inference, we don't have batch dimension
@@ -251,6 +284,11 @@ class TMDAgent(flax.struct.PyTreeNode):
         actions = dist.sample(seed=seed)
         if not self.config['discrete']:
             actions = jnp.clip(actions, -1, 1)
+            if chunk_len > 1:
+                flat_dim = actions.shape[-1]
+                ad = flat_dim // chunk_len
+                actions = actions.reshape(*actions.shape[:-1], chunk_len, ad)
+                actions = actions[..., 0, :]
         return actions
     
     @jax.jit
@@ -334,6 +372,7 @@ class TMDAgent(flax.struct.PyTreeNode):
             actor_def = GCActor(
                 hidden_dims=config['actor_hidden_dims'],
                 action_dim=action_dim,
+                chunk_length=int(config.get('action_chunk_length', 1)),
                 state_dependent_std=False,
                 const_std=config['const_std'],
                 gc_encoder=encoders.get('actor'),
@@ -411,6 +450,7 @@ def get_config():
             use_action_for_distance=True,  # Whether to use action for distance computation
             frame_stack=ml_collections.config_dict.placeholder(int),  # Number of frames to stack.
             dual_descent=False,
+            action_chunk_length=1,  # GCActor outputs chunk_length * action_dim; phi uses first action only.
         )
     )
     return config
