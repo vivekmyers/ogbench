@@ -213,17 +213,23 @@ class GCDataset:
         batch['rewards'] = successes - (1.0 if self.config['gc_negative'] else 0.0)
 
         chunk_len = self.config.get('action_chunk_length', 1)
+        final_state_idxs = self.idx_to_terminal[idxs]
         if chunk_len > 1:
             offsets = np.arange(chunk_len)
             chunk_idxs = idxs[:, None] + offsets[None, :]
-            chunk_idxs = np.minimum(chunk_idxs, self.idx_to_terminal[idxs][:, None])
+            chunk_idxs = np.minimum(chunk_idxs, final_state_idxs[:, None])
             batch['action_chunks'] = self.dataset['actions'][chunk_idxs]  # (B, chunk_len, action_dim)
         else:
             batch['action_chunks'] = batch['actions'][:, None, :]  # (B, 1, action_dim)
 
+        # State after executing the first K actions (for K-step / Q-chunk critics).
+        chunk_next_idxs = np.minimum(idxs + chunk_len, final_state_idxs)
+        batch['chunk_next_observations'] = self.get_observations(chunk_next_idxs)
+
         if self.config['p_aug'] is not None and not evaluation:
             if np.random.rand() < self.config['p_aug']:
-                self.augment(batch, ['observations', 'next_observations', 'value_goals', 'actor_goals'])
+                aug_keys = ['observations', 'next_observations', 'value_goals', 'actor_goals', 'chunk_next_observations']
+                self.augment(batch, aug_keys)
 
         return batch
 
@@ -336,6 +342,112 @@ class GCDataset:
 
 
 @dataclasses.dataclass
+class CGCDataset(GCDataset):
+    """Dataset for decoupled chunk-based goal-conditioned RL (TMD-DQC).
+
+    Extends GCDataset with multi-step backup fields:
+      - high_value_action_chunks: full backup_horizon-length action chunks
+      - high_value_next_observations: observations backup_horizon steps ahead
+      - high_value_goals / actor_goals: sampled goal observations
+      - high_value_backup_horizon, high_value_masks, high_value_rewards
+      - valids: per-timestep validity mask within the chunk
+    """
+
+    def __post_init__(self):
+        super().__post_init__()
+        backup_horizon = int(self.config['backup_horizon'])
+        cur_idx = 0
+        valid_idxs = []
+        for terminal_idx in self.terminal_locs:
+            valid_idxs.append(np.arange(cur_idx, terminal_idx + 1 - backup_horizon))
+            cur_idx = terminal_idx + 1
+        self.dataset.valid_idxs = np.concatenate(valid_idxs)
+
+    def _compute_high_next_idxs(self, idxs, final_state_idxs, high_goal_idxs, backup_horizon):
+        batch_size = len(idxs)
+        bh = np.full(batch_size, backup_horizon)
+        bh = np.minimum(bh, final_state_idxs - idxs)
+        diff = high_goal_idxs - idxs
+        should_clip = (0 <= diff) & (diff < bh)
+        bh = np.where(should_clip, diff, bh)
+        return idxs + bh, bh
+
+    def sample(self, batch_size, idxs=None, evaluation=False):
+        if idxs is None:
+            if self._sampling_weights is not None and not evaluation:
+                idxs = np.random.choice(self.size, batch_size, replace=True, p=self._sampling_weights)
+            else:
+                idxs = self.dataset.get_random_idxs(batch_size)
+
+        batch = self.dataset.sample(batch_size, idxs)
+        if self.config['frame_stack'] is not None:
+            batch['observations'] = self.get_observations(idxs)
+            next_idxs = np.minimum(idxs + 1, self.size - 1)
+            batch['next_observations'] = self.get_observations(next_idxs)
+
+        final_state_idxs = self.idx_to_terminal[idxs]
+        backup_horizon = int(self.config['backup_horizon'])
+
+        high_value_goal_idxs = self.sample_goals(
+            idxs,
+            self.config['value_p_curgoal'],
+            self.config['value_p_trajgoal'],
+            self.config['value_p_randomgoal'],
+            self.config['value_geom_sample'],
+        )
+        actor_goal_idxs = self.sample_goals(
+            idxs,
+            self.config['actor_p_curgoal'],
+            self.config['actor_p_trajgoal'],
+            self.config['actor_p_randomgoal'],
+            self.config['actor_geom_sample'],
+        )
+
+        high_value_next_idxs, high_value_bh = self._compute_high_next_idxs(
+            idxs, final_state_idxs, high_value_goal_idxs, backup_horizon,
+        )
+
+        all_goal_idxs = np.stack([high_value_goal_idxs, actor_goal_idxs,
+                                  high_value_next_idxs])
+        all_obs = self._batch_get_observations(all_goal_idxs)
+        batch['high_value_goals'] = jax.tree_util.tree_map(lambda x: x[0], all_obs)
+        batch['value_goals'] = batch['high_value_goals']
+        batch['actor_goals'] = jax.tree_util.tree_map(lambda x: x[1], all_obs)
+        batch['high_value_next_observations'] = jax.tree_util.tree_map(lambda x: x[2], all_obs)
+
+        chunk_offsets = np.arange(backup_horizon)
+        chunk_idxs = np.minimum(idxs[:, None] + chunk_offsets, final_state_idxs[:, None])
+        batch['high_value_action_chunks'] = self.dataset['actions'][chunk_idxs].reshape(batch_size, -1)
+        batch['valids'] = (idxs[:, None] + chunk_offsets <= final_state_idxs[:, None]).astype(np.float32)
+
+        high_value_successes = (high_value_bh < backup_horizon).astype(np.float32)
+        batch['high_value_backup_horizon'] = high_value_bh
+        batch['high_value_masks'] = 1.0 - high_value_successes
+        batch['high_value_rewards'] = (self.config['discount'] ** high_value_bh) * high_value_successes
+
+        successes = (idxs == high_value_goal_idxs).astype(np.float32)
+        batch['masks'] = 1.0 - successes
+        batch['rewards'] = successes - (1.0 if self.config['gc_negative'] else 0.0)
+
+        chunk_len = self.config.get('action_chunk_length', 1)
+        if chunk_len > 1:
+            offsets = np.arange(chunk_len)
+            actor_chunk_idxs = idxs[:, None] + offsets[None, :]
+            actor_chunk_idxs = np.minimum(actor_chunk_idxs, final_state_idxs[:, None])
+            batch['action_chunks'] = self.dataset['actions'][actor_chunk_idxs]
+        else:
+            batch['action_chunks'] = batch['actions'][:, None, :]
+
+        if self.config['p_aug'] is not None and not evaluation:
+            if np.random.rand() < self.config['p_aug']:
+                self.augment(batch, ['observations', 'next_observations',
+                                     'high_value_goals', 'actor_goals',
+                                     'high_value_next_observations'])
+
+        return batch
+
+
+@dataclasses.dataclass
 class HGCDataset(GCDataset):
 
     def sample(self, batch_size, idxs=None, evaluation=False):
@@ -401,12 +513,15 @@ class HGCDataset(GCDataset):
         else:
             batch['action_chunks'] = batch['actions'][:, None, :]
 
+        chunk_next_idxs = np.minimum(idxs + chunk_len, final_state_idxs)
+        batch['chunk_next_observations'] = self.get_observations(chunk_next_idxs)
+
         if self.config['p_aug'] is not None and not evaluation:
             if np.random.rand() < self.config['p_aug']:
                 self.augment(
                     batch,
                     ['observations', 'next_observations', 'value_goals', 'low_actor_goals',
-                     'high_actor_goals', 'high_actor_targets'],
+                     'high_actor_goals', 'high_actor_targets', 'chunk_next_observations'],
                 )
 
         return batch

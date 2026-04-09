@@ -1,0 +1,10 @@
+{
+  "suite_description": "Smoke only: 5 frames/episode. Use eval_config.json or raise frames_per_episode for real rollouts.",
+  "frames_per_episode": 5,
+  "goal_xy_mse_threshold": 0.0,
+  "algorithm": "tmd",
+  "pairs": [
+    [0, 100],
+    [200, 300]
+  ]
+}

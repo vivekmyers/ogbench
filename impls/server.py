@@ -3,8 +3,6 @@ import os
 import socket
 import pickle
 import argparse
-import time
-import inspect
 import json
 from pathlib import Path
 from collections import deque
@@ -17,6 +15,25 @@ from flax.serialization import from_bytes, to_state_dict, from_state_dict, msgpa
 import optax
 import ml_collections
 
+from eval_utils import (
+    dataset_image_stack,
+    fit_to_hw,
+    get_xy_from_dataset,
+    get_yaw_deg_from_dataset,
+    recvall,
+    send_len_pickled,
+)
+from eval_multi_episode import (
+    EvalPlan,
+    build_goal_stack_uint8,
+    header_dict_from_pair,
+    load_eval_config,
+    neutral_action_chunk,
+    normalize_eval_config,
+    send_action_chunk_wire,
+)
+from agents import agents as AGENT_REGISTRY
+
 # ---------------- XLA memory knobs (same as your setup) ----------------
 os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 os.environ.setdefault("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.5")
@@ -24,72 +41,15 @@ os.environ.setdefault("XLA_PYTHON_CLIENT_ALLOCATOR", "platform")
 
 # ---------------- util: import agent family ----------------
 def build_agent(agent_str: str):
+    agent_str = agent_str.lower().strip()
+    if agent_str not in AGENT_REGISTRY:
+        raise KeyError(
+            f"Unknown agent {agent_str!r}. Available: {sorted(AGENT_REGISTRY)}"
+        )
+    Agent = AGENT_REGISTRY[agent_str]
     module = importlib.import_module(f"agents.{agent_str}")
-    Agent = getattr(module, f"{agent_str.upper()}Agent")
     get_config = getattr(module, "get_config")
     return Agent, get_config
-
-# ---------------- socket helpers ----------------
-def send_len_pickled(conn: socket.socket, obj):
-    """Send one header: [4-byte big-endian length] + pickle(obj)."""
-    payload = pickle.dumps(obj, protocol=pickle.HIGHEST_PROTOCOL)
-    conn.sendall(len(payload).to_bytes(4, "big") + payload)
-
-def recvall(conn: socket.socket, n: int, *, timeout: float | None = None) -> bytes:
-    if timeout is not None:
-        conn.settimeout(timeout)
-    buf = b""
-    while len(buf) < n:
-        chunk = conn.recv(n - len(buf))
-        if not chunk:
-            raise ConnectionError("Connection lost while receiving payload")
-        buf += chunk
-    return buf
-
-# ---------------- shape helper (no cv2) ----------------
-def fit_to_hw(img: np.ndarray, H: int, W: int) -> np.ndarray:
-    """
-    Center-crop to (H,W) if larger; pad with edge pixels if smaller.
-    Keeps channels untouched. No resampling libs needed.
-    """
-    h, w = img.shape[:2]
-    y0 = max(0, (h - H) // 2)
-    x0 = max(0, (w - W) // 2)
-    # crop
-    cropped = img[y0:min(y0 + H, h), x0:min(x0 + W, w)]
-    ch = cropped.shape[2] if cropped.ndim == 3 else 1
-    # pad if needed
-    pad_h = H - cropped.shape[0]
-    pad_w = W - cropped.shape[1]
-    if pad_h > 0 or pad_w > 0:
-        if cropped.ndim == 2:
-            cropped = cropped[:, :, None]
-        cropped = np.pad(
-            cropped,
-            ((0, max(0, pad_h)), (0, max(0, pad_w)), (0, 0)),
-            mode="edge",
-        )
-        cropped = cropped[:H, :W, :]
-    return cropped
-
-
-def _dataset_image_stack(dataset):
-    """Training .npz usually has ``observations``; older eval files may use ``frames``."""
-    if "observations" in dataset:
-        return dataset["observations"]
-    if "frames" in dataset:
-        return dataset["frames"]
-    raise KeyError("Dataset must contain 'observations' or 'frames' (RGB per timestep)")
-
-
-def _get_xy_from_dataset(dataset, frame_idx: int):
-    for k in ("position", "poses_xy", "poses", "goal_xy", "loc_xy", "xy", "ego_xy"):
-        if k in dataset:
-            arr = np.asarray(dataset[k][frame_idx]).reshape(-1)
-            if arr.size >= 2:
-                return float(arr[0]), float(arr[1])
-    return None
-
 
 def _cfg_pick(config, key, default=None):
     """Read key from ml_collections.ConfigDict or dict-like; treat absent/None as default."""
@@ -130,22 +90,19 @@ def _resolve_eval_dims_from_config(config, args, *, loaded_config_json: bool):
     return obs_h, obs_w, obs_c, frame_stack_k
 
 
-def _get_yaw_deg_from_dataset(dataset, frame_idx: int):
-    for k in ("yaw", "heading", "rotation"):
-        if k in dataset:
-            return float(np.asarray(dataset[k][frame_idx]).reshape(-1)[0])
-    if "position" in dataset:
-        arr = np.asarray(dataset["position"][frame_idx]).reshape(-1)
-        if arr.size >= 4:
-            return float(arr[3])
-    return None
+_AGENT_CHOICES = sorted(AGENT_REGISTRY.keys())
 
 
 # ---------------- main ----------------
 def main():
     p = argparse.ArgumentParser()
     # Server-specific arguments
-    p.add_argument("--agent", default="gcbc", choices=["crl", "cmd", "gcbc", "gciql", "tmd"])
+    p.add_argument(
+        "--agent",
+        default="gcbc",
+        choices=_AGENT_CHOICES,
+        help=f"Agent module (available: {', '.join(_AGENT_CHOICES)})",
+    )
     p.add_argument("--model_path",
                    default="/global/scratch/users/achyuthkv76/tmd_models/run2.pkl")
     p.add_argument("--config_path", type=str, default=None,
@@ -209,13 +166,33 @@ def main():
     )
     p.add_argument("--n_actions", type=int, default=4, help="Use only the first N actions from the chunk (default: 4 = use first 4 actions). Useful when model was trained with chunking but you want to execute only the first N actions.")
     p.add_argument("--use_discrete", action="store_true", default=False, help="Use discrete actions (multi-discrete mode: discretize throttle/steer/brake into 32 bins each)")
+    p.add_argument(
+        "--eval_config",
+        type=str,
+        default=None,
+        help="JSON with pairs, frames_per_episode, goal_xy_mse_threshold (see impls/eval_config.json). When set, --start_frame_index/--goal_frame_index are ignored.",
+    )
+    p.add_argument(
+        "--eval_max_episodes",
+        type=int,
+        default=None,
+        help="With --eval_config: run at most this many episodes (first N pairs). Applied after optional max_episodes in the JSON.",
+    )
+    p.add_argument(
+        "--accept_multiple",
+        action="store_true",
+        help="After eval_done (or client disconnect), listen for another connection instead of exiting.",
+    )
     args = p.parse_args()
 
     # ---- Load agent ----
-    agent_str = args.agent.lower()
+    agent_str = args.agent.lower().strip()
+    if agent_str not in AGENT_REGISTRY:
+        raise SystemExit(
+            f"Unknown --agent {agent_str!r}. Choose one of: {sorted(AGENT_REGISTRY)}"
+        )
+    Agent = AGENT_REGISTRY[agent_str]
     module = importlib.import_module(f"agents.{agent_str}")
-    
-    Agent = getattr(module, f"{agent_str.upper()}Agent")
     get_config = getattr(module, "get_config")
 
     # Load config from file if provided, otherwise use defaults
@@ -354,88 +331,66 @@ def main():
     
     print("Model loaded and agent initialized")
     
-    # ---- Load dataset & goal ----
+    # ---- Load dataset ----
     dataset = np.load(args.dataset_path)
-    frames = _dataset_image_stack(dataset)
+    frames = dataset_image_stack(dataset)
     num_frames = len(frames)
-    g_idx = int(np.clip(args.goal_frame_index, 0, num_frames - 1))
-    s_idx = int(np.clip(args.start_frame_index, 0, num_frames - 1))
-    if g_idx != args.goal_frame_index or s_idx != args.start_frame_index:
-        print(f"[WARN] Clamped goal_frame_index={args.goal_frame_index}->{g_idx}, "
-              f"start_frame_index={args.start_frame_index}->{s_idx} (num_frames={num_frames})")
-    
-    # Stack goal frames using contiguous history, oldest-first (matches GCDataset).
-    # Goal at index g gets frames [g-(k-1), ..., g-1, g], clamped to trajectory start.
-    goal_frame_stack = []
-    for j in range(frame_stack_k):
-        goal_idx = g_idx - (frame_stack_k - 1 - j)
-        goal_idx = max(0, min(goal_idx, num_frames - 1))
-        gi_raw = np.asarray(frames[goal_idx])
-        gi_frame = fit_to_hw(gi_raw, obs_h, obs_w)
-        if gi_frame.dtype != np.uint8:
-            if gi_frame.max() <= 1.0:
-                gi_frame = (gi_frame * 255.0).astype(np.uint8)
-            else:
-                gi_frame = np.clip(gi_frame, 0, 255).astype(np.uint8)
-        goal_frame_stack.append(gi_frame)
 
-    goal_stacked = np.concatenate(goal_frame_stack, axis=-1)  # (H, W, 3*k) uint8
-    gi_obs = goal_frame_stack[-1]  # current frame for display
+    eval_plan: EvalPlan | None = None
+    if args.eval_config:
+        raw = load_eval_config(Path(args.eval_config))
+        eval_plan = normalize_eval_config(
+            raw,
+            agent_name=args.agent,
+            num_dataset_frames=num_frames,
+            max_episodes=args.eval_max_episodes,
+        )
+        print(
+            f"[EVAL] eval_config: {eval_plan.num_episodes} episodes, "
+            f"frames_per_episode={eval_plan.frames_per_episode}, "
+            f"goal_xy_mse_threshold={eval_plan.goal_xy_mse_threshold}"
+        )
+        s_idx, g_idx = eval_plan.pairs[0]
+    else:
+        g_idx = int(np.clip(args.goal_frame_index, 0, num_frames - 1))
+        s_idx = int(np.clip(args.start_frame_index, 0, num_frames - 1))
+        if g_idx != args.goal_frame_index or s_idx != args.start_frame_index:
+            print(
+                f"[WARN] Clamped goal_frame_index={args.goal_frame_index}->{g_idx}, "
+                f"start_frame_index={args.start_frame_index}->{s_idx} (num_frames={num_frames})"
+            )
 
-    goal_xy = _get_xy_from_dataset(dataset, g_idx)
-    start_xy = _get_xy_from_dataset(dataset, s_idx)
-    start_yaw_deg = _get_yaw_deg_from_dataset(dataset, s_idx)
+    def build_goal_state(start_i: int, goal_i: int):
+        goal_stacked, gi_obs = build_goal_stack_uint8(
+            frames,
+            goal_i,
+            num_frames=num_frames,
+            obs_h=obs_h,
+            obs_w=obs_w,
+            frame_stack_k=frame_stack_k,
+        )
+        g_xy = get_xy_from_dataset(dataset, goal_i)
+        st_xy = get_xy_from_dataset(dataset, start_i)
+        st_yaw = get_yaw_deg_from_dataset(dataset, start_i)
+        return goal_stacked, gi_obs, g_xy, st_xy, st_yaw
+
+    goal_stacked, gi_obs, goal_xy, start_xy, start_yaw_deg = build_goal_state(s_idx, g_idx)
+
     if start_xy is not None:
         print(f"[DATA] start_frame_index={s_idx} -> start_xy={start_xy}, start_yaw_deg={start_yaw_deg}")
     else:
         print(f"[DATA] start_frame_index={s_idx} -> no position key found; client will use random spawn")
     print(f"[DATA] goal_frame_index={g_idx} -> goal_xy={goal_xy}")
 
-    # Load goal for header (use first frame for display)
-    goal_fixed_header = gi_obs  # uint8 (H,W,3) for header display only
-
     print("Goal loaded")
+
     # ---- Socket setup ----
     server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     server_sock.bind((args.host, args.port))
     server_sock.listen(1)
     print(f"Listening on {args.host}:{args.port}...")
-    conn, addr = server_sock.accept()
-    print(f"Connection established with client: {addr}")
 
-    # send one-time header: goal image + (x,y), but using ONLY plain Python
-    # types (no numpy objects) to avoid pickle depending on numpy internals
-    # on the client side.
-    try:
-        gi_u8 = np.asarray(gi_obs, dtype=np.uint8)
-        header = {
-            "goal_img": {
-                "shape": list(gi_u8.shape),
-                "dtype": "uint8",
-                "data": gi_u8.reshape(-1).tolist(),
-            },
-            "goal_xy": goal_xy,
-            "start_xy": start_xy,
-            "start_yaw_deg": start_yaw_deg,
-            "start_frame_index": s_idx,
-            "goal_frame_index": g_idx,
-            "obs_h": obs_h,
-            "obs_w": obs_w,
-            "obs_c": obs_c,
-            "frame_stack": frame_stack_k,
-        }
-        send_len_pickled(conn, header)
-        print(
-            f"Sent eval header (goal img {gi_u8.shape}, goal_xy={goal_xy}, "
-            f"start_xy={start_xy}, start_yaw_deg={start_yaw_deg})"
-        )
-    except Exception as e:
-        print(f"[WARN] failed to send goal header: {e}")
-
-    # ---- Runtime buffers ----
-    HISTORY = deque(maxlen=frame_stack_k)
-    
     # Direct module access (matching your previous working pattern)
     actor_module = agent.network.model_def.modules["actor"]
     actor_params = agent.network.params["modules_actor"]
@@ -444,127 +399,226 @@ def main():
     print(f"  obs_shape={obs_shape}")
     print(f"  stacked_obs_shape={stacked_obs_shape}")
     print(f"  frame_stack={frame_stack_k}")
-    
-    # Goal must be uint8 [0,255] — same as training observations. ImpalaEncoder normalises.
-    goal_fixed = jnp.array(goal_stacked[None, ...])  # (1, H, W, 3*k) uint8
-    
-    t0 = time.perf_counter()
-    
+
+    cfg_chunk_default = int(_cfg_pick(config, "action_chunk_length", 1))
+    last_chunk_len = cfg_chunk_default
+
+    def serve_one_client(conn: socket.socket, addr):
+        nonlocal last_chunk_len, goal_stacked, gi_obs, goal_xy, start_xy, start_yaw_deg, s_idx, g_idx
+
+        if eval_plan is not None:
+            completed_episodes = 0
+            num_eps = eval_plan.num_episodes
+            pairs = eval_plan.pairs
+            s_idx, g_idx = pairs[0]
+            goal_stacked, gi_obs, goal_xy, start_xy, start_yaw_deg = build_goal_state(s_idx, g_idx)
+            goal_fixed = jnp.array(goal_stacked[None, ...])
+            HISTORY = deque(maxlen=frame_stack_k)
+            hdr = header_dict_from_pair(
+                gi_obs=gi_obs,
+                goal_xy=goal_xy,
+                start_xy=start_xy,
+                start_yaw_deg=start_yaw_deg,
+                start_frame_index=s_idx,
+                goal_frame_index=g_idx,
+                obs_h=obs_h,
+                obs_w=obs_w,
+                obs_c=obs_c,
+                frame_stack=frame_stack_k,
+                episode_index=0,
+                num_episodes=num_eps,
+                frames_per_episode=eval_plan.frames_per_episode,
+                goal_xy_mse_threshold=eval_plan.goal_xy_mse_threshold,
+            )
+        else:
+            num_eps = 1
+            completed_episodes = 0
+            goal_fixed = jnp.array(goal_stacked[None, ...])
+            HISTORY = deque(maxlen=frame_stack_k)
+            hdr = header_dict_from_pair(
+                gi_obs=gi_obs,
+                goal_xy=goal_xy,
+                start_xy=start_xy,
+                start_yaw_deg=start_yaw_deg,
+                start_frame_index=s_idx,
+                goal_frame_index=g_idx,
+                obs_h=obs_h,
+                obs_w=obs_w,
+                obs_c=obs_c,
+                frame_stack=frame_stack_k,
+                episode_index=0,
+                num_episodes=1,
+                frames_per_episode=None,
+                goal_xy_mse_threshold=None,
+            )
+
+        try:
+            send_len_pickled(conn, hdr)
+            gi_u8 = np.asarray(gi_obs, dtype=np.uint8)
+            print(
+                f"Sent eval header ep {hdr.get('episode_index')} (goal img {gi_u8.shape}, "
+                f"goal_xy={goal_xy}, start_xy={start_xy})"
+            )
+        except Exception as e:
+            print(f"[WARN] failed to send goal header: {e}")
+
+        try:
+            while True:
+                length_bytes = conn.recv(4)
+                if not length_bytes:
+                    break
+                msg_len = int.from_bytes(length_bytes, "big")
+                data = recvall(conn, msg_len, timeout=30.0)
+
+                obj = pickle.loads(data)
+
+                if isinstance(obj, dict) and obj.get("type") == "episode_end":
+                    if eval_plan is None:
+                        print("[WARN] received episode_end but --eval_config not set; ignoring.")
+                        continue
+                    completed_episodes += 1
+                    print(
+                        f"[EVAL] episode_end reason={obj.get('reason')} frames_used={obj.get('frames_used')} "
+                        f"completed={completed_episodes}/{num_eps}"
+                    )
+                    if completed_episodes >= num_eps:
+                        send_len_pickled(conn, {"type": "eval_done", "num_episodes": num_eps})
+                        print("[EVAL] sent eval_done")
+                        break
+                    s_idx, g_idx = pairs[completed_episodes]
+                    goal_stacked, gi_obs, goal_xy, start_xy, start_yaw_deg = build_goal_state(s_idx, g_idx)
+                    goal_fixed = jnp.array(goal_stacked[None, ...])
+                    HISTORY.clear()
+                    hdr = header_dict_from_pair(
+                        gi_obs=gi_obs,
+                        goal_xy=goal_xy,
+                        start_xy=start_xy,
+                        start_yaw_deg=start_yaw_deg,
+                        start_frame_index=s_idx,
+                        goal_frame_index=g_idx,
+                        obs_h=obs_h,
+                        obs_w=obs_w,
+                        obs_c=obs_c,
+                        frame_stack=frame_stack_k,
+                        episode_index=completed_episodes,
+                        num_episodes=num_eps,
+                        frames_per_episode=eval_plan.frames_per_episode,
+                        goal_xy_mse_threshold=eval_plan.goal_xy_mse_threshold,
+                    )
+                    send_len_pickled(conn, hdr)
+                    act_chunk = neutral_action_chunk(action_dim, last_chunk_len)
+                    send_action_chunk_wire(conn, act_chunk)
+                    print(
+                        f"[EVAL] next episode {completed_episodes}: start={s_idx} goal={g_idx}, "
+                        f"sent neutral chunk len={last_chunk_len}"
+                    )
+                    continue
+
+                if isinstance(obj, dict):
+                    print(f"[WARN] unexpected dict from client: {list(obj.keys())}")
+                    continue
+
+                img_arr = np.asarray(obj)
+
+                if img_arr.shape[:2] != (obs_h, obs_w):
+                    img_arr = fit_to_hw(img_arr, obs_h, obs_w)
+
+                if img_arr.dtype != np.uint8:
+                    if img_arr.max() <= 1.0:
+                        img_arr = np.clip(img_arr * 255.0, 0, 255).astype(np.uint8)
+                    else:
+                        img_arr = np.clip(img_arr, 0, 255).astype(np.uint8)
+
+                obs = jnp.array(img_arr).reshape((1, *obs_shape))
+
+                HISTORY.append(obs)
+                obs_stack = []
+                n = len(HISTORY)
+                for j in range(frame_stack_k):
+                    idx = max(0, n - frame_stack_k + j)
+                    obs_stack.append(HISTORY[idx])
+
+                obs_stacked = jnp.concatenate(obs_stack, axis=-1)
+                obs_fixed = obs_stacked.copy()
+
+                obs_mean = float(np.array(obs_fixed).mean())
+                print(f"[DEBUG step {n}] obs mean={obs_mean:.6f}")
+
+                if n == 1:
+                    print("\n[DEBUG] Input shapes and ranges (matching training format):")
+                    print(
+                        f"  obs_fixed: shape={obs_fixed.shape}, dtype={obs_fixed.dtype}, "
+                        f"range=[{obs_fixed.min():.3f}, {obs_fixed.max():.3f}]"
+                    )
+                    print(
+                        f"  goal_fixed: shape={goal_fixed.shape}, dtype={goal_fixed.dtype}, "
+                        f"range=[{goal_fixed.min():.3f}, {goal_fixed.max():.3f}]"
+                    )
+
+                variables = {"params": actor_params}
+                apply_kwargs = {
+                    "observations": obs_fixed,
+                    "goals": goal_fixed,
+                    "goal_encoded": False,
+                    "temperature": 1.0,
+                }
+
+                action_dist = actor_module.apply(variables, **apply_kwargs)
+                act = action_dist.mean()
+
+                act_np = np.array(act[0], dtype=np.float32).ravel()
+                flat = int(act_np.size)
+                if flat % action_dim != 0:
+                    raise ValueError(
+                        f"Actor output length {flat} is not divisible by action_dim={action_dim}."
+                    )
+                chunk_len_effective = flat // action_dim
+                last_chunk_len = chunk_len_effective
+                cfg_chunk = int(_cfg_pick(config, "action_chunk_length", 1))
+                if cfg_chunk != chunk_len_effective and n <= 3:
+                    print(
+                        f"[WARN] config action_chunk_length={cfg_chunk} but actor output implies "
+                        f"chunk_len={chunk_len_effective}; using output shape."
+                    )
+                act_chunk = act_np.reshape(chunk_len_effective, action_dim)
+                chunk_length = act_chunk.shape[0]
+
+                if args.n_actions is not None and chunk_length > args.n_actions:
+                    original_chunk_length = chunk_length
+                    act_chunk = act_chunk[: args.n_actions]
+                    chunk_length = args.n_actions
+                    print(
+                        f"[INFO] Using only first {chunk_length} actions from chunk "
+                        f"(model predicted {original_chunk_length} actions)"
+                    )
+
+                act_chunk[:, 0] = np.clip(act_chunk[:, 0], 0.0, 1.0)
+                act_chunk[:, 1] = np.clip(act_chunk[:, 1], -1.0, 1.0)
+                act_chunk[:, 2] = np.clip(act_chunk[:, 2], 0.0, 1.0)
+
+                send_action_chunk_wire(conn, act_chunk)
+
+        except KeyboardInterrupt:
+            print("Interrupted by User")
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
     try:
         while True:
-            # 1) receive image from client
-            length_bytes = conn.recv(4)
-            if not length_bytes:
+            conn, addr = server_sock.accept()
+            print(f"Connection established with client: {addr}")
+            serve_one_client(conn, addr)
+            if not args.accept_multiple:
                 break
-            msg_len = int.from_bytes(length_bytes, "big")
-            data = recvall(conn, msg_len, timeout=30.0)
-            t_recv = time.perf_counter()
-
-            # 2) deserialize; resize to (obs_h, obs_w, 3) to match training
-            img = pickle.loads(data)
-            img_arr = np.asarray(img)
-
-            if img_arr.shape[:2] != (obs_h, obs_w):
-                img_arr = fit_to_hw(img_arr, obs_h, obs_w)
-
-            # Ensure uint8 [0,255] — ImpalaEncoder does /255.0 internally.
-            # Training stores uint8 and passes directly; we must do the same.
-            if img_arr.dtype != np.uint8:
-                if img_arr.max() <= 1.0:
-                    img_arr = np.clip(img_arr * 255.0, 0, 255).astype(np.uint8)
-                else:
-                    img_arr = np.clip(img_arr, 0, 255).astype(np.uint8)
-
-            obs = jnp.array(img_arr).reshape((1, *obs_shape))  # (1,H,W,3) uint8
-
-            HISTORY.append(obs)
-            # Contiguous frame stack, oldest-first (matches GCDataset.get_stacked_observations).
-            # If we have fewer than k frames, repeat the oldest available.
-            obs_stack = []
-            n = len(HISTORY)
-            for j in range(frame_stack_k):
-                idx = max(0, n - frame_stack_k + j)
-                obs_stack.append(HISTORY[idx])
-
-            obs_stacked = jnp.concatenate(obs_stack, axis=-1)
-
-            # ---- match your previously working call pattern ----
-            obs_fixed = obs_stacked.copy()
-            # goal_fixed is already prepared before the loop
-
-            # DEBUG: Print observation mean to check if it's changing
-            obs_mean = float(np.array(obs_fixed).mean())
-            print(f"[DEBUG step {n}] obs mean={obs_mean:.6f}")
-
-            # DEBUG: Log input shapes and ranges to match training
-            if n == 1:  # Only log on first iteration to avoid spam
-                print(f"\n[DEBUG] Input shapes and ranges (matching training format):")
-                print(f"  obs_fixed: shape={obs_fixed.shape}, dtype={obs_fixed.dtype}, range=[{obs_fixed.min():.3f}, {obs_fixed.max():.3f}]")
-                print(f"  goal_fixed: shape={goal_fixed.shape}, dtype={goal_fixed.dtype}, range=[{goal_fixed.min():.3f}, {goal_fixed.max():.3f}]")
-
-            # 4) forward (explicit kwargs to avoid signature mismatches)
-            t_prep = time.perf_counter()
-            # Flax apply() requires variables as first positional argument
-            variables = {"params": actor_params}
-            apply_kwargs = {
-                "observations": obs_fixed,
-                "goals": goal_fixed,
-                "goal_encoded": False,
-                "temperature": 1.0,
-            }
-            
-            action_dist = actor_module.apply(variables, **apply_kwargs)
-            act = action_dist.mean()       # (1, action_dim * chunk_len) flat
-            t_fwd = time.perf_counter()
-
-            # Reshape to (chunk_len, action_dim). Prefer inferring chunk_len from output
-            # size so old checkpoints and config.json stay consistent.
-            act_np = np.array(act[0], dtype=np.float32).ravel()
-            flat = int(act_np.size)
-            if flat % action_dim != 0:
-                raise ValueError(
-                    f"Actor output length {flat} is not divisible by action_dim={action_dim}."
-                )
-            chunk_len_effective = flat // action_dim
-            cfg_chunk = int(_cfg_pick(config, "action_chunk_length", 1))
-            if cfg_chunk != chunk_len_effective and n <= 3:
-                print(
-                    f"[WARN] config action_chunk_length={cfg_chunk} but actor output implies "
-                    f"chunk_len={chunk_len_effective}; using output shape."
-                )
-            act_chunk = act_np.reshape(chunk_len_effective, action_dim)
-            chunk_length = act_chunk.shape[0]
-            
-            # Optionally use only the first N actions from the chunk
-            if args.n_actions is not None and chunk_length > args.n_actions:
-                original_chunk_length = chunk_length
-                act_chunk = act_chunk[:args.n_actions]
-                chunk_length = args.n_actions
-                print(f"[INFO] Using only first {chunk_length} actions from chunk (model predicted {original_chunk_length} actions)")
-            
-            # Ensure actions are in valid range [0,1] for throttle/brake, [-1,1] for steer
-            act_chunk[:, 0] = np.clip(act_chunk[:, 0], 0.0, 1.0)  # throttle
-            act_chunk[:, 1] = np.clip(act_chunk[:, 1], -1.0, 1.0)  # steer
-            act_chunk[:, 2] = np.clip(act_chunk[:, 2], 0.0, 1.0)  # brake
-            
-            # Send chunk: [4-byte chunk_length] + [chunk_length * 3 * float32]
-            chunk_length_bytes = chunk_length.to_bytes(4, "big")
-            action_bytes = act_chunk.flatten().tobytes()  # Flatten to (chunk_length * 3) float32s
-            print(f"Sending action chunk: shape={act_chunk.shape}, chunk_length={chunk_length}, discrete={config.get('discrete', False)}")
-            conn.sendall(chunk_length_bytes + action_bytes)
-            t_send = time.perf_counter()
-
-            # Optional perf:
-            # print(f"recv={t_recv-t0:.3f} prep={t_prep-t_recv:.3f} fwd={t_fwd-t_prep:.3f} send={t_send-t_fwd:.3f}")
-            t0 = time.perf_counter()
-
-    except KeyboardInterrupt:
-        print("Interrupted by User")
+            print("[EVAL] Waiting for next client (--accept_multiple)…")
     finally:
-        try: conn.close()
-        except Exception: pass
-        try: server_sock.close()
-        except Exception: pass
+        try:
+            server_sock.close()
+        except Exception:
+            pass
         print("Server shutdown cleanly")
 
 if __name__ == "__main__":

@@ -21,7 +21,7 @@ import numpy as np
 import wandb
 from tqdm import trange, tqdm
 
-from utils.datasets import Dataset, GCDataset
+from utils.datasets import CGCDataset, Dataset, GCDataset
 
 # =============================
 # Frame stacking (block-safe)
@@ -925,6 +925,12 @@ def main(args: argparse.Namespace) -> None:
     cfg.use_mrn_metric = args.use_mrn_metric
     if args.mrn_components is not None:
         cfg.mrn_components = args.mrn_components
+        cfg.components = args.mrn_components
+
+    if args.algorithm.upper() == 'TMD_DQC':
+        cfg.policy_chunk_size = args.action_chunk_length
+        cfg.action_chunk_length = args.action_chunk_length
+        cfg.backup_horizon = args.backup_horizon
 
     np.random.seed(args.seed)
 
@@ -985,7 +991,7 @@ def main(args: argparse.Namespace) -> None:
         pbar.update(1)
     
     # Build datasets
-    def build_gc_dataset(data: Dict) -> GCDataset | None:
+    def build_gc_dataset(data: Dict) -> GCDataset | CGCDataset | None:
         """Construct a goal-conditioned dataset from raw arrays.
 
         Important: `GCDataset` is written assuming NumPy arrays (like the original
@@ -1001,7 +1007,10 @@ def main(args: argparse.Namespace) -> None:
             actions=np.asarray(data["actions"]),
             terminals=np.asarray(data["terminals"]),
         )
-        return GCDataset(Dataset.create(**dataset_fields), cfg)
+        ds = Dataset.create(**dataset_fields)
+        if args.algorithm.upper() == 'TMD_DQC':
+            return CGCDataset(ds, cfg)
+        return GCDataset(ds, cfg)
 
     print(f"\nBuilding train dataset ({len(train_data['observations'])} frames, frame_stack={cfg.frame_stack})...", flush=True)
     t0 = time.time()
@@ -1027,7 +1036,7 @@ def main(args: argparse.Namespace) -> None:
         'config': cfg,
     }
     # TMD agent requires steps argument
-    if args.algorithm.upper() == 'TMD':
+    if args.algorithm.upper() in ('TMD', 'TMD_QC', 'TMD_DQC'):
         create_kwargs['steps'] = args.train_steps * args.epochs
     agent = agent_cls.create(**create_kwargs)
     print(f"Agent created successfully in {time.time() - agent_start:.2f}s (JIT compilation may happen on first forward pass)")
@@ -1244,6 +1253,12 @@ if __name__ == "__main__":
     parser.add_argument("--obs_c", type=int, default=3)
     parser.add_argument("--frame_offsets", nargs="*", type=int, default=None, help="e.g., --frame_offsets 0 -5 -10 -20")
     parser.add_argument("--action_chunk_length", type=int, default=1, help="Number of consecutive actions to predict (1 = no chunking)")
+    parser.add_argument(
+        "--backup_horizon",
+        type=int,
+        default=25,
+        help="Chunk critic horizon H for TMD_DQC (must be <= trajectory length; CGCDataset samples only valid starts).",
+    )
     parser.add_argument("--no_filter_intersections", action="store_true", help="Disable filtering of intersection/stationary frames")
     parser.add_argument("--use_mrn_metric", action="store_true", help="Enable MRN distance inside CRL contrastive loss")
     parser.add_argument("--mrn_components", type=int, default=None, help="Number of MRN components (requires --use_mrn_metric)")
