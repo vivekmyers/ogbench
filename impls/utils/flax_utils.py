@@ -207,3 +207,28 @@ def restore_agent(agent, restore_path, restore_epoch):
     print(f'Restored from {restore_path}')
 
     return agent
+
+
+def randomize_bc_goals_from_batch(actor_goals: Any, rng: Any, p: float) -> Any:
+    """Per batch row, with probability ``p``, replace the goal with another goal from the same batch.
+
+    Intended **only** for the BC log-likelihood term: the critic and the actor Q path should keep
+    the batch's normal goals (e.g. ``actor_goals`` / ``value_goals`` from the dataset). When ``p <= 0``,
+    callers should skip calling this to avoid extra work.
+    """
+    if p <= 0.0:
+        return actor_goals
+    leaves = jax.tree_util.tree_leaves(actor_goals)
+    if not leaves:
+        return actor_goals
+    batch_size = leaves[0].shape[0]
+    rng_perm, rng_coin = jax.random.split(rng)
+    perm = jax.random.permutation(rng_perm, batch_size)
+    shuffled = jax.tree_util.tree_map(lambda x: x[perm], actor_goals)
+    use_rand = jax.random.bernoulli(rng_coin, p, (batch_size,))
+
+    def mix(g, sh):
+        expand = use_rand.reshape(use_rand.shape + (1,) * (g.ndim - 1))
+        return jnp.where(expand, sh, g)
+
+    return jax.tree_util.tree_map(mix, actor_goals, shuffled)

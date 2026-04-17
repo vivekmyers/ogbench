@@ -7,7 +7,7 @@ import ml_collections
 import optax
 
 from utils.encoders import GCEncoder, encoder_modules
-from utils.flax_utils import ModuleDict, TrainState, nonpytree_field
+from utils.flax_utils import ModuleDict, TrainState, nonpytree_field, randomize_bc_goals_from_batch
 from utils.networks import (
     DiscreteStateActionRepresentation,
     GCActor,
@@ -77,10 +77,10 @@ class TMDAgent(flax.struct.PyTreeNode):
     def critic_loss(self, batch, grad_params):
         batch_size = batch['observations'].shape[0]
         if self.config['encoder'] is not None:
-            phi, _ = self.network.select('phi')(batch['observations'], batch['actions'], params=grad_params)
-            psi_s, _ = self.network.select('psi')(batch['observations'], params=grad_params)
-            psi_next, _ = self.network.select('psi')(batch['next_observations'], params=grad_params)
-            psi_g, _ = self.network.select('psi')(batch['value_goals'], params=grad_params)
+            phi = self.network.select('phi')(batch['observations'], batch['actions'], params=grad_params)
+            psi_s = self.network.select('psi')(batch['observations'], params=grad_params)
+            psi_next = self.network.select('psi')(batch['next_observations'], params=grad_params)
+            psi_g = self.network.select('psi')(batch['value_goals'], params=grad_params)
         else:
             phi = self.network.select('phi')(batch['observations'], batch['actions'], params=grad_params)
             psi_s = self.network.select('psi')(batch['observations'], params=grad_params)
@@ -163,19 +163,46 @@ class TMDAgent(flax.struct.PyTreeNode):
         chunk_len = int(self.config.get('action_chunk_length', 1))
         action_dim = batch['actions'].shape[-1]
 
+        rng = rng if rng is not None else self.rng
+        p_bc = float(self.config.get('bc_goal_randomize_prob', 0.0))
+        if p_bc > 0.0:
+            rng, rng_mix = jax.random.split(rng)
+            bc_goals = randomize_bc_goals_from_batch(batch['actor_goals'], rng_mix, p_bc)
+        else:
+            bc_goals = batch['actor_goals']
+
         if self.config['use_latent']:
-            psi_s, psi_g = (
-                self.network.select('psi')(batch['observations'], params=grad_params),
-                self.network.select('psi')(batch['actor_goals'], params=grad_params),
-            )
+            psi_s = self.network.select('psi')(batch['observations'], params=grad_params)
+            psi_g = self.network.select('psi')(batch['actor_goals'], params=grad_params)
+            if p_bc > 0.0:
+                psi_g_bc = self.network.select('psi')(bc_goals, params=grad_params)
             if len(psi_s.shape) == 3:
                 psi_s = jnp.mean(psi_s, axis=0)
                 psi_g = jnp.mean(psi_g, axis=0)
+                if p_bc > 0.0:
+                    psi_g_bc = jnp.mean(psi_g_bc, axis=0)
             if self.config['freeze_enc_for_actor_grad']:
-                psi_s, psi_g = jax.lax.stop_gradient(psi_s), jax.lax.stop_gradient(psi_g)
+                psi_s = jax.lax.stop_gradient(psi_s)
+                psi_g = jax.lax.stop_gradient(psi_g)
+                if p_bc > 0.0:
+                    psi_g_bc = jax.lax.stop_gradient(psi_g_bc)
             dist = self.network.select('actor')(psi_s, psi_g, params=grad_params)
+            if p_bc > 0.0:
+                # BC uses random goals: do not backprop through ψ(goal) or ψ(obs) so the TMD critic's ψ
+                # is trained only by critic_loss (and the Q branch below), not by BC under wrong goals.
+                dist_bc = self.network.select('actor')(
+                    jax.lax.stop_gradient(psi_s),
+                    jax.lax.stop_gradient(psi_g_bc),
+                    params=grad_params,
+                )
+            else:
+                dist_bc = dist
         else:
             dist = self.network.select('actor')(batch['observations'], batch['actor_goals'], params=grad_params)
+            if p_bc > 0.0:
+                dist_bc = self.network.select('actor')(batch['observations'], bc_goals, params=grad_params)
+            else:
+                dist_bc = dist
         if self.config['const_std']:
             q_flat = jnp.clip(dist.mode(), -1, 1)
         else:
@@ -196,7 +223,7 @@ class TMDAgent(flax.struct.PyTreeNode):
         q_loss = -q.mean() / jax.lax.stop_gradient(jnp.abs(q).mean() + 1e-6)
 
         if self.config['discrete']:
-            log_prob = dist.log_prob(batch['actions'])
+            log_prob = dist_bc.log_prob(batch['actions'])
             bc_loss = -(self.config['alpha'] * log_prob).mean()
             actor_loss = q_loss + bc_loss
             pred = dist.mode()
@@ -212,7 +239,7 @@ class TMDAgent(flax.struct.PyTreeNode):
             }
 
         action_targets = batch['action_chunks'].reshape(batch['action_chunks'].shape[0], -1)
-        log_prob = dist.log_prob(action_targets)
+        log_prob = dist_bc.log_prob(action_targets)
 
         bc_loss = -(self.config['alpha'] * log_prob).mean()
 
@@ -442,6 +469,7 @@ def get_config():
             actor_p_trajgoal=1.0,  # Probability of using a future state in the same trajectory as the actor goal.
             actor_p_randomgoal=0.0,  # Probability of using a random state as the actor goal.
             actor_geom_sample=False,  # Whether to use geometric sampling for future actor goals.
+            bc_goal_randomize_prob=0.0,  # Per-row prob. of in-batch shuffled goal for BC log-likelihood only.
             gc_negative=False,  # Unused (defined for compatibility with GCDataset).
             p_aug=0.0,  # Probability of applying image augmentation.
             use_iqe=False,  # Whether to use IQE distance or MRN distance

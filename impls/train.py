@@ -901,9 +901,6 @@ def main(args: argparse.Namespace) -> None:
     cfg.obs_c = args.obs_c
     cfg.block_size = args.block_size
     cfg.p_aug = 0.5
-    cfg.distance_loss_weight = 0.05
-    cfg.distance_head_hidden_dims = (256, 256)
-    cfg.upsample_mode = 'turns_high'
     cfg.upsample_weight = 3.0
     cfg.steer_thresh = 0.05
     cfg.throttle_thresh = 0.3
@@ -931,6 +928,9 @@ def main(args: argparse.Namespace) -> None:
         cfg.policy_chunk_size = args.action_chunk_length
         cfg.action_chunk_length = args.action_chunk_length
         cfg.backup_horizon = args.backup_horizon
+
+    if args.algorithm.upper() in ('TMD', 'TMD_QC', 'TMD_DQC'):
+        cfg.bc_goal_randomize_prob = float(args.bc_goal_randomize_prob)
 
     np.random.seed(args.seed)
 
@@ -1037,7 +1037,7 @@ def main(args: argparse.Namespace) -> None:
     }
     # TMD agent requires steps argument
     if args.algorithm.upper() in ('TMD', 'TMD_QC', 'TMD_DQC'):
-        create_kwargs['steps'] = args.train_steps * args.epochs
+        create_kwargs['steps'] = args.steps * args.epochs
     agent = agent_cls.create(**create_kwargs)
     print(f"Agent created successfully in {time.time() - agent_start:.2f}s (JIT compilation may happen on first forward pass)")
     
@@ -1069,8 +1069,8 @@ def main(args: argparse.Namespace) -> None:
 
     for epoch in range(args.epochs):
         print(f"\nStarting epoch {epoch + 1}/{args.epochs}")
-        progress = trange(args.train_steps, dynamic_ncols=True)
-        for step in range(args.train_steps):
+        progress = trange(args.steps, dynamic_ncols=True)
+        for step in range(args.steps):
             total_steps += 1
             t_progress_start = time.time()
             progress.update(1)
@@ -1229,7 +1229,7 @@ def main(args: argparse.Namespace) -> None:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="CRL/GCBC offline training (clean CPU-bypass design)")
     parser.add_argument("--dataset_path", type=str, required=True, help="Path to .npz offline dataset")
-    parser.add_argument("--train_steps", type=int, default=800_000, help="Total gradient steps")
+    parser.add_argument("--steps", type=int, default=800_000, help="Total gradient steps")
     parser.add_argument("--epochs", type=int, default=2, help="Number of epochs to train")
     parser.add_argument("--batch_size", type=int, default=256)
     parser.add_argument("--actor_loss", choices=["awr", "ddpgbc"], default="ddpgbc")
@@ -1248,8 +1248,8 @@ if __name__ == "__main__":
     parser.add_argument("--chunk_size", type=int, default=50000, help="Process dataset in chunks of ~this many frames (trajectories are kept intact, not split)")
     parser.add_argument("--use_mmap", action="store_true", help="Use memory-mapped file loading (saves RAM but may be slower)")
     parser.add_argument("--val_every", type=int, default=500)
-    parser.add_argument("--obs_h", type=int, default=100)
-    parser.add_argument("--obs_w", type=int, default=100)
+    parser.add_argument("--obs_h", type=int, default=64)
+    parser.add_argument("--obs_w", type=int, default=64)
     parser.add_argument("--obs_c", type=int, default=3)
     parser.add_argument("--frame_offsets", nargs="*", type=int, default=None, help="e.g., --frame_offsets 0 -5 -10 -20")
     parser.add_argument("--action_chunk_length", type=int, default=1, help="Number of consecutive actions to predict (1 = no chunking)")
@@ -1258,6 +1258,12 @@ if __name__ == "__main__":
         type=int,
         default=25,
         help="Chunk critic horizon H for TMD_DQC (must be <= trajectory length; CGCDataset samples only valid starts).",
+    )
+    parser.add_argument(
+        "--bc_goal_randomize_prob",
+        type=float,
+        default=1.0,
+        help="TMD / TMD_QC / TMD_DQC only: per-batch-row probability of replacing the goal with another goal from the same batch for the BC log-likelihood only (critic and Q path unchanged).",
     )
     parser.add_argument("--no_filter_intersections", action="store_true", help="Disable filtering of intersection/stationary frames")
     parser.add_argument("--use_mrn_metric", action="store_true", help="Enable MRN distance inside CRL contrastive loss")
