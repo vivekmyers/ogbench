@@ -13,6 +13,9 @@ from utils.networks import (
     GCActor,
     GCDiscreteActor,
     StateRepresentation,
+    actor_action_stack_kwargs_from_batch,
+    actor_action_stack_kwargs_from_value,
+    build_gc_actor_init,
 )
 
 
@@ -87,7 +90,10 @@ class CMDAgent(flax.struct.PyTreeNode):
     def actor_loss(self, batch, grad_params, rng=None):
         # Maximize log Q if actor_log_q is True (which is default).
 
-        dist = self.network.select('actor')(batch['observations'], batch['actor_goals'], params=grad_params)
+        akw = actor_action_stack_kwargs_from_batch(self.config, batch)
+        dist = self.network.select('actor')(
+            batch['observations'], batch['actor_goals'], params=grad_params, **akw
+        )
         if self.config['const_std']:
             q_actions = jnp.clip(dist.mode(), -1, 1)
         else:
@@ -155,9 +161,11 @@ class CMDAgent(flax.struct.PyTreeNode):
         observations,
         goals=None,
         seed=None,
+        action_stack=None,
         temperature=1.0,
     ):
-        dist = self.network.select('actor')(observations, goals, temperature=temperature)
+        akw = actor_action_stack_kwargs_from_value(self.config, action_stack)
+        dist = self.network.select('actor')(observations, goals, temperature=temperature, **akw)
         actions = dist.sample(seed=seed)
         if not self.config['discrete']:
             actions = jnp.clip(actions, -1, 1)
@@ -170,6 +178,7 @@ class CMDAgent(flax.struct.PyTreeNode):
         ex_observations,
         ex_actions,
         config,
+        ex_action_stack=None,
     ):
         rng = jax.random.PRNGKey(seed)
         rng, init_rng = jax.random.split(rng, 2)
@@ -220,7 +229,7 @@ class CMDAgent(flax.struct.PyTreeNode):
             )
 
         network_info = dict(
-            actor=(actor_def, (ex_observations, ex_goals)),
+            actor=(actor_def, build_gc_actor_init(ex_observations, ex_goals, ex_action_stack)),
             critic=(critic_def, (ex_observations, ex_actions)),
         )
         networks = {k: v[0] for k, v in network_info.items()}

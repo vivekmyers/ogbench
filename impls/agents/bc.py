@@ -9,7 +9,14 @@ import numpy as np
 
 from utils.encoders import encoder_modules
 from utils.flax_utils import ModuleDict, TrainState, nonpytree_field
-from utils.networks import GCActor, GCDiscreteActor, MLP
+from utils.networks import (
+    GCActor,
+    GCDiscreteActor,
+    MLP,
+    actor_action_stack_kwargs_from_batch,
+    actor_action_stack_kwargs_from_value,
+    build_gc_actor_init,
+)
 
 
 class BCAgent(flax.struct.PyTreeNode):
@@ -21,7 +28,12 @@ class BCAgent(flax.struct.PyTreeNode):
 
     def actor_loss(self, batch, grad_params, rng=None):
         """Simple BC loss - just maximize log probability of expert actions."""
-        dist = self.network.select('actor')(batch['observations'], goals=None, params=grad_params)
+        dist = self.network.select('actor')(
+            batch['observations'],
+            goals=None,
+            params=grad_params,
+            **actor_action_stack_kwargs_from_batch(self.config, batch),
+        )
         log_prob = dist.log_prob(batch['actions'])
 
         actor_loss = -log_prob.mean()
@@ -72,10 +84,12 @@ class BCAgent(flax.struct.PyTreeNode):
         observations,
         goals=None,  # Ignored for BC
         seed=None,
+        action_stack=None,
         temperature=1.0,
     ):
         """Sample actions from the actor."""
-        dist = self.network.select('actor')(observations, goals=None, temperature=temperature)
+        akw = actor_action_stack_kwargs_from_value(self.config, action_stack)
+        dist = self.network.select('actor')(observations, goals=None, temperature=temperature, **akw)
         actions = dist.sample(seed=seed)
         if not self.config['discrete']:
             actions = jnp.clip(actions, -1, 1)
@@ -88,6 +102,7 @@ class BCAgent(flax.struct.PyTreeNode):
         ex_observations,
         ex_actions,
         config,
+        ex_action_stack=None,
     ):
         rng = jax.random.PRNGKey(seed)
         rng, init_rng = jax.random.split(rng, 2)
@@ -139,7 +154,7 @@ class BCAgent(flax.struct.PyTreeNode):
 
         # Initialize with observations only (goals=None)
         network_info = dict(
-            actor=(actor_def, (ex_observations, None)),  # Pass None for goals
+            actor=(actor_def, build_gc_actor_init(ex_observations, None, ex_action_stack)),
         )
         networks = {k: v[0] for k, v in network_info.items()}
         network_args = {k: v[1] for k, v in network_info.items()}

@@ -125,18 +125,210 @@ class GCDataset:
             self.config['actor_p_curgoal'] + self.config['actor_p_trajgoal'] + self.config['actor_p_randomgoal'], 1.0
         )
 
+        # --- Random frame-stack offsets (causal-confusion mitigation) ---
+        # Single knob: `frame_stack_window`. Default == `frame_stack` -> canonical
+        # consecutive K-frame stack (existing behaviour, bit-identical revert by
+        # setting window == K). Set strictly greater than K to enable per-batch
+        # random sampling: K-1 distinct offsets drawn uniformly from [1, W-1] +
+        # offset 0 (current frame), sorted oldest-first along the channel axis to
+        # match `_preprocess_frame_stack` and `get_stacked_observations`.
+        # Validation (`evaluation=True`) and goals always use the canonical stack.
+        #
+        # Performance note: even with random stacking on, we ALWAYS pre-stack so
+        # canonical sources (goals, eval, chunk_next when not random) stay at
+        # one-fancy-index-per-gather. The random path reads a zero-copy view of
+        # the per-step "current" frame embedded in the pre-stacked array's last C
+        # channels (`_raw_obs_view` below), so we get random offsets without
+        # paying a separate raw-array allocation.
+        if self.config.get('frame_stack') is not None:
+            K = int(self.config['frame_stack'])
+            W_cfg = self.config.get('frame_stack_window')
+            W = int(W_cfg) if W_cfg else K
+            if W < K:
+                raise ValueError(
+                    f"frame_stack_window ({W}) must be >= frame_stack ({K})."
+                )
+            self._frame_stack_window = W
+            # Fixed custom offsets (e.g. (0, -20)) imply the user has already
+            # committed to a specific spacing; skip random stacking so every
+            # gather stays on the single-fancy-index pre-stacked fast path.
+            custom_offsets = self.config.get('frame_offsets')
+            self._frame_stack_random = (W > K) and (custom_offsets is None)
+        else:
+            self._frame_stack_window = 1
+            self._frame_stack_random = False
+
+        # Stash the raw obs reference *before* we overwrite the dataset with the
+        # pre-stacked version. We only need it for shape introspection; the
+        # actual random-stack reads use a view of the pre-stacked array (see
+        # `_raw_obs_view`) to avoid double-storing.
+        self._raw_obs_view = None
+        # Single-frame observation buffer (H,W,C) retained only when we must
+        # build actor_goals with a *different* temporal pattern than the
+        # pre-stacked training observations (see ``goal_frame_stack``).
+        self._raw_obs_single_frame = None
         if self.config['frame_stack'] is not None:
             assert 'next_observations' not in self.dataset
             if self.preprocess_frame_stack:
+                K = int(self.config['frame_stack'])
+                raw_obs = self.dataset['observations']
+                if self._needs_separate_goal_temporal_stack():
+                    self._raw_obs_single_frame = raw_obs
                 stacked_observations = self._preprocess_frame_stack()
                 self.dataset = Dataset(self.dataset.copy(dict(observations=stacked_observations)))
+                # Last C channels of the pre-stacked frame == the current raw frame
+                # at that index (oldest-first channel order). View, not copy.
+                if isinstance(stacked_observations, np.ndarray) and stacked_observations.ndim >= 4:
+                    C = int(raw_obs.shape[-1])
+                    self._raw_obs_view = stacked_observations.reshape(
+                        stacked_observations.shape[0],
+                        *stacked_observations.shape[1:-1],
+                        K, C,
+                    )[..., -1, :]
+
+        elif self._needs_separate_goal_temporal_stack():
+            # Observations are left as raw (H,W,C) on disk; we still need the same
+            # buffer for per-goal-index temporal gathers.
+            self._raw_obs_single_frame = self.dataset['observations']
 
         self._sampling_weights = self._build_sampling_weights()
 
+        gk, go = self._resolved_goal_stack_spec()
+        if gk is not None:
+            print(
+                f"[GCDataset] actor goal stack: K={gk} offsets={go} "
+                f"({'raw temporal gather (extra RAM)' if self._needs_separate_goal_temporal_stack() else 'fast path = same as observations'})"
+            )
+
+    @staticmethod
+    def _normalize_frame_offsets(k: int, offsets) -> tuple[int, ...]:
+        """Return offsets sorted oldest-first (non-positive, includes 0)."""
+        if offsets is not None:
+            fo = tuple(int(x) for x in offsets)
+            if len(fo) != k:
+                raise ValueError(f"frame_offsets has {len(fo)} entries but stack depth is k={k}.")
+            if any(o > 0 for o in fo):
+                raise ValueError(f"frame_offsets must all be <= 0, got {fo}.")
+            if 0 not in fo:
+                raise ValueError(f"frame_offsets must include 0 (current frame), got {fo}.")
+            return tuple(sorted(fo))
+        if k == 1:
+            return (0,)
+        return tuple(range(-(k - 1), 1))
+
+    def _resolved_obs_stack_spec(self) -> tuple[int | None, tuple[int, ...] | None]:
+        k = self.config.get('frame_stack')
+        if k is None:
+            return None, None
+        k = int(k)
+        fo = self.config.get('frame_offsets')
+        return k, self._normalize_frame_offsets(k, fo)
+
+    def _resolved_goal_stack_spec(self) -> tuple[int | None, tuple[int, ...] | None]:
+        """Explicit ``goal_*`` overrides obs stacking; omitting both mirrors obs (train.py default)."""
+        gk_raw = self.config.get('goal_frame_stack')
+        go_raw = self.config.get('goal_frame_offsets')
+        if gk_raw is None and go_raw is None:
+            # Legacy checkpoints / hand configs with no goal_* keys behave like train defaults:
+            # same temporal pattern as observations.
+            return self._resolved_obs_stack_spec()
+        if gk_raw is None:
+            raise ValueError(
+                "goal_frame_offsets is set but goal_frame_stack is missing; "
+                "set goal_frame_stack or omit both keys to mirror observations."
+            )
+        gk = int(gk_raw)
+        return gk, self._normalize_frame_offsets(gk, go_raw)
+
+    def _needs_separate_goal_temporal_stack(self) -> bool:
+        """True iff actor goals must be gathered from raw frames (not the pre-stacked tensor)."""
+        gk, go = self._resolved_goal_stack_spec()
+        if gk is None:
+            return False
+        ok, oo = self._resolved_obs_stack_spec()
+        return (gk, go) != (ok, oo)
+
+    def _goal_stack_raw_buffer(self) -> np.ndarray:
+        """(N,H,W,C) single-frame observations used to build temporal goal stacks."""
+        if getattr(self, '_raw_obs_single_frame', None) is not None:
+            return self._raw_obs_single_frame
+        obs = self.dataset['observations']
+        c = int(self.config.get('obs_c', obs.shape[-1]))
+        if obs.shape[-1] == c:
+            return obs
+        raise RuntimeError(
+            "goal_frame_stack requires raw (H,W,C) observations, but the dataset "
+            "observations look pre-stacked (last dim != obs_c). "
+            "This is an internal error: file a bug with your frame_stack / goal_frame_stack config."
+        )
+
+    def _gather_goal_temporal_stack(self, goal_idxs: np.ndarray) -> np.ndarray:
+        """Stack ``goal_frame_stack`` raw frames around each goal index (trajectory-clamped)."""
+        _, go = self._resolved_goal_stack_spec()
+        assert go is not None
+        raw = self._goal_stack_raw_buffer()
+        # Same lag order as ``_preprocess_frame_stack`` / ``get_stacked_observations``:
+        # oldest frame first along the channel axis.
+        lags = tuple(sorted((-int(o) for o in go), reverse=True))
+        b = len(goal_idxs)
+        inits = self.idx_to_initial[goal_idxs]
+        parts = []
+        for lag in lags:
+            cur = np.maximum(goal_idxs - lag, inits)
+            parts.append(raw[cur])
+        return np.concatenate(parts, axis=-1)
+
+    def _compute_speed_from_position(self) -> np.ndarray | None:
+        """Per-frame ego speed (m/s) derived from `position`, clipped at traj boundaries.
+
+        Uses XY-plane finite differences only (Z is noisy on bumps/spawn). Speed at
+        a trajectory's terminal frame is copied from the previous step so every
+        index has a valid value.
+        """
+        if 'position' not in self.dataset._dict:
+            return None
+        pos = np.asarray(self.dataset['position'], dtype=np.float64)
+        if pos.ndim != 2 or pos.shape[0] != self.size or pos.shape[1] < 2:
+            return None
+
+        fps = float(self.config.get('lb_train_fps', 10.0))
+        dx = np.zeros(self.size, dtype=np.float64)
+        dy = np.zeros(self.size, dtype=np.float64)
+        dx[:-1] = pos[1:, 0] - pos[:-1, 0]
+        dy[:-1] = pos[1:, 1] - pos[:-1, 1]
+        speed = np.sqrt(dx * dx + dy * dy) * fps
+
+        for start, end in zip(self.initial_locs, self.terminal_locs):
+            s, e = int(start), int(end)
+            if e > s:
+                speed[e] = speed[e - 1]
+            else:
+                speed[e] = 0.0
+        return speed
+
     def _build_sampling_weights(self):
-        """Precompute per-frame sampling weights for action upsampling."""
+        """Precompute per-frame sampling weights for action upsampling.
+
+        Two independent knobs:
+          1. ``upsample_mode``: a single categorical mode that selects a set of
+             "target" frames and boosts them by ``upsample_weight`` (legacy).
+          2. ``longitudinal_balance``: when True, applies *multiplicative*
+             longitudinal re-weighting on top of (1) to rebalance
+             throttle/brake ambiguity. Uses speed derived from ``position``:
+             - stopped_with_brake (speed<lb_stopped_speed & brake>lb_brake_high)
+               → weight ×lb_w_stopped_brake (downsample, e.g. 0.07)
+             - accelerating_from_stop (speed<lb_accel_speed & throttle>lb_thr_hi
+               & brake<lb_brake_low) → weight ×lb_w_accel_from_stop (e.g. 8x)
+             - mixed_longitudinal (throttle>lb_mix_thr & brake>lb_mix_brk)
+               → weight ×lb_w_mixed (downsample)
+             - decisive_decel (brake>lb_brake_high & speed>lb_decel_speed)
+               → weight ×lb_w_decisive_decel (upsample modestly)
+        """
         mode = self.config.get('upsample_mode', 'none')
-        if mode == 'none' or 'actions' not in self.dataset._dict:
+        lb_on = bool(self.config.get('longitudinal_balance', False))
+        if 'actions' not in self.dataset._dict:
+            return None
+        if mode == 'none' and not lb_on:
             return None
 
         actions = self.dataset['actions']
@@ -148,9 +340,37 @@ class GCDataset:
         throttle_thresh = self.config.get('throttle_thresh', 0.3)
         brake_thresh = self.config.get('brake_thresh', 0.1)
         w = float(self.config.get('upsample_weight', 3.0))
+        approach_h = int(self.config.get('turn_approach_horizon', 0) or 0)
 
+        is_target = None
         if mode == 'turns_high':
             is_target = np.abs(steer) > steer_thresh
+        elif mode == 'turns_high_approach':
+            # Upsample frames with strong steering AND the H frames around them
+            # (before + after; trajectory-clamped). This biases sampling toward
+            # the throttle/brake setup and recovery around a turn, not just the
+            # high-curvature frames themselves.
+            turn = np.abs(steer) > steer_thresh
+            if approach_h <= 0:
+                is_target = turn
+            else:
+                is_target = turn.copy()
+                # For each trajectory, mark frames within H steps of any turn
+                # frame. We do this with a backward scan (distance to next turn)
+                # and a forward scan (distance to previous turn), then OR.
+                for start, end in zip(self.initial_locs, self.terminal_locs):
+                    sl = slice(int(start), int(end) + 1)
+                    dist = approach_h + 1  # >H means "not in window"
+                    for i in range(int(end), int(start) - 1, -1):
+                        dist = 0 if turn[i] else (dist + 1)
+                        if dist <= approach_h:
+                            is_target[i] = True
+
+                    dist = approach_h + 1
+                    for i in range(int(start), int(end) + 1):
+                        dist = 0 if turn[i] else (dist + 1)
+                        if dist <= approach_h:
+                            is_target[i] = True
         elif mode == 'turns_low':
             is_target = np.abs(steer) < steer_thresh
         elif mode == 'throttle_high':
@@ -161,17 +381,93 @@ class GCDataset:
             is_target = brake > brake_thresh
         elif mode == 'brake_low':
             is_target = brake < brake_thresh
-        else:
+        elif mode != 'none':
             return None
 
-        weights = np.where(is_target, w, 1.0).astype(np.float64)
-        weights /= weights.sum()
-        n_target = int(np.sum(is_target))
-        print(
-            f"[GCDataset] upsample_mode={mode}: {n_target}/{self.size} "
-            f"({100.0 * n_target / self.size:.1f}%) frames get weight {w}x"
-        )
+        # Base weights from mode (uniform if mode == 'none').
+        if is_target is None:
+            weights = np.ones(self.size, dtype=np.float64)
+        else:
+            weights = np.where(is_target, w, 1.0).astype(np.float64)
+            n_target = int(np.sum(is_target))
+            print(
+                f"[GCDataset] upsample_mode={mode}: {n_target}/{self.size} "
+                f"({100.0 * n_target / self.size:.1f}%) frames get weight {w}x"
+            )
+
+        # Multiplicative longitudinal rebalancing on top of base.
+        if lb_on:
+            speed = self._compute_speed_from_position()
+            if speed is None:
+                print(
+                    "[GCDataset] longitudinal_balance=True but 'position' is "
+                    "missing from the dataset; skipping longitudinal re-weighting."
+                )
+            else:
+                stopped_speed = float(self.config.get('lb_stopped_speed_thresh', 0.5))
+                accel_speed = float(self.config.get('lb_accel_speed_thresh', 2.0))
+                decel_speed = float(self.config.get('lb_decel_speed_thresh', 2.0))
+                brake_high = float(self.config.get('lb_brake_high', 0.3))
+                brake_low = float(self.config.get('lb_brake_low', 0.05))
+                throttle_high = float(self.config.get('lb_throttle_high', 0.2))
+                mix_thr_lo = float(self.config.get('lb_mixed_thr_lo', 0.05))
+                mix_brk_lo = float(self.config.get('lb_mixed_brk_lo', 0.05))
+
+                w_stopped_brake = float(self.config.get('lb_w_stopped_brake', 0.07))
+                w_accel_from_stop = float(self.config.get('lb_w_accel_from_stop', 8.0))
+                w_mixed = float(self.config.get('lb_w_mixed', 0.1))
+                w_decisive_decel = float(self.config.get('lb_w_decisive_decel', 2.5))
+
+                stopped_brake_mask = (speed < stopped_speed) & (brake > brake_high)
+                accel_from_stop_mask = (
+                    (speed < accel_speed) & (throttle > throttle_high) & (brake < brake_low)
+                )
+                mixed_mask = (throttle > mix_thr_lo) & (brake > mix_brk_lo)
+                decisive_decel_mask = (brake > brake_high) & (speed > decel_speed)
+
+                weights = np.where(stopped_brake_mask, weights * w_stopped_brake, weights)
+                weights = np.where(accel_from_stop_mask, weights * w_accel_from_stop, weights)
+                weights = np.where(mixed_mask, weights * w_mixed, weights)
+                weights = np.where(decisive_decel_mask, weights * w_decisive_decel, weights)
+
+                n_stop = int(np.sum(stopped_brake_mask))
+                n_accel = int(np.sum(accel_from_stop_mask))
+                n_mix = int(np.sum(mixed_mask))
+                n_dec = int(np.sum(decisive_decel_mask))
+                pct = lambda n: 100.0 * n / max(self.size, 1)
+                print(
+                    f"[GCDataset] longitudinal_balance: "
+                    f"stopped_with_brake={n_stop} ({pct(n_stop):.1f}%, ×{w_stopped_brake}); "
+                    f"accel_from_stop={n_accel} ({pct(n_accel):.1f}%, ×{w_accel_from_stop}); "
+                    f"mixed={n_mix} ({pct(n_mix):.1f}%, ×{w_mixed}); "
+                    f"decisive_decel={n_dec} ({pct(n_dec):.1f}%, ×{w_decisive_decel}). "
+                    f"speed: median={np.median(speed):.2f} m/s, "
+                    f"p95={np.percentile(speed, 95):.2f} m/s, "
+                    f"frac(speed<{stopped_speed})={np.mean(speed < stopped_speed):.2f}"
+                )
+
+        total = weights.sum()
+        if total <= 0 or not np.isfinite(total):
+            print("[GCDataset] sampling weights collapsed to zero; falling back to uniform.")
+            return None
+        weights /= total
         return weights
+
+    def _action_stack_len(self) -> int:
+        return int(self.config.get("action_stack_length", 1) or 1)
+
+    def _gather_past_action_stack(self, idxs: np.ndarray, stack_len: int) -> np.ndarray:
+        """Past ``stack_len`` actions before time ``idxs`` (oldest first), trajectory-clamped.
+
+        Indices use ``[a_{t-L}, ..., a_{t-1}]`` with padding at segment starts by repeating
+        the earliest available action in-segment (same convention as early-frame obs stacks).
+        """
+        initial = self.idx_to_initial[idxs]  # (B,)
+        j = np.arange(stack_len, dtype=np.int64)[None, :]  # (1, L)
+        raw = idxs[:, None] - stack_len + j  # (B, L) -> t-L ... t-1
+        past_upper = np.maximum(idxs - 1, initial)
+        src = np.clip(raw, initial[:, None], past_upper[:, None])
+        return self.dataset["actions"][src]
 
     def sample(self, batch_size, idxs=None, evaluation=False):
         if idxs is None:
@@ -180,40 +476,83 @@ class GCDataset:
             else:
                 idxs = self.dataset.get_random_idxs(batch_size)
 
-        batch = self.dataset.sample(batch_size, idxs)
-        if self.config['frame_stack'] is not None:
-            batch['observations'] = self.get_observations(idxs)
-            next_idxs = np.minimum(idxs + 1, self.size - 1)
-            batch['next_observations'] = self.get_observations(next_idxs)
+        # Per-agent batch-key pruning: pure BC (e.g. GCBC) only needs
+        # `observations`, `actor_goals`, `actions`, `action_chunks`. Skipping
+        # the unused gathers (`next_observations`, `value_goals`,
+        # `chunk_next_observations`) cuts gather work by ~half on BC-only runs.
+        # `cfg.minimal_batch=True` opts in. Default stays full so other agents
+        # (CRL, TMD*, GCIQL, ...) keep getting everything they need.
+        minimal = bool(self.config.get('minimal_batch', False))
 
-        value_goal_idxs = self.sample_goals(
-            idxs,
-            self.config['value_p_curgoal'],
-            self.config['value_p_trajgoal'],
-            self.config['value_p_randomgoal'],
-            self.config['value_geom_sample'],
-        )
-        actor_goal_idxs = self.sample_goals(
+        batch = self.dataset.sample(batch_size, idxs)
+        final_state_idxs = self.idx_to_terminal[idxs]
+
+        # Dataset.get_subset auto-fills next_observations from raw obs; for the
+        # minimal-batch path (BC) we drop it so the contract stays "this key is
+        # never present" and downstream code can't silently read stale frames.
+        if minimal:
+            batch.pop('next_observations', None)
+
+        if self.config['frame_stack'] is not None:
+            # Random offsets are applied to OBS-LIKE sources (current state and
+            # any future-state inputs the encoder sees). Goals stay canonical
+            # because (a) the goal image is meant to look like a clean target,
+            # not a regularised input, and (b) at eval the goal is fed as a
+            # canonical stack regardless of fps.
+            batch['observations'] = self.get_observations(idxs, evaluation=evaluation)
+            if not minimal:
+                next_idxs = np.minimum(idxs + 1, self.size - 1)
+                batch['next_observations'] = self.get_observations(next_idxs, evaluation=evaluation)
+
+        actor_goal_idxs, actor_goal_sources = self.sample_goals(
             idxs,
             self.config['actor_p_curgoal'],
             self.config['actor_p_trajgoal'],
             self.config['actor_p_randomgoal'],
             self.config['actor_geom_sample'],
+            return_sources=True,
         )
+        # Only surface source tags on validation batches: they're only consumed
+        # by the hard-val-frames logger, and adding extra int8 keys to training
+        # batches would trigger jit recompiles / pytree shape changes.
+        if evaluation:
+            batch['actor_goal_sources'] = actor_goal_sources
 
-        # --- FIX 2: Batch observation gathering ---
-        # Single indexing pass for all goal observations instead of separate tree_maps
-        all_goal_idxs = np.stack([value_goal_idxs, actor_goal_idxs])  # (2, batch_size)
-        all_goals = self._batch_get_observations(all_goal_idxs)
-        batch['value_goals'] = jax.tree_util.tree_map(lambda x: x[0], all_goals)
-        batch['actor_goals'] = jax.tree_util.tree_map(lambda x: x[1], all_goals)
+        if minimal:
+            # Single fancy index for the actor-only goal source.
+            if self._needs_separate_goal_temporal_stack():
+                batch['actor_goals'] = self._gather_goal_temporal_stack(actor_goal_idxs)
+            else:
+                all_goals = self._batch_get_observations(
+                    actor_goal_idxs[None, :], evaluation=evaluation, randomize=False,
+                )
+                batch['actor_goals'] = jax.tree_util.tree_map(lambda x: x[0], all_goals)
+            # Reward / mask plumbing still expected by the train loop.
+            successes = np.zeros(len(idxs), dtype=np.float32)
+        else:
+            value_goal_idxs = self.sample_goals(
+                idxs,
+                self.config['value_p_curgoal'],
+                self.config['value_p_trajgoal'],
+                self.config['value_p_randomgoal'],
+                self.config['value_geom_sample'],
+            )
+            # --- FIX 2: Batch observation gathering ---
+            # Single indexing pass for all goal observations instead of separate tree_maps.
+            # Goals always use canonical stacking (randomize=False).
+            all_goal_idxs = np.stack([value_goal_idxs, actor_goal_idxs])  # (2, batch_size)
+            all_goals = self._batch_get_observations(all_goal_idxs, evaluation=evaluation, randomize=False)
+            batch['value_goals'] = jax.tree_util.tree_map(lambda x: x[0], all_goals)
+            if self._needs_separate_goal_temporal_stack():
+                batch['actor_goals'] = self._gather_goal_temporal_stack(actor_goal_idxs)
+            else:
+                batch['actor_goals'] = jax.tree_util.tree_map(lambda x: x[1], all_goals)
+            successes = (idxs == value_goal_idxs).astype(np.float32)
 
-        successes = (idxs == value_goal_idxs).astype(np.float32)
         batch['masks'] = 1.0 - successes
         batch['rewards'] = successes - (1.0 if self.config['gc_negative'] else 0.0)
 
         chunk_len = self.config.get('action_chunk_length', 1)
-        final_state_idxs = self.idx_to_terminal[idxs]
         if chunk_len > 1:
             offsets = np.arange(chunk_len)
             chunk_idxs = idxs[:, None] + offsets[None, :]
@@ -222,35 +561,63 @@ class GCDataset:
         else:
             batch['action_chunks'] = batch['actions'][:, None, :]  # (B, 1, action_dim)
 
-        # State after executing the first K actions (for K-step / Q-chunk critics).
-        chunk_next_idxs = np.minimum(idxs + chunk_len, final_state_idxs)
-        batch['chunk_next_observations'] = self.get_observations(chunk_next_idxs)
+        L_as = self._action_stack_len()
+        if L_as > 1:
+            batch['action_stack'] = self._gather_past_action_stack(idxs, L_as)
+
+        if not minimal:
+            # State after executing the first K actions (for K-step / Q-chunk critics).
+            chunk_next_idxs = np.minimum(idxs + chunk_len, final_state_idxs)
+            batch['chunk_next_observations'] = self.get_observations(chunk_next_idxs, evaluation=evaluation)
 
         if self.config['p_aug'] is not None and not evaluation:
             if np.random.rand() < self.config['p_aug']:
-                aug_keys = ['observations', 'next_observations', 'value_goals', 'actor_goals', 'chunk_next_observations']
+                aug_keys = ['observations', 'actor_goals']
+                if not minimal:
+                    aug_keys.extend(['next_observations', 'value_goals', 'chunk_next_observations'])
                 self.augment(batch, aug_keys)
+
+        if not evaluation:
+            self.apply_action_noise(batch)
 
         return batch
 
-    def _batch_get_observations(self, idx_sets):
+    def _batch_get_observations(self, idx_sets, evaluation=False, randomize=False):
         """Gather observations for multiple index arrays in one pass.
 
         Args:
             idx_sets: (num_sets, batch_size) array of indices.
+            evaluation: if True, never apply random offsets (validation /
+                eval-time should always see the canonical stack).
+            randomize: if True (and random stacking is enabled in config and
+                ``evaluation=False``), draw fresh random offsets per element.
+                Goal-like sources should pass ``randomize=False``; obs-like
+                sources should pass ``randomize=True``.
 
         Returns:
             Tree of arrays with shape (num_sets, batch_size, ...).
         """
         flat_idxs = idx_sets.ravel()
-        if self.config['frame_stack'] is None or self.preprocess_frame_stack:
+        if self.config['frame_stack'] is None:
+            flat_obs = jax.tree_util.tree_map(lambda arr: arr[flat_idxs], self.dataset['observations'])
+        elif randomize and self._frame_stack_random and not evaluation:
+            flat_obs = self._random_stacked_observations(flat_idxs)
+        elif self.preprocess_frame_stack:
+            # Pre-stacked: single fancy index per source -> fastest path. Used for
+            # all goal sources (always canonical) and for obs at eval time.
             flat_obs = jax.tree_util.tree_map(lambda arr: arr[flat_idxs], self.dataset['observations'])
         else:
             flat_obs = self.get_stacked_observations(flat_idxs)
         num_sets, batch_size = idx_sets.shape
         return jax.tree_util.tree_map(lambda arr: arr.reshape(num_sets, batch_size, *arr.shape[1:]), flat_obs)
 
-    def sample_goals(self, idxs, p_curgoal, p_trajgoal, p_randomgoal, geom_sample):
+    # Goal-source tags used by logging (hard val frames) and any future
+    # per-source metrics. 0=curgoal, 1=trajgoal, 2=randomgoal.
+    GOAL_SOURCE_CUR = 0
+    GOAL_SOURCE_TRAJ = 1
+    GOAL_SOURCE_RANDOM = 2
+
+    def sample_goals(self, idxs, p_curgoal, p_trajgoal, p_randomgoal, geom_sample, return_sources=False):
         batch_size = len(idxs)
 
         random_goal_idxs = self.dataset.get_random_idxs(batch_size)
@@ -269,13 +636,144 @@ class GCDataset:
 
         if p_curgoal == 1.0:
             goal_idxs = idxs
-        else:
-            goal_idxs = np.where(
-                np.random.rand(batch_size) < p_trajgoal / (1.0 - p_curgoal), traj_goal_idxs, random_goal_idxs
+            if return_sources:
+                sources = np.full(batch_size, self.GOAL_SOURCE_CUR, dtype=np.int8)
+                return goal_idxs, sources
+            return goal_idxs
+
+        # Two-stage draw: first traj-vs-random, then overwrite with cur. Mirror
+        # the exact same RNG pattern when building the source tags so sources
+        # are consistent with the actual goal_idxs returned.
+        traj_vs_rand_draw = np.random.rand(batch_size) < p_trajgoal / (1.0 - p_curgoal)
+        goal_idxs = np.where(traj_vs_rand_draw, traj_goal_idxs, random_goal_idxs)
+        cur_draw = np.random.rand(batch_size) < p_curgoal
+        goal_idxs = np.where(cur_draw, idxs, goal_idxs)
+
+        if return_sources:
+            sources = np.where(
+                traj_vs_rand_draw,
+                np.int8(self.GOAL_SOURCE_TRAJ),
+                np.int8(self.GOAL_SOURCE_RANDOM),
             )
-            goal_idxs = np.where(np.random.rand(batch_size) < p_curgoal, idxs, goal_idxs)
+            sources = np.where(cur_draw, np.int8(self.GOAL_SOURCE_CUR), sources).astype(np.int8)
+            return goal_idxs, sources
 
         return goal_idxs
+
+    def apply_action_noise(self, batch):
+        """Gaussian perturbation of action targets (opt-in, default no-op).
+
+        Called only from ``GCDataset.sample(..., evaluation=False)``. Validation
+        and eval passes must use ``evaluation=True`` so metrics are computed on
+        the true stored actions.
+
+        Controlled by three config keys:
+          - ``action_noise_std``  (float OR sequence of ``action_dim`` floats,
+            default 0.0): standard deviation of additive Gaussian noise.  A
+            scalar is broadcast to every action dimension; a per-dim array
+            lets you set different noise levels per channel (e.g. lower std
+            on steering because its action-to-outcome gain is much higher
+            than throttle / brake).  0.0 disables the transform entirely.
+          - ``action_noise_chunk_corr`` (float in [0, 1), default 0.0 if the
+            key is omitted): AR(1) temporal correlation of the noise across the
+            timesteps of an action chunk.  0.0 ⇒ i.i.d. per-step noise (white).
+            Values closer to 1 ⇒ smoother per-chunk noise.  ``train.py`` defaults
+            this to **0.6** so chunk training gets realistic temporal structure
+            without an extra flag.  Marginal per-step variance stays ``std^2``
+            (innovation uses ``√(1-ρ²)``).  No effect when chunk length is 1.
+          - ``action_noise_clip`` (bool, default True): if True, clip the
+            perturbed actions to ``[-1, 1]``.
+
+        Rationale:
+          - Mild regulariser for BC-style loss targets.
+          - Target-policy-smoothing-style regularisation for critic inputs.
+          - Per Bishop-1995, unbiased additive input noise on training targets
+            is approximately equivalent to an L2 penalty on the function —
+            cheap insurance against memorising exact dataset actions.
+
+        The invariant ``batch['actions'] == batch['action_chunks'][:, 0, :]``
+        is preserved: ``action_chunks`` is perturbed once and ``actions`` is
+        rebound to its first slot.  ``high_value_action_chunks`` (used only
+        by the TMD-DQC backup bootstrap) gets its own independent noise draw.
+        """
+        # Categorical-head (multi_discrete) actors use internal binning in
+        # MultiDiscreteDistribution.log_prob; Gaussian-style additive noise
+        # followed by a [-1, 1] clip would mangle throttle/brake (range [0, 1])
+        # and has no regularisation benefit since the loss is cross-entropy.
+        if bool(self.config.get('multi_discrete', False)):
+            return
+
+        std_cfg = self.config.get('action_noise_std', 0.0)
+        # Handle scalar / sequence / ConfigDict tuple transparently.
+        if isinstance(std_cfg, (list, tuple)):
+            std_vec = np.asarray(std_cfg, dtype=np.float32)
+        else:
+            val = float(std_cfg or 0.0)
+            if val <= 0.0:
+                return
+            std_vec = None  # broadcast scalar below; will materialise on use
+            std_scalar = val
+        if std_vec is not None and not np.any(std_vec > 0.0):
+            return
+        clip = bool(self.config.get('action_noise_clip', True))
+        corr = float(self.config.get('action_noise_chunk_corr', 0.0) or 0.0)
+        corr = max(0.0, min(corr, 0.999))  # keep strictly in [0, 0.999]
+
+        def _scale_noise(unit_noise):
+            """Multiply unit-variance noise by the (scalar or per-dim) std."""
+            if std_vec is None:
+                return unit_noise * std_scalar
+            # unit_noise has trailing axis == action_dim
+            return unit_noise * std_vec.reshape((1,) * (unit_noise.ndim - 1) + (-1,))
+
+        def _ar1_chunk_noise(shape):
+            """Draw AR(1)-correlated unit-variance noise with shape (..., T, A).
+
+            ``T`` is the second-to-last axis.  If T == 1 this reduces to iid.
+            """
+            xi = np.random.randn(*shape).astype(np.float32)
+            if corr <= 0.0 or shape[-2] <= 1:
+                return xi
+            innov = np.sqrt(1.0 - corr * corr)
+            eps = np.empty_like(xi)
+            eps[..., 0, :] = xi[..., 0, :]
+            for t in range(1, shape[-2]):
+                eps[..., t, :] = corr * eps[..., t - 1, :] + innov * xi[..., t, :]
+            return eps
+
+        if 'action_chunks' in batch:
+            ac = batch['action_chunks']  # (B, C, A)
+            noise = _scale_noise(_ar1_chunk_noise(ac.shape)).astype(ac.dtype, copy=False)
+            ac = ac + noise
+            if clip:
+                ac = np.clip(ac, -1.0, 1.0)
+            batch['action_chunks'] = ac
+            # Preserve invariant actions == action_chunks[:, 0, :].
+            batch['actions'] = ac[:, 0, :]
+        elif 'actions' in batch:
+            a = batch['actions']  # (B, A)
+            noise = _scale_noise(np.random.randn(*a.shape).astype(np.float32)).astype(a.dtype, copy=False)
+            a = a + noise
+            if clip:
+                a = np.clip(a, -1.0, 1.0)
+            batch['actions'] = a
+
+        if 'high_value_action_chunks' in batch:
+            hva = batch['high_value_action_chunks']  # (B, H * A) flattened
+            B = hva.shape[0]
+            if std_vec is not None:
+                A = std_vec.shape[0]
+            elif 'action_chunks' in batch:
+                A = batch['action_chunks'].shape[-1]
+            else:
+                A = batch['actions'].shape[-1]
+            H = hva.shape[1] // A
+            unshaped = hva.reshape(B, H, A)
+            noise = _scale_noise(_ar1_chunk_noise(unshaped.shape)).astype(hva.dtype, copy=False)
+            unshaped = unshaped + noise
+            if clip:
+                unshaped = np.clip(unshaped, -1.0, 1.0)
+            batch['high_value_action_chunks'] = unshaped.reshape(B, H * A)
 
     def augment(self, batch, keys):
         """Apply image augmentation — stay in JAX, no round-trip."""
@@ -305,31 +803,56 @@ class GCDataset:
         spatial = obs.shape[1:-1]
         out = np.empty((N, *spatial, C * k), dtype=obs.dtype)
 
+        # Resolve the lag for each channel block. Positive int >= 0: how many
+        # dataset steps back from the current frame that slot sources from.
+        custom_offsets = self.config.get('frame_offsets') if hasattr(self.config, 'get') else None
+        if custom_offsets is not None:
+            offs = tuple(int(o) for o in custom_offsets)
+            if len(offs) != k:
+                raise ValueError(
+                    f"frame_offsets has {len(offs)} entries but frame_stack is {k}."
+                )
+            if any(o > 0 for o in offs):
+                raise ValueError(f"frame_offsets must all be <= 0, got {offs}.")
+            lags_oldest_first = sorted((-o for o in offs), reverse=True)  # e.g. (0,-20) -> [20, 0]
+        else:
+            lags_oldest_first = list(range(k - 1, -1, -1))  # [K-1, ..., 1, 0]
+
         for traj_start, traj_end in zip(self.initial_locs, self.terminal_locs):
             traj_len = traj_end - traj_start + 1
             traj_obs = obs[traj_start:traj_end + 1]          # (L, *spatial, C)
-            for j in range(k):
-                lag = k - 1 - j
-                src_start = max(0, 0 - lag)                    # always 0 when lag < traj_len
-                # For each frame t in [0, traj_len), the source is max(0, t - lag)
-                # Build the shifted view: pad the beginning by repeating frame 0
-                pad_len = min(lag, traj_len)
-                body_start = lag                               # first frame that doesn't need clamping
+            for j, lag in enumerate(lags_oldest_first):
                 ch_slice = slice(j * C, (j + 1) * C)
-                # Frames [0, pad_len) all map to traj_obs[0]
+                # For each frame t in [0, traj_len), source = max(0, t - lag).
+                # Frames [0, min(lag, traj_len)) clamp to traj_obs[0]; the rest
+                # map 1:1 from traj_obs[:traj_len - lag].
+                pad_len = min(lag, traj_len)
+                body_start = lag
                 if pad_len > 0:
                     out[traj_start:traj_start + pad_len, ..., ch_slice] = traj_obs[0:1]
-                # Frames [pad_len, traj_len) map to traj_obs[t - lag]
                 if body_start < traj_len:
                     out[traj_start + body_start:traj_end + 1, ..., ch_slice] = \
                         traj_obs[:traj_len - body_start]
         return out
 
-    def get_observations(self, idxs):
-        if self.config['frame_stack'] is None or self.preprocess_frame_stack:
+    def get_observations(self, idxs, evaluation=False):
+        """Build the K-frame observation stack for a batch of indices.
+
+        Dispatch order:
+          1. If frame_stack disabled: single fancy index (fastest).
+          2. If random stacking is on and this is a training pass: K-of-W random
+             offsets per element via :py:meth:`_random_stacked_observations`.
+          3. If pre-stacked at __post_init__: single fancy index on the
+             pre-stacked array (canonical consecutive K, fastest).
+          4. Otherwise: canonical K consecutive frames via per-frame gather.
+        """
+        if self.config['frame_stack'] is None:
             return jax.tree_util.tree_map(lambda arr: arr[idxs], self.dataset['observations'])
-        else:
-            return self.get_stacked_observations(idxs)
+        if self._frame_stack_random and not evaluation:
+            return self._random_stacked_observations(idxs)
+        if self.preprocess_frame_stack:
+            return jax.tree_util.tree_map(lambda arr: arr[idxs], self.dataset['observations'])
+        return self.get_stacked_observations(idxs)
 
     def get_stacked_observations(self, idxs):
         # --- FIX 1 continued: Use pre-computed lookup ---
@@ -339,6 +862,70 @@ class GCDataset:
             cur_idxs = np.maximum(idxs - i, initial_state_idxs)
             rets.append(jax.tree_util.tree_map(lambda arr: arr[cur_idxs], self.dataset['observations']))
         return jax.tree_util.tree_map(lambda *args: np.concatenate(args, axis=-1), *rets)
+
+    def _random_stacked_observations(self, idxs):
+        """Vectorised K-of-W random frame stack with offset 0 always included.
+
+        For each element ``i`` we sample ``K - 1`` distinct offsets uniformly
+        from ``[1, W - 1]`` (where ``W = frame_stack_window``) using the
+        argpartition trick on per-row uniform keys, then append offset 0
+        (the current frame) and sort descending so the channel order along
+        the last axis is ``[oldest, ..., current]`` — matching
+        :py:meth:`_preprocess_frame_stack` and :py:meth:`get_stacked_observations`.
+
+        Source frame indices are clamped at ``idx_to_initial[idxs]`` so the
+        stack never crosses a trajectory boundary (same convention as the
+        canonical path).
+
+        Implementation notes (kept in NumPy because the dataset lives on host):
+          * One fancy index over a flat ``(B*K,)`` array followed by a
+            ``transpose + reshape`` instead of K separate Python-loop
+            indexings + ``np.concatenate``. This avoids ``K`` allocations
+            per batch and keeps memory bandwidth O(K * frame_bytes) once.
+          * The offset draw is O(B * W) and independent across batch
+            elements, so different rows see different random subsets per
+            forward pass — strongest setting for breaking causal-confusion
+            shortcuts.
+          * No JAX device transfer: the underlying observation array is on
+            CPU as a NumPy buffer; gather happens in C inside NumPy. The
+            downstream JAX-side path (encoder forward, augmentation) is
+            untouched and still runs on device.
+        """
+        K = int(self.config['frame_stack'])
+        W = int(self._frame_stack_window)
+        B = len(idxs)
+
+        if K == 1:
+            offsets = np.zeros((B, 1), dtype=np.int64)
+        else:
+            # Sample K-1 distinct offsets from [1, W-1] per element via the
+            # argpartition trick on uniform keys (vectorised, ~tens of microseconds
+            # at B=1024, W<=24). Then prepend offset 0 and sort descending so
+            # channels are oldest-first.
+            keys = np.random.rand(B, W - 1)
+            chosen = np.argpartition(keys, K - 1, axis=1)[:, : K - 1] + 1  # (B, K-1) in [1, W-1]
+            offsets = np.concatenate(
+                [chosen.astype(np.int64), np.zeros((B, 1), dtype=np.int64)], axis=1
+            )  # (B, K)
+            offsets = -np.sort(-offsets, axis=1)  # descending: oldest first
+
+        initial = self.idx_to_initial[idxs]
+        src = np.maximum(idxs[:, None] - offsets, initial[:, None])  # (B, K)
+
+        # When pre-stacking is on (default with random stacking enabled), the raw
+        # current-frame buffer is exposed as a strided view of the pre-stacked
+        # array's last C channels. Same gather pattern, no extra storage.
+        obs = self._raw_obs_view if self._raw_obs_view is not None else self.dataset['observations']
+        gathered = obs[src.ravel()].reshape(B, K, *obs.shape[1:])
+
+        if obs.ndim >= 4:
+            spatial = obs.shape[1:-1]  # (H, W) for images, (H, W, D) for 3-D, etc.
+            C = obs.shape[-1]
+            # (B, K, *spatial, C) -> (B, *spatial, K, C) -> (B, *spatial, K*C)
+            perm = (0,) + tuple(range(2, 2 + len(spatial))) + (1, 1 + 1 + len(spatial))
+            return np.transpose(gathered, perm).reshape(B, *spatial, K * C)
+        # 1-D / state-vector obs: stack along feature axis.
+        return gathered.reshape(B, K * obs.shape[-1])
 
 
 @dataclasses.dataclass
@@ -381,9 +968,9 @@ class CGCDataset(GCDataset):
 
         batch = self.dataset.sample(batch_size, idxs)
         if self.config['frame_stack'] is not None:
-            batch['observations'] = self.get_observations(idxs)
+            batch['observations'] = self.get_observations(idxs, evaluation=evaluation)
             next_idxs = np.minimum(idxs + 1, self.size - 1)
-            batch['next_observations'] = self.get_observations(next_idxs)
+            batch['next_observations'] = self.get_observations(next_idxs, evaluation=evaluation)
 
         final_state_idxs = self.idx_to_terminal[idxs]
         backup_horizon = int(self.config['backup_horizon'])
@@ -395,24 +982,33 @@ class CGCDataset(GCDataset):
             self.config['value_p_randomgoal'],
             self.config['value_geom_sample'],
         )
-        actor_goal_idxs = self.sample_goals(
+        actor_goal_idxs, actor_goal_sources = self.sample_goals(
             idxs,
             self.config['actor_p_curgoal'],
             self.config['actor_p_trajgoal'],
             self.config['actor_p_randomgoal'],
             self.config['actor_geom_sample'],
+            return_sources=True,
         )
+        if evaluation:
+            batch['actor_goal_sources'] = actor_goal_sources
 
         high_value_next_idxs, high_value_bh = self._compute_high_next_idxs(
             idxs, final_state_idxs, high_value_goal_idxs, backup_horizon,
         )
 
+        # All three sources are goal-like / target-state inputs to psi: keep
+        # them on canonical stacks so psi sees a single distribution that
+        # matches eval-time goal images.
         all_goal_idxs = np.stack([high_value_goal_idxs, actor_goal_idxs,
                                   high_value_next_idxs])
-        all_obs = self._batch_get_observations(all_goal_idxs)
+        all_obs = self._batch_get_observations(all_goal_idxs, evaluation=evaluation, randomize=False)
         batch['high_value_goals'] = jax.tree_util.tree_map(lambda x: x[0], all_obs)
         batch['value_goals'] = batch['high_value_goals']
-        batch['actor_goals'] = jax.tree_util.tree_map(lambda x: x[1], all_obs)
+        if self._needs_separate_goal_temporal_stack():
+            batch['actor_goals'] = self._gather_goal_temporal_stack(actor_goal_idxs)
+        else:
+            batch['actor_goals'] = jax.tree_util.tree_map(lambda x: x[1], all_obs)
         batch['high_value_next_observations'] = jax.tree_util.tree_map(lambda x: x[2], all_obs)
 
         chunk_offsets = np.arange(backup_horizon)
@@ -438,11 +1034,18 @@ class CGCDataset(GCDataset):
         else:
             batch['action_chunks'] = batch['actions'][:, None, :]
 
+        L_as = self._action_stack_len()
+        if L_as > 1:
+            batch['action_stack'] = self._gather_past_action_stack(idxs, L_as)
+
         if self.config['p_aug'] is not None and not evaluation:
             if np.random.rand() < self.config['p_aug']:
                 self.augment(batch, ['observations', 'next_observations',
                                      'high_value_goals', 'actor_goals',
                                      'high_value_next_observations'])
+
+        if not evaluation:
+            self.apply_action_noise(batch)
 
         return batch
 
@@ -459,9 +1062,9 @@ class HGCDataset(GCDataset):
 
         batch = self.dataset.sample(batch_size, idxs)
         if self.config['frame_stack'] is not None:
-            batch['observations'] = self.get_observations(idxs)
+            batch['observations'] = self.get_observations(idxs, evaluation=evaluation)
             next_idxs = np.minimum(idxs + 1, self.size - 1)
-            batch['next_observations'] = self.get_observations(next_idxs)
+            batch['next_observations'] = self.get_observations(next_idxs, evaluation=evaluation)
 
         value_goal_idxs = self.sample_goals(
             idxs,
@@ -470,7 +1073,8 @@ class HGCDataset(GCDataset):
             self.config['value_p_randomgoal'],
             self.config['value_geom_sample'],
         )
-        batch['value_goals'] = self.get_observations(value_goal_idxs)
+        # Goals stay canonical (see GCDataset.sample for rationale).
+        batch['value_goals'] = self.get_observations(value_goal_idxs, evaluation=True)
 
         successes = (idxs == value_goal_idxs).astype(np.float32)
         batch['masks'] = 1.0 - successes
@@ -496,10 +1100,15 @@ class HGCDataset(GCDataset):
         pick_random = np.random.rand(batch_size) < self.config['actor_p_randomgoal']
         high_goal_idxs = np.where(pick_random, high_random_goal_idxs, high_traj_goal_idxs)
         high_target_idxs = np.where(pick_random, high_random_target_idxs, high_traj_target_idxs)
+        if evaluation:
+            batch['actor_goal_sources'] = np.where(
+                pick_random, np.int8(self.GOAL_SOURCE_RANDOM), np.int8(self.GOAL_SOURCE_TRAJ),
+            ).astype(np.int8)
 
         # --- FIX 2: Batch all observation gathering ---
+        # All three are goal-like targets for the high-/low-level actors -> canonical.
         all_idx_sets = np.stack([low_goal_idxs, high_goal_idxs, high_target_idxs])  # (3, batch_size)
-        all_obs = self._batch_get_observations(all_idx_sets)
+        all_obs = self._batch_get_observations(all_idx_sets, evaluation=evaluation, randomize=False)
         batch['low_actor_goals'] = jax.tree_util.tree_map(lambda x: x[0], all_obs)
         batch['high_actor_goals'] = jax.tree_util.tree_map(lambda x: x[1], all_obs)
         batch['high_actor_targets'] = jax.tree_util.tree_map(lambda x: x[2], all_obs)
@@ -514,7 +1123,11 @@ class HGCDataset(GCDataset):
             batch['action_chunks'] = batch['actions'][:, None, :]
 
         chunk_next_idxs = np.minimum(idxs + chunk_len, final_state_idxs)
-        batch['chunk_next_observations'] = self.get_observations(chunk_next_idxs)
+        batch['chunk_next_observations'] = self.get_observations(chunk_next_idxs, evaluation=evaluation)
+
+        L_as = self._action_stack_len()
+        if L_as > 1:
+            batch['action_stack'] = self._gather_past_action_stack(idxs, L_as)
 
         if self.config['p_aug'] is not None and not evaluation:
             if np.random.rand() < self.config['p_aug']:
@@ -523,5 +1136,8 @@ class HGCDataset(GCDataset):
                     ['observations', 'next_observations', 'value_goals', 'low_actor_goals',
                      'high_actor_goals', 'high_actor_targets', 'chunk_next_observations'],
                 )
+
+        if not evaluation:
+            self.apply_action_noise(batch)
 
         return batch

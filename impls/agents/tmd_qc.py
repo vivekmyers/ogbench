@@ -16,6 +16,8 @@ from utils.networks import (
     GCDiscreteActor,
     Param,
     StateRepresentation,
+    actor_action_stack_kwargs_from_batch,
+    build_gc_actor_init,
 )
 
 from .tmd import TMDAgent
@@ -45,18 +47,18 @@ class TMDQCAgent(TMDAgent):
         batch_size = batch['observations'].shape[0]
         a_flat = self._action_chunk_flat(batch)
 
-        if self.config['encoder'] is not None:
-            phi = self.network.select('phi')(batch['observations'], a_flat, params=grad_params)
-            psi_s = self.network.select('psi')(batch['observations'], params=grad_params)
-            psi_next = self.network.select('psi')(
-                batch['chunk_next_observations'], params=grad_params
-            )
-            psi_g = self.network.select('psi')(batch['value_goals'], params=grad_params)
-        else:
-            phi = self.network.select('phi')(batch['observations'], a_flat, params=grad_params)
-            psi_s = self.network.select('psi')(batch['observations'], params=grad_params)
-            psi_next = self.network.select('psi')(batch['chunk_next_observations'], params=grad_params)
-            psi_g = self.network.select('psi')(batch['value_goals'], params=grad_params)
+        # Bootstrap horizon must agree with the discount used in the backup.
+        # If chunk_backup_discount_k is True (default), gamma = d^K and we
+        # bootstrap from psi(s_{t+K}). If False, gamma = d (one-step), so the
+        # corresponding next-state must also be the one-step next observation.
+        k = int(self.config.get('action_chunk_length', 1))
+        use_chunk_bootstrap = bool(self.config.get('chunk_backup_discount_k', True)) or k == 1
+        next_obs = batch['chunk_next_observations'] if use_chunk_bootstrap else batch['next_observations']
+
+        phi = self.network.select('phi')(batch['observations'], a_flat, params=grad_params)
+        psi_s = self.network.select('psi')(batch['observations'], params=grad_params)
+        psi_next = self.network.select('psi')(next_obs, params=grad_params)
+        psi_g = self.network.select('psi')(batch['value_goals'], params=grad_params)
 
         if len(phi.shape) == 2:
             phi = phi[None, ...]
@@ -155,6 +157,7 @@ class TMDQCAgent(TMDAgent):
         else:
             bc_goals = batch['actor_goals']
 
+        akw = actor_action_stack_kwargs_from_batch(self.config, batch)
         if self.config['use_latent']:
             psi_s = self.network.select('psi')(batch['observations'], params=grad_params)
             psi_g = self.network.select('psi')(batch['actor_goals'], params=grad_params)
@@ -170,19 +173,22 @@ class TMDQCAgent(TMDAgent):
                 psi_g = jax.lax.stop_gradient(psi_g)
                 if p_bc > 0.0:
                     psi_g_bc = jax.lax.stop_gradient(psi_g_bc)
-            dist = self.network.select('actor')(psi_s, psi_g, params=grad_params)
+            dist = self.network.select('actor')(psi_s, psi_g, params=grad_params, **akw)
             if p_bc > 0.0:
                 dist_bc = self.network.select('actor')(
                     jax.lax.stop_gradient(psi_s),
                     jax.lax.stop_gradient(psi_g_bc),
                     params=grad_params,
+                    **akw,
                 )
             else:
                 dist_bc = dist
         else:
-            dist = self.network.select('actor')(batch['observations'], batch['actor_goals'], params=grad_params)
+            dist = self.network.select('actor')(
+                batch['observations'], batch['actor_goals'], params=grad_params, **akw
+            )
             if p_bc > 0.0:
-                dist_bc = self.network.select('actor')(batch['observations'], bc_goals, params=grad_params)
+                dist_bc = self.network.select('actor')(batch['observations'], bc_goals, params=grad_params, **akw)
             else:
                 dist_bc = dist
 
@@ -262,6 +268,7 @@ class TMDQCAgent(TMDAgent):
         ex_actions,
         config,
         steps=None,
+        ex_action_stack=None,
     ):
         rng = jax.random.PRNGKey(seed)
         rng, init_rng = jax.random.split(rng, 2)
@@ -344,7 +351,7 @@ class TMDQCAgent(TMDAgent):
 
         if config['use_iqe']:
             network_info = dict(
-                actor=(actor_def, (ex_observations, ex_goals)),
+                actor=(actor_def, build_gc_actor_init(ex_observations, ex_goals, ex_action_stack)),
                 phi=(phi_def, (ex_observations, ex_a_chunk)),
                 psi=(psi_def, (ex_goals,)),
                 alpha_raw=(Param(), ()),
@@ -353,13 +360,13 @@ class TMDQCAgent(TMDAgent):
             if config['use_latent']:
                 embed = jnp.zeros((1, config['latent_dim']))
                 network_info = dict(
-                    actor=(actor_def, (embed, embed)),
+                    actor=(actor_def, build_gc_actor_init(embed, embed, ex_action_stack)),
                     phi=(phi_def, (ex_observations, ex_a_chunk)),
                     psi=(psi_def, (ex_goals,)),
                 )
             else:
                 network_info = dict(
-                    actor=(actor_def, (ex_observations, ex_goals)),
+                    actor=(actor_def, build_gc_actor_init(ex_observations, ex_goals, ex_action_stack)),
                     phi=(phi_def, (ex_observations, ex_a_chunk)),
                     psi=(psi_def, (ex_goals,)),
                 )

@@ -92,6 +92,35 @@ def _resolve_eval_dims_from_config(config, args, *, loaded_config_json: bool):
 
 _AGENT_CHOICES = sorted(AGENT_REGISTRY.keys())
 
+def _resolve_frame_offsets(config, frame_stack_k: int) -> tuple[int, ...]:
+    """Resolve explicit per-stack offsets (oldest-first, includes 0).
+
+    Offsets are in dataset/policy-step units and must be <= 0.
+    Examples:
+      - canonical consecutive K=3: (-2, -1, 0)
+      - spaced: (0, -20, -40) (will be returned as (-40, -20, 0))
+    """
+    fo = _cfg_pick(config, "frame_offsets", None)
+    if fo is None:
+        return tuple(range(-(frame_stack_k - 1), 1))
+    if isinstance(fo, list):
+        fo = tuple(int(x) for x in fo)
+    else:
+        fo = tuple(int(x) for x in fo)
+    if len(fo) != int(frame_stack_k):
+        raise ValueError(
+            f"config frame_offsets has {len(fo)} entries but frame_stack={frame_stack_k}."
+        )
+    if any(x > 0 for x in fo):
+        raise ValueError(f"frame_offsets must be <= 0, got {fo}.")
+    if 0 not in fo:
+        raise ValueError(f"frame_offsets must include 0 (current frame), got {fo}.")
+    # Oldest-first
+    return tuple(sorted(fo))
+
+def _history_len_for_offsets(frame_offsets: tuple[int, ...]) -> int:
+    max_lag = max(0, max((-o for o in frame_offsets if o < 0), default=0))
+    return int(max_lag + 1)
 
 # ---------------- main ----------------
 def main():
@@ -164,7 +193,20 @@ def main():
         default=1,
         help="Unused when --config_path is set (use action_chunk_length from config.json).",
     )
-    p.add_argument("--n_actions", type=int, default=4, help="Use only the first N actions from the chunk (default: 4 = use first 4 actions). Useful when model was trained with chunking but you want to execute only the first N actions.")
+    p.add_argument(
+        "--n_actions",
+        type=int,
+        default=None,
+        help="Send at most the first N actions from each predicted chunk. "
+        "Default: same as action_chunk_length from the merged eval config (config.json, checkpoint "
+        "fallback, or agent template). Override for fewer steps per replan (e.g. --n_actions 1).",
+    )
+    p.add_argument(
+        "--brake_deadzone",
+        type=float,
+        default=0.01,
+        help="If brake is in [0, deadzone), force it to 0 before sending to client (post-clip).",
+    )
     p.add_argument("--use_discrete", action="store_true", default=False, help="Use discrete actions (multi-discrete mode: discretize throttle/steer/brake into 32 bins each)")
     p.add_argument(
         "--eval_config",
@@ -177,6 +219,15 @@ def main():
         type=int,
         default=None,
         help="With --eval_config: run at most this many episodes (first N pairs). Applied after optional max_episodes in the JSON.",
+    )
+    p.add_argument(
+        "--easy_hard_threshold",
+        type=int,
+        default=200,
+        help="Dataset-index gap at or below which a same-trajectory (start,goal) pair "
+             "is classified 'same_traj_easy'; above it, 'same_traj_hard'. 10 Hz data "
+             "=> 200 ~= 20 s of expert play. Overridden by 'easy_hard_threshold' in "
+             "the eval_config JSON if set, and by per-pair 'category' if set.",
     )
     p.add_argument(
         "--accept_multiple",
@@ -195,34 +246,44 @@ def main():
     module = importlib.import_module(f"agents.{agent_str}")
     get_config = getattr(module, "get_config")
 
-    # Load config from file if provided, otherwise use defaults
+    # Load config from file if provided, otherwise try sibling config.json next to the checkpoint
     config = get_config()
     loaded_config_json = False
+    config_path = None
     if args.config_path:
         config_path = Path(args.config_path)
-        if config_path.exists():
-            loaded_config_json = True
-            print(f"Loading config from {config_path}")
-            with config_path.open("r") as f:
-                config_dict = json.load(f)
-            # Update config with values from file
-            for key, value in config_dict.items():
-                # Handle tuple/list conversion for fields like frame_offsets, hidden_dims, etc.
-                if isinstance(value, list) and key in [
-                    "frame_offsets",
-                    "actor_hidden_dims",
-                    "value_hidden_dims",
-                    "distance_head_hidden_dims",
-                ]:
-                    value = tuple(value)
-                # For ml_collections.ConfigDict, allow creating new fields directly
-                if isinstance(config, ml_collections.ConfigDict):
-                    config[key] = value
-                else:
-                    setattr(config, key, value)
-            print(f"Loaded config from file: {len(config_dict)} keys")
-        else:
-            print(f"Warning: config file {config_path} not found, using defaults")
+        if not config_path.exists():
+            raise SystemExit(
+                f"--config_path={config_path} does not exist. "
+                f"Did you mean {Path(args.model_path).parent / 'config.json'}?"
+            )
+    else:
+        sibling = Path(args.model_path).parent / "config.json"
+        if sibling.exists():
+            config_path = sibling
+            print(f"[INFO] No --config_path given; auto-using {config_path}")
+
+    if config_path is not None:
+        loaded_config_json = True
+        print(f"Loading config from {config_path}")
+        with config_path.open("r") as f:
+            config_dict = json.load(f)
+        for key, value in config_dict.items():
+            if value is None:
+                continue  # JSON null must not clobber template (e.g. encoder)
+            if isinstance(value, list) and key in [
+                "frame_offsets",
+                "goal_frame_offsets",
+                "actor_hidden_dims",
+                "value_hidden_dims",
+                "distance_head_hidden_dims",
+            ]:
+                value = tuple(value)
+            if isinstance(config, ml_collections.ConfigDict):
+                config[key] = value
+            else:
+                setattr(config, key, value)
+        print(f"Loaded config from file: {len(config_dict)} keys")
     else:
         print("No config file provided, using defaults from agent.get_config()")
 
@@ -245,8 +306,11 @@ def main():
                 saved_config = maybe_dict["config"]
                 if isinstance(saved_config, dict):
                     for key, value in saved_config.items():
+                        if value is None:
+                            continue
                         if isinstance(value, list) and key in [
                             "frame_offsets",
+                            "goal_frame_offsets",
                             "actor_hidden_dims",
                             "value_hidden_dims",
                             "distance_head_hidden_dims",
@@ -294,25 +358,73 @@ def main():
             "(must match the run that produced --model_path; config.json may be from a different experiment)"
         )
 
+    # Resolve explicit offsets for eval-time stacking and history size.
+    frame_offsets = _resolve_frame_offsets(config, frame_stack_k)
+    history_maxlen = _history_len_for_offsets(frame_offsets)
+
+    # Optional goal-only temporal stack (must match training ``goal_frame_stack``).
+    gfs = _cfg_pick(config, "goal_frame_stack", None)
+    goal_stack_k = int(gfs) if gfs is not None else int(frame_stack_k)
+    gfo_raw = _cfg_pick(config, "goal_frame_offsets", None)
+    goal_frame_offsets: tuple[int, ...] | None
+    if gfo_raw is None:
+        goal_frame_offsets = None
+    else:
+        if isinstance(gfo_raw, list):
+            goal_frame_offsets = tuple(int(x) for x in gfo_raw)
+        else:
+            goal_frame_offsets = tuple(int(x) for x in gfo_raw)
+        if len(goal_frame_offsets) != goal_stack_k:
+            raise ValueError(
+                f"config goal_frame_offsets has {len(goal_frame_offsets)} entries "
+                f"but goal_frame_stack={goal_stack_k}."
+            )
+    # When not using a separate goal stack, still mirror training by applying
+    # the same ``frame_offsets`` as observations (eval used to always use
+    # consecutive lags only, which broke custom obs offsets at goal time).
+    if gfs is None and goal_frame_offsets is None:
+        fo_obs = _cfg_pick(config, "frame_offsets", None)
+        if fo_obs is not None:
+            if isinstance(fo_obs, list):
+                fo_obs = tuple(int(x) for x in fo_obs)
+            else:
+                fo_obs = tuple(int(x) for x in fo_obs)
+            if len(fo_obs) == goal_stack_k:
+                goal_frame_offsets = fo_obs
+
     obs_shape = (obs_h, obs_w, obs_c)
     stacked_obs_shape = (obs_h, obs_w, obs_c * frame_stack_k)
+    stacked_goal_shape = (obs_h, obs_w, obs_c * goal_stack_k)
     print(
         f"[EVAL] Resolved from {'config.json' if loaded_config_json else 'config + defaults'}: "
         f"obs_h={obs_h}, obs_w={obs_w}, obs_c={obs_c}, frame_stack={frame_stack_k}, "
+        f"goal_frame_stack={goal_stack_k}, "
         f"action_chunk_length={int(_cfg_pick(config, 'action_chunk_length', 1))}"
     )
+    if frame_offsets != tuple(range(-(frame_stack_k - 1), 1)):
+        print(f"[EVAL] Using explicit frame_offsets={frame_offsets} (history_maxlen={history_maxlen})")
+    # Goal tensor differs from observation tensor only when using a separate goal stack.
+    if stacked_goal_shape != stacked_obs_shape:
+        print(
+            f"[EVAL] Goal tensor shape {stacked_goal_shape} "
+            f"(goal_frame_offsets={goal_frame_offsets})"
+        )
 
     # Initialize with *stacked* shape (this must match runtime)
     dummy_obs = jnp.zeros((1, *stacked_obs_shape), dtype=jnp.float32)
     dummy_act = jnp.zeros((1, *act_shape), dtype=jnp.float32)  # (1, 3)
-    
+    dummy_goal = jnp.zeros((1, *stacked_goal_shape), dtype=jnp.float32)
+
     # Create agent with config that matches checkpoint (structure will match)
-    agent = Agent.create(
+    create_kwargs = dict(
         seed=0,
         ex_observations=dummy_obs,
         ex_actions=dummy_act,
         config=config,
     )
+    if agent_str == "gcbc":
+        create_kwargs["ex_goals"] = dummy_goal
+    agent = Agent.create(**create_kwargs)
     
     # Load checkpoint state dict directly (bypasses agent structure validation)
     # Extract only params to avoid opt_state structure mismatches
@@ -339,17 +451,33 @@ def main():
     eval_plan: EvalPlan | None = None
     if args.eval_config:
         raw = load_eval_config(Path(args.eval_config))
+        # Pull dataset terminals for auto-classification (same_traj vs random).
+        # npz may not have a terminals key for every dataset — pass None and
+        # fall back to a distance-only heuristic inside classify_pair.
+        terms = None
+        if 'terminals' in dataset.files:
+            terms = np.asarray(dataset['terminals'])
         eval_plan = normalize_eval_config(
             raw,
             agent_name=args.agent,
             num_dataset_frames=num_frames,
             max_episodes=args.eval_max_episodes,
+            terminals=terms,
+            easy_hard_threshold=args.easy_hard_threshold,
         )
+        # Show per-category counts and a dump of the first few classified
+        # pairs so it's obvious from stdout how the test suite was split.
+        from collections import Counter as _Counter
+        cat_counts = _Counter(eval_plan.categories)
         print(
             f"[EVAL] eval_config: {eval_plan.num_episodes} episodes, "
             f"frames_per_episode={eval_plan.frames_per_episode}, "
-            f"goal_xy_mse_threshold={eval_plan.goal_xy_mse_threshold}"
+            f"goal_xy_mse_threshold={eval_plan.goal_xy_mse_threshold}, "
+            f"easy_hard_threshold={args.easy_hard_threshold}"
         )
+        print(f"[EVAL] categories: {dict(cat_counts)}")
+        for i, ((s, g), c) in enumerate(zip(eval_plan.pairs, eval_plan.categories)):
+            print(f"[EVAL]   ep{i:03d} start={s} goal={g} cat={c}")
         s_idx, g_idx = eval_plan.pairs[0]
     else:
         g_idx = int(np.clip(args.goal_frame_index, 0, num_frames - 1))
@@ -367,7 +495,8 @@ def main():
             num_frames=num_frames,
             obs_h=obs_h,
             obs_w=obs_w,
-            frame_stack_k=frame_stack_k,
+            frame_stack_k=goal_stack_k,
+            goal_frame_offsets=goal_frame_offsets,
         )
         g_xy = get_xy_from_dataset(dataset, goal_i)
         st_xy = get_xy_from_dataset(dataset, start_i)
@@ -395,13 +524,21 @@ def main():
     actor_module = agent.network.model_def.modules["actor"]
     actor_params = agent.network.params["modules_actor"]
 
+    cfg_chunk_default = int(_cfg_pick(config, "action_chunk_length", 1))
+    action_stack_len = int(_cfg_pick(config, "action_stack_length", 1) or 1)
+
     print("Runtime config:")
     print(f"  obs_shape={obs_shape}")
     print(f"  stacked_obs_shape={stacked_obs_shape}")
-    print(f"  frame_stack={frame_stack_k}")
-
-    cfg_chunk_default = int(_cfg_pick(config, "action_chunk_length", 1))
+    print(f"  stacked_goal_shape={stacked_goal_shape}")
+    print(f"  frame_stack={frame_stack_k}, goal_frame_stack={goal_stack_k}")
+    print(f"  action_stack_length={action_stack_len}")
     last_chunk_len = cfg_chunk_default
+    n_actions_exec = int(args.n_actions) if args.n_actions is not None else cfg_chunk_default
+    if args.n_actions is None:
+        print(f"[EVAL] n_actions={n_actions_exec} (default: action_chunk_length from config)")
+    else:
+        print(f"[EVAL] n_actions={n_actions_exec} (CLI override; action_chunk_length={cfg_chunk_default})")
 
     def serve_one_client(conn: socket.socket, addr):
         nonlocal last_chunk_len, goal_stacked, gi_obs, goal_xy, start_xy, start_yaw_deg, s_idx, g_idx
@@ -413,7 +550,8 @@ def main():
             s_idx, g_idx = pairs[0]
             goal_stacked, gi_obs, goal_xy, start_xy, start_yaw_deg = build_goal_state(s_idx, g_idx)
             goal_fixed = jnp.array(goal_stacked[None, ...])
-            HISTORY = deque(maxlen=frame_stack_k)
+            HISTORY = deque(maxlen=history_maxlen)
+            action_past = deque(maxlen=int(action_stack_len) if int(action_stack_len) > 1 else None)
             hdr = header_dict_from_pair(
                 gi_obs=gi_obs,
                 goal_xy=goal_xy,
@@ -429,12 +567,16 @@ def main():
                 num_episodes=num_eps,
                 frames_per_episode=eval_plan.frames_per_episode,
                 goal_xy_mse_threshold=eval_plan.goal_xy_mse_threshold,
+                category=eval_plan.categories[0],
+                goal_frame_stack=goal_stack_k,
             )
+            hdr["frame_offsets"] = list(frame_offsets)
         else:
             num_eps = 1
             completed_episodes = 0
             goal_fixed = jnp.array(goal_stacked[None, ...])
-            HISTORY = deque(maxlen=frame_stack_k)
+            HISTORY = deque(maxlen=history_maxlen)
+            action_past = deque(maxlen=int(action_stack_len) if int(action_stack_len) > 1 else None)
             hdr = header_dict_from_pair(
                 gi_obs=gi_obs,
                 goal_xy=goal_xy,
@@ -450,7 +592,9 @@ def main():
                 num_episodes=1,
                 frames_per_episode=None,
                 goal_xy_mse_threshold=None,
+                goal_frame_stack=goal_stack_k,
             )
+            hdr["frame_offsets"] = list(frame_offsets)
 
         try:
             send_len_pickled(conn, hdr)
@@ -489,6 +633,7 @@ def main():
                     goal_stacked, gi_obs, goal_xy, start_xy, start_yaw_deg = build_goal_state(s_idx, g_idx)
                     goal_fixed = jnp.array(goal_stacked[None, ...])
                     HISTORY.clear()
+                    action_past.clear()
                     hdr = header_dict_from_pair(
                         gi_obs=gi_obs,
                         goal_xy=goal_xy,
@@ -504,7 +649,10 @@ def main():
                         num_episodes=num_eps,
                         frames_per_episode=eval_plan.frames_per_episode,
                         goal_xy_mse_threshold=eval_plan.goal_xy_mse_threshold,
+                        category=eval_plan.categories[completed_episodes],
+                        goal_frame_stack=goal_stack_k,
                     )
+                    hdr["frame_offsets"] = list(frame_offsets)
                     send_len_pickled(conn, hdr)
                     act_chunk = neutral_action_chunk(action_dim, last_chunk_len)
                     send_action_chunk_wire(conn, act_chunk)
@@ -529,17 +677,35 @@ def main():
                     else:
                         img_arr = np.clip(img_arr, 0, 255).astype(np.uint8)
 
-                obs = jnp.array(img_arr).reshape((1, *obs_shape))
-
-                HISTORY.append(obs)
-                obs_stack = []
-                n = len(HISTORY)
-                for j in range(frame_stack_k):
-                    idx = max(0, n - frame_stack_k + j)
-                    obs_stack.append(HISTORY[idx])
-
-                obs_stacked = jnp.concatenate(obs_stack, axis=-1)
-                obs_fixed = obs_stacked.copy()
+                # Detect a client that already stacked frames at policy-step
+                # cadence (channel dim = obs_c * frame_stack_k). For such clients
+                # we bypass the server's per-request HISTORY (which would stack
+                # at chunk-cadence and break temporal alignment with training).
+                # Old single-frame clients (channel dim == obs_c) still hit the
+                # legacy HISTORY path. When frame_stack_k == 1 the two are
+                # equivalent and we just take the fast path.
+                last_axis = int(img_arr.shape[-1])
+                if last_axis == obs_c * frame_stack_k:
+                    obs_fixed = jnp.array(img_arr).reshape((1, *stacked_obs_shape))
+                    HISTORY.append(obs_fixed)  # only kept for `n` debug counter
+                    n = len(HISTORY)
+                elif last_axis == obs_c:
+                    obs = jnp.array(img_arr).reshape((1, *obs_shape))
+                    HISTORY.append(obs)
+                    # Stack using explicit offsets (oldest-first). HISTORY stores
+                    # single frames at policy-step cadence.
+                    n = len(HISTORY)
+                    obs_stack = []
+                    for off in frame_offsets:
+                        idx = n - 1 + int(off)
+                        idx = max(0, idx)
+                        obs_stack.append(HISTORY[idx])
+                    obs_fixed = jnp.concatenate(obs_stack, axis=-1).copy()
+                else:
+                    raise ValueError(
+                        f"Unexpected obs channel dim {last_axis}; expected {obs_c} (single frame) "
+                        f"or {obs_c * frame_stack_k} (pre-stacked from client)."
+                    )
 
                 obs_mean = float(np.array(obs_fixed).mean())
                 print(f"[DEBUG step {n}] obs mean={obs_mean:.6f}")
@@ -562,6 +728,28 @@ def main():
                     "goal_encoded": False,
                     "temperature": 1.0,
                 }
+                if action_stack_len > 1:
+                    # Match training-time padding semantics: when the stack is shorter
+                    # than L at the start of an episode, repeat the earliest available
+                    # action; if nothing exists yet, fall back to neutral (all zeros).
+                    _neutral = np.array([0.0, 0.0, 0.0], dtype=np.float32)
+                    _h = list(action_past)
+                    _L = int(action_stack_len)
+                    if len(_h) < _L:
+                        _pad = _h[0] if len(_h) > 0 else _neutral
+                        _rows = [_pad] * (_L - len(_h)) + _h
+                    else:
+                        _rows = _h[-_L:]
+                    apply_kwargs["action_stack"] = jnp.array(
+                        np.stack(_rows, axis=0)[None, ...], dtype=jnp.float32
+                    )
+                    if n <= 3:
+                        _as_np = np.stack(_rows, axis=0)
+                        print(
+                            f"[DEBUG step {n}] action_stack shape={_as_np.shape} "
+                            f"mean={_as_np.mean():.3f} std={_as_np.std():.3f} "
+                            f"last={_as_np[-1].round(3).tolist()}"
+                        )
 
                 action_dist = actor_module.apply(variables, **apply_kwargs)
                 act = action_dist.mean()
@@ -583,10 +771,10 @@ def main():
                 act_chunk = act_np.reshape(chunk_len_effective, action_dim)
                 chunk_length = act_chunk.shape[0]
 
-                if args.n_actions is not None and chunk_length > args.n_actions:
+                if chunk_length > n_actions_exec:
                     original_chunk_length = chunk_length
-                    act_chunk = act_chunk[: args.n_actions]
-                    chunk_length = args.n_actions
+                    act_chunk = act_chunk[:n_actions_exec]
+                    chunk_length = n_actions_exec
                     print(
                         f"[INFO] Using only first {chunk_length} actions from chunk "
                         f"(model predicted {original_chunk_length} actions)"
@@ -595,6 +783,13 @@ def main():
                 act_chunk[:, 0] = np.clip(act_chunk[:, 0], 0.0, 1.0)
                 act_chunk[:, 1] = np.clip(act_chunk[:, 1], -1.0, 1.0)
                 act_chunk[:, 2] = np.clip(act_chunk[:, 2], 0.0, 1.0)
+                bd = float(getattr(args, "brake_deadzone", 0.0) or 0.0)
+                if bd > 0.0:
+                    act_chunk[:, 2] = np.where(act_chunk[:, 2] < bd, 0.0, act_chunk[:, 2])
+
+                if action_stack_len > 1:
+                    for _i in range(int(chunk_length)):
+                        action_past.append(np.asarray(act_chunk[_i], dtype=np.float32).copy())
 
                 send_action_chunk_wire(conn, act_chunk)
 

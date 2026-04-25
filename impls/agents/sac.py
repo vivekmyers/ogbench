@@ -7,7 +7,14 @@ import jax.numpy as jnp
 import ml_collections
 import optax
 from utils.flax_utils import ModuleDict, TrainState, nonpytree_field
-from utils.networks import GCActor, GCValue, LogParam
+from utils.networks import (
+    GCActor,
+    GCValue,
+    LogParam,
+    actor_action_stack_kwargs_from_batch,
+    actor_action_stack_kwargs_from_value,
+    build_gc_actor_init,
+)
 
 
 class SACAgent(flax.struct.PyTreeNode):
@@ -19,7 +26,8 @@ class SACAgent(flax.struct.PyTreeNode):
 
     def critic_loss(self, batch, grad_params, rng):
         """Compute the SAC critic loss."""
-        next_dist = self.network.select('actor')(batch['next_observations'])
+        akw = actor_action_stack_kwargs_from_batch(self.config, batch)
+        next_dist = self.network.select('actor')(batch['next_observations'], **akw)
         next_actions, next_log_probs = next_dist.sample_and_log_prob(seed=rng)
 
         next_qs = self.network.select('target_critic')(batch['next_observations'], next_actions)
@@ -43,8 +51,9 @@ class SACAgent(flax.struct.PyTreeNode):
 
     def actor_loss(self, batch, grad_params, rng):
         """Compute the SAC actor loss."""
+        akw = actor_action_stack_kwargs_from_batch(self.config, batch)
         # Actor loss.
-        dist = self.network.select('actor')(batch['observations'], params=grad_params)
+        dist = self.network.select('actor')(batch['observations'], params=grad_params, **akw)
         actions, log_probs = dist.sample_and_log_prob(seed=rng)
 
         qs = self.network.select('critic')(batch['observations'], actions)
@@ -123,10 +132,12 @@ class SACAgent(flax.struct.PyTreeNode):
         observations,
         goals=None,
         seed=None,
+        action_stack=None,
         temperature=1.0,
     ):
         """Sample actions from the actor."""
-        dist = self.network.select('actor')(observations, goals, temperature=temperature)
+        akw = actor_action_stack_kwargs_from_value(self.config, action_stack)
+        dist = self.network.select('actor')(observations, goals, temperature=temperature, **akw)
         actions = dist.sample(seed=seed)
         actions = jnp.clip(actions, -1, 1)
         return actions
@@ -138,6 +149,7 @@ class SACAgent(flax.struct.PyTreeNode):
         ex_observations,
         ex_actions,
         config,
+        ex_action_stack=None,
     ):
         """Create a new agent.
 
@@ -178,7 +190,7 @@ class SACAgent(flax.struct.PyTreeNode):
         network_info = dict(
             critic=(critic_def, (ex_observations, None, ex_actions)),
             target_critic=(copy.deepcopy(critic_def), (ex_observations, None, ex_actions)),
-            actor=(actor_def, (ex_observations, None)),
+            actor=(actor_def, build_gc_actor_init(ex_observations, None, ex_action_stack)),
             alpha=(alpha_def, ()),
         )
         networks = {k: v[0] for k, v in network_info.items()}

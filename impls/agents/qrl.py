@@ -8,7 +8,17 @@ import numpy as np
 import optax
 from utils.encoders import GCEncoder, encoder_modules
 from utils.flax_utils import ModuleDict, TrainState, nonpytree_field
-from utils.networks import MLP, GCActor, GCDiscreteActor, GCIQEValue, GCMRNValue, LogParam
+from utils.networks import (
+    MLP,
+    GCActor,
+    GCDiscreteActor,
+    GCIQEValue,
+    GCMRNValue,
+    LogParam,
+    actor_action_stack_kwargs_from_batch,
+    actor_action_stack_kwargs_from_value,
+    build_gc_actor_init,
+)
 
 
 class QRLAgent(flax.struct.PyTreeNode):
@@ -77,6 +87,7 @@ class QRLAgent(flax.struct.PyTreeNode):
 
     def actor_loss(self, batch, grad_params, rng=None):
         """Compute the actor loss (AWR or DDPG+BC)."""
+        akw = actor_action_stack_kwargs_from_batch(self.config, batch)
         if self.config['actor_loss'] == 'awr':
             # Compute AWR loss based on V(s', g) - V(s, g).
             v = -self.network.select('value')(batch['observations'], batch['actor_goals'])
@@ -86,7 +97,9 @@ class QRLAgent(flax.struct.PyTreeNode):
             exp_a = jnp.exp(adv * self.config['alpha'])
             exp_a = jnp.minimum(exp_a, 100.0)
 
-            dist = self.network.select('actor')(batch['observations'], batch['actor_goals'], params=grad_params)
+            dist = self.network.select('actor')(
+                batch['observations'], batch['actor_goals'], params=grad_params, **akw
+            )
             log_prob = dist.log_prob(batch['actions'])
 
             actor_loss = -(exp_a * log_prob).mean()
@@ -109,7 +122,9 @@ class QRLAgent(flax.struct.PyTreeNode):
             # Compute DDPG+BC loss based on latent dynamics model.
             assert not self.config['discrete']
 
-            dist = self.network.select('actor')(batch['observations'], batch['actor_goals'], params=grad_params)
+            dist = self.network.select('actor')(
+                batch['observations'], batch['actor_goals'], params=grad_params, **akw
+            )
             if self.config['const_std']:
                 q_actions = jnp.clip(dist.mode(), -1, 1)
             else:
@@ -185,10 +200,12 @@ class QRLAgent(flax.struct.PyTreeNode):
         observations,
         goals=None,
         seed=None,
+        action_stack=None,
         temperature=1.0,
     ):
         """Sample actions from the actor."""
-        dist = self.network.select('actor')(observations, goals, temperature=temperature)
+        akw = actor_action_stack_kwargs_from_value(self.config, action_stack)
+        dist = self.network.select('actor')(observations, goals, temperature=temperature, **akw)
         actions = dist.sample(seed=seed)
         if not self.config['discrete']:
             actions = jnp.clip(actions, -1, 1)
@@ -201,6 +218,7 @@ class QRLAgent(flax.struct.PyTreeNode):
         ex_observations,
         ex_actions,
         config,
+        ex_action_stack=None,
     ):
         """Create a new agent.
 
@@ -273,7 +291,7 @@ class QRLAgent(flax.struct.PyTreeNode):
 
         network_info = dict(
             value=(value_def, (ex_observations, ex_goals)),
-            actor=(actor_def, (ex_observations, ex_goals)),
+            actor=(actor_def, build_gc_actor_init(ex_observations, ex_goals, ex_action_stack)),
             lam=(lam_def, ()),
         )
         if config['actor_loss'] == 'ddpgbc':

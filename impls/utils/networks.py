@@ -163,6 +163,9 @@ class GCActor(nn.Module):
     tanh_squash: bool = False
     state_dependent_std: bool = False
     const_std: bool = True
+    # When const_std=True, use this as the fixed standard deviation (log_std =
+    # log(const_std_val); 1.0 matches the old jnp.zeros_like(means) behavior).
+    const_std_val: float = 1.0
     final_fc_init_scale: float = 1e-2
     gc_encoder: nn.Module = None
 
@@ -186,6 +189,7 @@ class GCActor(nn.Module):
         goals=None,
         goal_encoded=False,
         temperature=1.0,
+        action_stack=None,
     ):
         """Return the action distribution.
 
@@ -193,6 +197,9 @@ class GCActor(nn.Module):
         action vectors of size ``action_dim * chunk_length``.  Callers that
         need ``(B, chunk_length, action_dim)`` should reshape ``dist.mode()``
         or ``dist.sample()`` accordingly.
+
+        When ``action_stack`` is set (shape ``(B, L, action_dim)`` or flattened),
+        it is concatenated to the encoder output (past L actions, oldest first).
         """
         if self.gc_encoder is not None:
             inputs = self.gc_encoder(observations, goals, goal_encoded=goal_encoded)
@@ -201,6 +208,9 @@ class GCActor(nn.Module):
             if goals is not None:
                 inputs.append(goals)
             inputs = jnp.concatenate(inputs, axis=-1)
+        if action_stack is not None:
+            aflat = action_stack.reshape(action_stack.shape[0], -1) if action_stack.ndim > 2 else action_stack
+            inputs = jnp.concatenate([inputs, aflat], axis=-1)
         outputs = self.actor_net(inputs)
 
         means = self.mean_net(outputs)
@@ -208,7 +218,7 @@ class GCActor(nn.Module):
             log_stds = self.log_std_net(outputs)
         else:
             if self.const_std:
-                log_stds = jnp.zeros_like(means)
+                log_stds = jnp.full_like(means, jnp.log(self.const_std_val))
             else:
                 log_stds = self.log_stds
 
@@ -256,6 +266,7 @@ class GCDiscreteActor(nn.Module):
         goals=None,
         goal_encoded=False,
         temperature=1.0,
+        action_stack=None,
     ):
         """Return the action distribution.
 
@@ -264,6 +275,7 @@ class GCDiscreteActor(nn.Module):
             goals: Goals (optional).
             goal_encoded: Whether the goals are already encoded.
             temperature: Inverse scaling factor for the logits (set to 0 to get the argmax).
+            action_stack: Optional past actions (B, L, A) or (B, L*A) concatenated to encoder output.
         """
         if self.gc_encoder is not None:
             inputs = self.gc_encoder(observations, goals, goal_encoded=goal_encoded)
@@ -272,6 +284,9 @@ class GCDiscreteActor(nn.Module):
             if goals is not None:
                 inputs.append(goals)
             inputs = jnp.concatenate(inputs, axis=-1)
+        if action_stack is not None:
+            aflat = action_stack.reshape(action_stack.shape[0], -1) if action_stack.ndim > 2 else action_stack
+            inputs = jnp.concatenate([inputs, aflat], axis=-1)
         outputs = self.actor_net(inputs)
 
         logits = self.logit_net(outputs)
@@ -289,8 +304,7 @@ class GCDiscreteActor(nn.Module):
                 dist = distrax.Categorical(logits=logits[:, i, :] / jnp.maximum(1e-6, temperature))
                 distributions.append(dist)
             
-            # Return a custom distribution that handles multi-dimensional discrete actions
-            return MultiDiscreteDistribution(distributions)
+            return MultiDiscreteDistribution(distributions, num_bins=self.num_bins_per_dim)
         else:
             # Single discrete distribution
             distribution = distrax.Categorical(logits=logits / jnp.maximum(1e-6, temperature))
@@ -298,79 +312,100 @@ class GCDiscreteActor(nn.Module):
 
 
 class MultiDiscreteDistribution:
-    """Custom distribution for multi-dimensional discrete actions."""
-    
-    def __init__(self, distributions):
+    """3D action distribution backed by 3 independent categoricals over bins.
+
+    Fixed to CARLA-style actions ``[throttle, steer, brake]``:
+      - dim 0 (throttle): continuous in [0, 1], bins = linspace(0, 1, num_bins)
+      - dim 1 (steer):    continuous in [-1, 1], bins = linspace(-1, 1, num_bins)
+      - dim 2 (brake):    continuous in [0, 1], bins = linspace(0, 1, num_bins)
+
+    External API is continuous (callers don't need to know about bins):
+      - ``mode()``  -> (B, 3) bin-center of argmax per dim
+      - ``sample(seed)`` -> (B, 3) bin-center of sampled index per dim
+      - ``mean()``  -> (B, 3) softmax-weighted average of bin centers
+      - ``log_prob(actions)`` accepts continuous (B, 3) (or (B, 3*chunk_len)
+        with chunk_len==1) and internally bins them before summing the
+        per-dim Categorical log-probs. This lets the rest of the pipeline
+        keep treating actions as float32 while the head is categorical.
+    """
+
+    # CARLA action ranges; the head only ever outputs (throttle, steer, brake).
+    _LO = (0.0, -1.0, 0.0)
+    _HI = (1.0, 1.0, 1.0)
+
+    def __init__(self, distributions, num_bins=32):
         self.distributions = distributions
         self.num_dims = len(distributions)
-    
+        self.num_bins = int(num_bins)
+        # Per-dim bin centers stacked along a leading "dim" axis.
+        self._centers = jnp.stack(
+            [
+                jnp.linspace(self._LO[i], self._HI[i], self.num_bins)
+                for i in range(self.num_dims)
+            ],
+            axis=0,
+        )  # (num_dims, num_bins)
+        self._lo = jnp.asarray(self._LO[: self.num_dims])
+        self._hi = jnp.asarray(self._HI[: self.num_dims])
+
+    def _to_bin_indices(self, actions):
+        """(B, num_dims) continuous -> (B, num_dims) int32 bin indices."""
+        clipped = jnp.clip(actions, self._lo, self._hi)
+        normalized = (clipped - self._lo) / (self._hi - self._lo)  # [0, 1]
+        idx = jnp.round(normalized * (self.num_bins - 1)).astype(jnp.int32)
+        return jnp.clip(idx, 0, self.num_bins - 1)
+
+    def _indices_to_centers(self, indices):
+        """(B, num_dims) int -> (B, num_dims) continuous bin-center values."""
+        centers_b = jnp.broadcast_to(
+            self._centers[None, :, :], (indices.shape[0], self.num_dims, self.num_bins)
+        )
+        return jnp.take_along_axis(centers_b, indices[:, :, None], axis=-1).squeeze(-1)
+
     def sample(self, seed=None):
-        """Sample actions from each dimension independently."""
         if seed is not None:
             seeds = jax.random.split(seed, self.num_dims)
         else:
             seeds = [None] * self.num_dims
-        
-        samples = []
-        for i, dist in enumerate(self.distributions):
-            sample = dist.sample(seed=seeds[i])
-            samples.append(sample)
-        
-        # Stack to get shape (batch_size, num_dims)
-        return jnp.stack(samples, axis=-1)
-    
+        indices = jnp.stack(
+            [self.distributions[i].sample(seed=seeds[i]) for i in range(self.num_dims)],
+            axis=-1,
+        )
+        return self._indices_to_centers(indices)
+
     def mode(self):
-        """Get the mode (most likely action) for each dimension."""
-        modes = []
-        for dist in self.distributions:
-            mode = dist.mode()
-            modes.append(mode)
-        
-        # Stack to get shape (batch_size, num_dims)
-        return jnp.stack(modes, axis=-1)
-    
+        indices = jnp.stack([d.mode() for d in self.distributions], axis=-1)
+        return self._indices_to_centers(indices)
+
     def log_prob(self, actions):
-        """Compute log probability of actions.
-        
-        Args:
-            actions: Actions of shape (batch_size, num_dims)
+        """Log-prob of continuous (B, num_dims) actions, summed across dims.
+
+        A chunk-flattened (B, chunk_len*num_dims) input is tolerated with
+        chunk_len==1 (i.e. trailing dim already == num_dims). Longer chunks
+        aren't supported by this head; GCBC should enforce chunk_len==1.
         """
-        log_probs = []
-        for i, dist in enumerate(self.distributions):
-            log_prob = dist.log_prob(actions[:, i])
-            log_probs.append(log_prob)
-        
-        # Sum log probabilities across dimensions
-        return jnp.sum(jnp.stack(log_probs, axis=-1), axis=-1)
-    
+        if actions.ndim == 2 and actions.shape[-1] != self.num_dims:
+            actions = actions[:, : self.num_dims]
+        idx = self._to_bin_indices(actions)  # (B, num_dims) int32
+        lps = jnp.stack(
+            [self.distributions[d].log_prob(idx[:, d]) for d in range(self.num_dims)],
+            axis=-1,
+        )
+        return jnp.sum(lps, axis=-1)
+
     def mean(self):
-        """Convert discrete bins to continuous action values using linspace.
-        
-        This method computes the expected continuous action value by taking the weighted
-        average of bin centers, where weights are the softmax probabilities.
-        """
-        num_bins = 32
-        throttle_centers = jnp.linspace(0, 1, num_bins)
-        steer_centers = jnp.linspace(-1, 1, num_bins)
-        brake_centers = jnp.linspace(0, 1, num_bins)
+        """Softmax-weighted average of bin centers per dim; continuous (B, num_dims)."""
+        probs = jnp.stack(
+            [jax.nn.softmax(d.logits, axis=-1) for d in self.distributions], axis=1
+        )  # (B, num_dims, num_bins)
+        return jnp.sum(probs * self._centers[None, :, :], axis=-1)
 
-        all_centers = jnp.stack([throttle_centers, steer_centers, brake_centers], axis=0)
+    def entropy(self):
+        ents = jnp.stack([d.entropy() for d in self.distributions], axis=-1)
+        return jnp.sum(ents, axis=-1)
 
-        probs = []
-        for dist in self.distributions:
-            prob = jax.nn.softmax(dist.logits, axis=-1)
-            probs.append(prob)
-        
-        probs = jnp.stack(probs, axis=1)
-        batch_size = probs.shape[0]
-        centers_broadcast = all_centers[None, :, :]
-
-        mean_actions = jnp.sum(probs * centers_broadcast, axis=-1) 
-        return mean_actions
-    
     @property
     def logits(self):
-        """Get the logits for all dimensions."""
         return jnp.stack([dist.logits for dist in self.distributions], axis=1)
 
 
@@ -788,3 +823,30 @@ class GoalClassifier(nn.Module):
         # Output logit
         logit = self.classifier_head(inputs).squeeze(-1)
         return logit
+
+
+def build_gc_actor_init(ex_observations, ex_goals, ex_action_stack=None):
+    """Keyword args for :class:`GCActor` / :class:`GCDiscreteActor` ``init`` (``ModuleDict`` mapping)."""
+    d = dict(observations=ex_observations, goals=ex_goals)
+    if ex_action_stack is not None:
+        d["action_stack"] = ex_action_stack
+    return d
+
+
+def actor_action_stack_kwargs_from_batch(config, batch):
+    """Pass ``action_stack`` to the actor when ``action_stack_length`` > 1."""
+    L = int(config.get("action_stack_length", 1) or 1)
+    if L <= 1:
+        return {}
+    ast = batch.get("action_stack")
+    if ast is None:
+        return {}
+    return {"action_stack": ast}
+
+
+def actor_action_stack_kwargs_from_value(config, action_stack):
+    """For ``sample_actions`` / inference when action history is provided explicitly."""
+    L = int(config.get("action_stack_length", 1) or 1)
+    if L <= 1 or action_stack is None:
+        return {}
+    return {"action_stack": action_stack}

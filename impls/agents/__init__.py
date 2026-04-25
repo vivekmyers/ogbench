@@ -9,6 +9,7 @@ from .qrl import QRLAgent
 from .sac import SACAgent
 from .cmd import CMDAgent
 from .tmd import TMDAgent
+from .tmd_dc import TMDDCAgent
 from .tmd_dqc import TMDDQCAgent
 from .tmd_qc import TMDQCAgent
 #from impls.agents.tra import TRAAgent
@@ -26,6 +27,7 @@ agents = dict(
     sac=SACAgent,
     cmd=CMDAgent,
     tmd=TMDAgent,
+    tmd_dc=TMDDCAgent,
     tmd_dqc=TMDDQCAgent,
     tmd_qc=TMDQCAgent,
     #tra=TRAAgent,

@@ -14,6 +14,9 @@ from utils.networks import (
     GCDiscreteActor,
     GCDiscreteBilinearCritic,
     GoalDistanceHead,
+    actor_action_stack_kwargs_from_batch,
+    actor_action_stack_kwargs_from_value,
+    build_gc_actor_init,
 )
 
 
@@ -84,6 +87,7 @@ class CRLAgent(flax.struct.PyTreeNode):
 
     def actor_loss(self, batch, grad_params, rng=None):
         """Compute the actor loss (AWR or DDPG+BC)."""
+        akw = actor_action_stack_kwargs_from_batch(self.config, batch)
         if self.config['actor_loss'] == 'awr':
             # AWR loss.
             v = self.network.select('value')(batch['observations'], batch['actor_goals'])
@@ -94,7 +98,9 @@ class CRLAgent(flax.struct.PyTreeNode):
             exp_a = jnp.exp(adv * self.config['alpha'])
             exp_a = jnp.minimum(exp_a, 100.0)
 
-            dist = self.network.select('actor')(batch['observations'], batch['actor_goals'], params=grad_params)
+            dist = self.network.select('actor')(
+                batch['observations'], batch['actor_goals'], params=grad_params, **akw
+            )
             log_prob = dist.log_prob(batch['actions'])
 
             pred_actions = dist.mode()
@@ -119,7 +125,9 @@ class CRLAgent(flax.struct.PyTreeNode):
             # DDPG+BC loss.
             assert not self.config['discrete']
 
-            dist = self.network.select('actor')(batch['observations'], batch['actor_goals'], params=grad_params)
+            dist = self.network.select('actor')(
+                batch['observations'], batch['actor_goals'], params=grad_params, **akw
+            )
             if self.config['const_std']:
                 q_actions = jnp.clip(dist.mode(), -1, 1)
             else:
@@ -191,10 +199,12 @@ class CRLAgent(flax.struct.PyTreeNode):
         observations,
         goals=None,
         seed=None,
+        action_stack=None,
         temperature=1.0,
     ):
         """Sample actions from the actor."""
-        dist = self.network.select('actor')(observations, goals, temperature=temperature)
+        akw = actor_action_stack_kwargs_from_value(self.config, action_stack)
+        dist = self.network.select('actor')(observations, goals, temperature=temperature, **akw)
         actions = dist.sample(seed=seed)
         if not self.config['discrete']:
             actions = jnp.clip(actions, -1, 1)
@@ -207,6 +217,7 @@ class CRLAgent(flax.struct.PyTreeNode):
         ex_observations,
         ex_actions,
         config,
+        ex_action_stack=None,
     ):
         """Create a new agent.
 
@@ -288,7 +299,7 @@ class CRLAgent(flax.struct.PyTreeNode):
 
         network_info = dict(
             critic=(critic_def, (ex_observations, ex_goals, ex_actions)),
-            actor=(actor_def, (ex_observations, ex_goals)),
+            actor=(actor_def, build_gc_actor_init(ex_observations, ex_goals, ex_action_stack)),
         )
         if config['actor_loss'] == 'awr':
             network_info.update(

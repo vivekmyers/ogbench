@@ -10,7 +10,13 @@ from typing import Dict
 
 from utils.encoders import GCEncoder, encoder_modules
 from utils.flax_utils import ModuleDict, TrainState, nonpytree_field
-from utils.networks import GCActor, GCDiscreteActor
+from utils.networks import (
+    GCActor,
+    GCDiscreteActor,
+    actor_action_stack_kwargs_from_batch,
+    actor_action_stack_kwargs_from_value,
+    build_gc_actor_init,
+)
 
 
 class GCBCAgent(flax.struct.PyTreeNode):
@@ -22,12 +28,29 @@ class GCBCAgent(flax.struct.PyTreeNode):
 
     def actor_loss(self, batch, grad_params, rng=None):
         chunk_len = self.config.get('action_chunk_length', 1)
-        dist = self.network.select('actor')(batch['observations'], batch['actor_goals'], params=grad_params)
+        is_multi_disc = bool(self.config.get('multi_discrete', False)) and bool(self.config.get('discrete', False))
+        dist = self.network.select('actor')(
+            batch['observations'],
+            batch['actor_goals'],
+            params=grad_params,
+            **actor_action_stack_kwargs_from_batch(self.config, batch),
+        )
 
         action_targets = batch['action_chunks'].reshape(batch['action_chunks'].shape[0], -1)  # (B, chunk_len * action_dim)
         log_prob = dist.log_prob(action_targets)
 
-        actor_loss = -log_prob.mean()
+        loss_type = self.config.get('actor_loss', 'nll')
+        if loss_type == 'huber' and not self.config['discrete']:
+            # Huber regression on the mode: L2 for small errors, linear for large ones.
+            # Prevents rare "throttle/brake swapped" frames from dominating with huge
+            # quadratic gradients. delta is tunable via cfg.huber_delta (default 0.1).
+            delta = float(self.config.get('huber_delta', 0.1))
+            predicted = dist.mode()
+            actor_loss = jnp.mean(
+                optax.huber_loss(predicted, action_targets, delta=delta)
+            )
+        else:
+            actor_loss = -log_prob.mean()
 
         actor_info = {
             'actor_loss': actor_loss,
@@ -46,6 +69,18 @@ class GCBCAgent(flax.struct.PyTreeNode):
                 pred_first = predicted[:, :action_dim]
                 target_first = action_targets[:, :action_dim]
                 actor_info['mse_first'] = jnp.mean((pred_first - target_first) ** 2)
+        elif is_multi_disc:
+            # For monitoring: MultiDiscreteDistribution.mode() returns continuous
+            # bin-center values, so MSE is comparable to the Gaussian path.
+            predicted = dist.mode()  # (B, num_dims) continuous
+            pred_flat = predicted.reshape(predicted.shape[0], -1)
+            tgt_flat = action_targets[:, : pred_flat.shape[-1]]
+            mse_per_sample = jnp.mean((pred_flat - tgt_flat) ** 2, axis=-1)
+            actor_info['mse'] = jnp.mean(mse_per_sample)
+            actor_info['mse_std'] = jnp.std(mse_per_sample)
+            actor_info['mse_max'] = jnp.max(mse_per_sample)
+            actor_info['mse_first'] = actor_info['mse']  # chunk_len == 1 for multi_discrete
+            actor_info['entropy'] = jnp.mean(dist.entropy())
 
         return actor_loss, actor_info
 
@@ -79,11 +114,22 @@ class GCBCAgent(flax.struct.PyTreeNode):
         observations,
         goals=None,
         seed=None,
+        action_stack=None,
         temperature=1.0,
     ):
         chunk_len = self.config.get('action_chunk_length', 1)
-        dist = self.network.select('actor')(observations, goals, temperature=temperature)
+        is_multi_disc = bool(self.config.get('multi_discrete', False)) and bool(self.config.get('discrete', False))
+        akw = actor_action_stack_kwargs_from_value(self.config, action_stack)
+        dist = self.network.select('actor')(observations, goals, temperature=temperature, **akw)
         actions = dist.sample(seed=seed)
+        if is_multi_disc:
+            # dist.sample() already returns continuous bin-center values. Clip
+            # to CARLA action ranges (throttle/brake in [0,1], steer in [-1,1])
+            # and skip the chunk reshape: multi_discrete enforces chunk_len==1.
+            lo = jnp.array([0.0, -1.0, 0.0], dtype=actions.dtype)
+            hi = jnp.array([1.0, 1.0, 1.0], dtype=actions.dtype)
+            actions = jnp.clip(actions, lo, hi)
+            return actions
         if not self.config['discrete']:
             actions = jnp.clip(actions, -1, 1)
         if chunk_len > 1:
@@ -99,11 +145,14 @@ class GCBCAgent(flax.struct.PyTreeNode):
         ex_observations,
         ex_actions,
         config,
+        ex_goals=None,
+        ex_action_stack=None,
     ):
         rng = jax.random.PRNGKey(seed)
         rng, init_rng = jax.random.split(rng, 2)
 
-        ex_goals = ex_observations
+        if ex_goals is None:
+            ex_goals = ex_observations
         if config['discrete']:
             if config.get('multi_discrete', False):
                 # For multi-discrete actions, we don't need action_dim in the traditional sense
@@ -125,8 +174,8 @@ class GCBCAgent(flax.struct.PyTreeNode):
                 actor_def = GCDiscreteActor(
                     hidden_dims=config['actor_hidden_dims'],
                     action_dim=None,  # Not used for multi-discrete
-                    num_bins_per_dim=32,
-                    num_dims=3,
+                    num_bins_per_dim=int(config.get('num_bins_per_dim', 32)),
+                    num_dims=int(config.get('multi_discrete_num_dims', 3)),
                     multi_discrete=True,
                     gc_encoder=encoders.get('actor'),
                 )
@@ -149,7 +198,7 @@ class GCBCAgent(flax.struct.PyTreeNode):
             )
 
         network_info = dict(
-            actor=(actor_def, (ex_observations, ex_goals)),
+            actor=(actor_def, build_gc_actor_init(ex_observations, ex_goals, ex_action_stack)),
         )
         networks = {k: v[0] for k, v in network_info.items()}
         network_args = {k: v[1] for k, v in network_info.items()}
@@ -263,12 +312,14 @@ def get_config():
             p_aug=0.5,  # Probability of applying image augmentation.
             frame_stack=ml_collections.config_dict.placeholder(int),  # Number of frames to stack.
             block_size=1000,  # Block size for goal sampling (trajectory length).
-            upsample_mode='none',  # Upsampling mode: 'turns_low', 'turns_high', 'throttle_low', 'throttle_high', 'brake_low', 'brake_high', 'none'
+            upsample_mode='turns_high',  # 'turns_high': oversample |steer|>steer_thresh; see also train.py cfg
             upsample_weight=3.0,  # Weight multiplier for upsampled samples
             steer_thresh=0.1,  # Steer threshold for low/high detection
             throttle_thresh=0.3,  # Throttle threshold for low/high detection
             brake_thresh=0.1,  # Brake threshold for low/high detection
             cycle_steps=20000,  # Steps per mode in cycle (20k each = 120k full cycle)
+            actor_loss='nll',  # BC loss type: 'nll' (Gaussian NLL = MSE), 'huber'.
+            huber_delta=0.1,  # Huber loss threshold (only used when actor_loss='huber').
         )
     )
     return config

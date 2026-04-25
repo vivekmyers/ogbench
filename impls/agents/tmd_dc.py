@@ -1,3 +1,21 @@
+"""TMD with a double critic.
+
+Critic 1 (``phi``, ``psi``): identical to ``agents.tmd.TMDAgent`` — contrastive
+goal-reaching loss + invariance loss + LINEX backup (+ optional dual-descent).
+
+Critic 2 (``phi_am``, ``psi_am``): a *separate* action-match critic.  It grades
+how well an action fits the current state's representation by training
+``phi_am(s, a)`` to be close to ``psi_am(s)`` (positive) and far from
+``psi_am(s')`` for other states ``s'`` in the batch (negatives), using InfoNCE
+on the same MRN/IQE distance machinery.
+
+Together, in the actor, the second critic acts as an action-consistency bonus:
+
+    q = -D(phi(s, a), psi(g))  +  q_match_weight * ( -D(phi_am(s, a), psi_am(s)) )
+
+None of the existing TMD/QC/DQC agent modules are modified.
+"""
+
 from typing import Any
 
 import flax
@@ -20,12 +38,16 @@ from utils.networks import (
 )
 
 
-class TMDAgent(flax.struct.PyTreeNode):
-    """Temporal Metric Distillation (TMD) agent."""
+class TMDDCAgent(flax.struct.PyTreeNode):
+    """TMD with a goal-reaching critic and a separate action-match critic."""
 
     rng: Any
     network: Any
     config: Any = nonpytree_field()
+
+    # ------------------------------------------------------------------ #
+    #  Distance primitives (identical to TMDAgent)                        #
+    # ------------------------------------------------------------------ #
 
     @jax.jit
     def mrn_distance(self, x, y):
@@ -45,7 +67,6 @@ class TMDAgent(flax.struct.PyTreeNode):
         x_split = jnp.stack(jnp.split(x, K, axis=-1), axis=-1)
         y_split = jnp.stack(jnp.split(y, K, axis=-1), axis=-1)
         dists = jax.vmap(mrn_distance_component, in_axes=(-1, -1), out_axes=-1)(x_split, y_split)
-
         return dists.mean(axis=-1)
 
     def iqe_distance(self, x, y):
@@ -76,21 +97,19 @@ class TMDAgent(flax.struct.PyTreeNode):
         else:
             return self.mrn_distance(x, y)
 
+    # ------------------------------------------------------------------ #
+    #  Critic 1: goal-reaching TMD loss (unchanged from agents/tmd.py)    #
+    # ------------------------------------------------------------------ #
+
     @jax.jit
     def critic_loss(self, batch, grad_params):
         batch_size = batch['observations'].shape[0]
-        if self.config['encoder'] is not None:
-            phi = self.network.select('phi')(batch['observations'], batch['actions'], params=grad_params)
-            psi_s = self.network.select('psi')(batch['observations'], params=grad_params)
-            psi_next = self.network.select('psi')(batch['next_observations'], params=grad_params)
-            psi_g = self.network.select('psi')(batch['value_goals'], params=grad_params)
-        else:
-            phi = self.network.select('phi')(batch['observations'], batch['actions'], params=grad_params)
-            psi_s = self.network.select('psi')(batch['observations'], params=grad_params)
-            psi_next = self.network.select('psi')(batch['next_observations'], params=grad_params)
-            psi_g = self.network.select('psi')(batch['value_goals'], params=grad_params)
+        phi = self.network.select('phi')(batch['observations'], batch['actions'], params=grad_params)
+        psi_s = self.network.select('psi')(batch['observations'], params=grad_params)
+        psi_next = self.network.select('psi')(batch['next_observations'], params=grad_params)
+        psi_g = self.network.select('psi')(batch['value_goals'], params=grad_params)
 
-        if len(phi.shape) == 2:  # Non-ensemble
+        if len(phi.shape) == 2:
             phi = phi[None, ...]
             psi_s = psi_s[None, ...]
             psi_next = psi_next[None, ...]
@@ -98,18 +117,17 @@ class TMDAgent(flax.struct.PyTreeNode):
 
         dist = self.distance(phi[:, :, None], psi_g[:, None, :])
         logits = -dist / jnp.sqrt(phi.shape[-1])
-        # logits.shape is (e, B, B) with one term for positive pair and (B - 1) terms for negative pairs in each row.
 
         I = jnp.eye(batch_size)
         contrastive_loss = jax.vmap(
             lambda _logits: optax.softmax_cross_entropy(logits=_logits.T, labels=I),
         )(logits)
         contrastive_loss = jnp.mean(contrastive_loss)
+
         if self.config['stopgrad_phi_invariance']:
             action_dist = self.distance(psi_s, jax.lax.stop_gradient(phi))
         else:
             action_dist = self.distance(psi_s, phi)
-
         action_invariance_loss = jnp.mean(action_dist)
 
         dist_next = self.distance(psi_next[:, :, None], psi_g[:, None, :])
@@ -128,41 +146,95 @@ class TMDAgent(flax.struct.PyTreeNode):
         dw = self.config['diag_backup']
         divergence = divergence * (1 - dw) + jnp.diagonal(divergence, axis1=1, axis2=2)[..., None] * dw
         backup_loss = jnp.mean(divergence)
+
         if self.config['dual_descent']:
             optim_backup = 1 - jax.lax.stop_gradient(dist_next) + jnp.log(gamma)
             optim_backup = optim_backup * (1 - dw) + jnp.diagonal(optim_backup, axis1=1, axis2=2)[..., None] * dw
-            backup_optim_loss= jnp.mean(divergence - optim_backup)
+            backup_optim_loss = jnp.mean(divergence - optim_backup)
             val = jnp.exp(-(jax.lax.stop_gradient(backup_optim_loss) + jax.lax.stop_gradient(action_invariance_loss)))
-            critic_loss = val * contrastive_loss + backup_loss + action_invariance_loss
+            critic_loss_val = val * contrastive_loss + backup_loss + action_invariance_loss
         else:
-            critic_loss = contrastive_loss + self.config['zeta'] * action_invariance_loss + self.config['zeta'] * backup_loss
+            critic_loss_val = (
+                contrastive_loss
+                + self.config['zeta'] * action_invariance_loss
+                + self.config['zeta'] * backup_loss
+            )
 
-        logits = jnp.mean(logits, axis=0)
-        correct = jnp.argmax(logits, axis=1) == jnp.argmax(I, axis=1)
-        logits_pos = jnp.sum(logits * I) / jnp.sum(I)
-        logits_neg = jnp.sum(logits * (1 - I)) / jnp.sum(1 - I)
+        logits_mean = jnp.mean(logits, axis=0)
+        correct = jnp.argmax(logits_mean, axis=1) == jnp.argmax(I, axis=1)
+        logits_pos = jnp.sum(logits_mean * I) / jnp.sum(I)
+        logits_neg = jnp.sum(logits_mean * (1 - I)) / jnp.sum(1 - I)
 
         return (
             (contrastive_loss, backup_loss, action_invariance_loss),
-            critic_loss,
+            critic_loss_val,
             {
                 'contrastive_loss': contrastive_loss,
                 'action_invariance_loss': action_invariance_loss,
                 'backup_loss': backup_loss,
-                'critic_loss': critic_loss,
-                'binary_accuracy': jnp.mean((logits > 0) == I),
+                'critic_loss': critic_loss_val,
+                'binary_accuracy': jnp.mean((logits_mean > 0) == I),
                 'categorical_accuracy': jnp.mean(correct),
                 'logits_pos': logits_pos,
                 'logits_neg': logits_neg,
-                'logits': logits.mean(),
+                'logits': logits_mean.mean(),
                 'dist': dist.mean(),
                 'biggest_diff_in_dist': jnp.max(dist - dist_next),
             },
         )
 
+    # ------------------------------------------------------------------ #
+    #  Critic 2: action-match contrastive loss                            #
+    # ------------------------------------------------------------------ #
+    #
+    # For a batch of (s_i, a_i):
+    #   phi_am[i] = phi_am(s_i, a_i)          # "what action was taken from s_i"
+    #   psi_am[j] = psi_am(s_j)               # state-only key
+    # Positive pair: (i, i) — the action was actually taken from state s_i.
+    # Negative pairs: (i, j), j != i — action a_i was not taken from state s_j.
+    # We minimise InfoNCE over logits L[i, j] = -D(phi_am[i], psi_am[j]).
+    # This gives a score that is high when an action "matches" a state.
+
+    @jax.jit
+    def action_match_loss(self, batch, grad_params):
+        batch_size = batch['observations'].shape[0]
+        phi_am = self.network.select('phi_am')(
+            batch['observations'], batch['actions'], params=grad_params
+        )
+        psi_am = self.network.select('psi_am')(batch['observations'], params=grad_params)
+
+        if len(phi_am.shape) == 2:
+            phi_am = phi_am[None, ...]
+            psi_am = psi_am[None, ...]
+
+        dist = self.distance(phi_am[:, :, None], psi_am[:, None, :])
+        logits = -dist / jnp.sqrt(phi_am.shape[-1])
+
+        I = jnp.eye(batch_size)
+        am_contrastive = jax.vmap(
+            lambda _logits: optax.softmax_cross_entropy(logits=_logits.T, labels=I),
+        )(logits)
+        am_contrastive = jnp.mean(am_contrastive)
+
+        logits_mean = jnp.mean(logits, axis=0)
+        correct = jnp.argmax(logits_mean, axis=1) == jnp.argmax(I, axis=1)
+        logits_pos = jnp.sum(logits_mean * I) / jnp.sum(I)
+        logits_neg = jnp.sum(logits_mean * (1 - I)) / jnp.sum(1 - I)
+
+        return am_contrastive, {
+            'am_contrastive_loss': am_contrastive,
+            'am_categorical_accuracy': jnp.mean(correct),
+            'am_logits_pos': logits_pos,
+            'am_logits_neg': logits_neg,
+            'am_dist': dist.mean(),
+        }
+
+    # ------------------------------------------------------------------ #
+    #  Actor: DDPG+BC with combined goal-reaching and action-match Q      #
+    # ------------------------------------------------------------------ #
+
     @jax.jit
     def actor_loss(self, batch, grad_params, rng=None):
-        # Maximize log Q if actor_log_q is True (which is default).
         chunk_len = int(self.config.get('action_chunk_length', 1))
         action_dim = batch['actions'].shape[-1]
 
@@ -192,8 +264,6 @@ class TMDAgent(flax.struct.PyTreeNode):
                     psi_g_bc = jax.lax.stop_gradient(psi_g_bc)
             dist = self.network.select('actor')(psi_s, psi_g, params=grad_params, **akw)
             if p_bc > 0.0:
-                # BC uses random goals: do not backprop through ψ(goal) or ψ(obs) so the TMD critic's ψ
-                # is trained only by critic_loss (and the Q branch below), not by BC under wrong goals.
                 dist_bc = self.network.select('actor')(
                     jax.lax.stop_gradient(psi_s),
                     jax.lax.stop_gradient(psi_g_bc),
@@ -207,38 +277,53 @@ class TMDAgent(flax.struct.PyTreeNode):
                 batch['observations'], batch['actor_goals'], params=grad_params, **akw
             )
             if p_bc > 0.0:
-                dist_bc = self.network.select('actor')(batch['observations'], bc_goals, params=grad_params, **akw)
+                dist_bc = self.network.select('actor')(
+                    batch['observations'], bc_goals, params=grad_params, **akw
+                )
             else:
                 dist_bc = dist
+
         if self.config['const_std']:
             q_flat = jnp.clip(dist.mode(), -1, 1)
         else:
             q_flat = jnp.clip(dist.sample(seed=rng), -1, 1)
 
-        # Phi(s, a) is defined on a single action; use the first step of the chunk for Q.
         if chunk_len > 1:
             q_actions = q_flat[:, :action_dim]
         else:
             q_actions = q_flat
 
+        # Goal-reaching Q via critic 1.
         phi = self.network.select('phi')(batch['observations'], q_actions)
-        psi = self.network.select('psi')(batch['actor_goals'])
-        q1, q2 = -self.distance(phi, psi)
-        q = jnp.minimum(q1, q2)
+        psi_goal = self.network.select('psi')(batch['actor_goals'])
+        q_goal_pair = -self.distance(phi, psi_goal)
+        q1, q2 = q_goal_pair
+        q_goal = jnp.minimum(q1, q2)
 
-        # Normalize Q values by the absolute mean to make the loss scale invariant.
+        # Action-match Q via critic 2: actor wants phi_am(s, a) ~ psi_am(s).
+        phi_am = self.network.select('phi_am')(batch['observations'], q_actions)
+        psi_state = self.network.select('psi_am')(batch['observations'])
+        q_match_pair = -self.distance(phi_am, psi_state)
+        qm1, qm2 = q_match_pair
+        q_match = jnp.minimum(qm1, qm2)
+
+        w = float(self.config.get('q_match_weight', 1.0))
+        q = q_goal + w * q_match
+
         q_loss = -q.mean() / jax.lax.stop_gradient(jnp.abs(q).mean() + 1e-6)
 
         if self.config['discrete']:
             log_prob = dist_bc.log_prob(batch['actions'])
             bc_loss = -(self.config['alpha'] * log_prob).mean()
-            actor_loss = q_loss + bc_loss
+            actor_loss_val = q_loss + bc_loss
             pred = dist.mode()
-            return actor_loss, {
-                'actor_loss': actor_loss,
+            return actor_loss_val, {
+                'actor_loss': actor_loss_val,
                 'q_loss': q_loss,
                 'bc_loss': bc_loss,
                 'q_mean': q.mean(),
+                'q_goal_mean': q_goal.mean(),
+                'q_match_mean': q_match.mean(),
                 'q_abs_mean': jnp.abs(q).mean(),
                 'bc_log_prob': log_prob.mean(),
                 'mse': jnp.mean((pred - batch['actions']) ** 2),
@@ -247,71 +332,68 @@ class TMDAgent(flax.struct.PyTreeNode):
 
         action_targets = batch['action_chunks'].reshape(batch['action_chunks'].shape[0], -1)
         log_prob = dist_bc.log_prob(action_targets)
-
         bc_loss = -(self.config['alpha'] * log_prob).mean()
-
-        actor_loss = q_loss + bc_loss
+        actor_loss_val = q_loss + bc_loss
 
         pred = dist.mode()
         actor_info = {
-            'actor_loss': actor_loss,
+            'actor_loss': actor_loss_val,
             'q_loss': q_loss,
             'bc_loss': bc_loss,
             'q_mean': q.mean(),
+            'q_goal_mean': q_goal.mean(),
+            'q_match_mean': q_match.mean(),
             'q_abs_mean': jnp.abs(q).mean(),
             'bc_log_prob': log_prob.mean(),
             'mse': jnp.mean((pred - action_targets) ** 2),
             'std': jnp.mean(dist.scale_diag),
         }
         if chunk_len > 1:
-            actor_info['mse_first'] = jnp.mean((pred[:, :action_dim] - action_targets[:, :action_dim]) ** 2)
-
-        return actor_loss, actor_info
+            actor_info['mse_first'] = jnp.mean(
+                (pred[:, :action_dim] - action_targets[:, :action_dim]) ** 2
+            )
+        return actor_loss_val, actor_info
 
     @jax.jit
-    def total_loss(self, batch, grad_params, rng=None, critic_only=False, step: int=0):
+    def total_loss(self, batch, grad_params, rng=None, critic_only=False, step: int = 0):
         info = {}
         rng = rng if rng is not None else self.rng
 
-        (contrastive_loss, backup_loss, action_invariance_loss), critic_loss, critic_info = self.critic_loss(
-            batch, grad_params
-        )
+        (_c1, _bk, _inv), critic_loss_val, critic_info = self.critic_loss(batch, grad_params)
         for k, v in critic_info.items():
             info[f'critic/{k}'] = v
 
+        am_loss_val, am_info = self.action_match_loss(batch, grad_params)
+        for k, v in am_info.items():
+            info[f'critic/{k}'] = v
+
         rng, actor_rng = jax.random.split(rng)
-        actor_loss, actor_info = self.actor_loss(batch, grad_params, actor_rng)
+        actor_loss_val, actor_info = self.actor_loss(batch, grad_params, actor_rng)
         for k, v in actor_info.items():
             info[f'actor/{k}'] = v
 
-        loss = critic_loss + actor_loss
+        am_weight = float(self.config.get('am_loss_weight', 1.0))
+        loss = critic_loss_val + am_weight * am_loss_val + actor_loss_val
+        info['critic/am_loss_weighted'] = am_weight * am_loss_val
         return loss, info
 
     @jax.jit
-    def update(self, batch, critic_only=False, step: int=0):
+    def update(self, batch, critic_only=False, step: int = 0):
         new_rng, rng = jax.random.split(self.rng)
 
         def loss_fn(grad_params):
             return self.total_loss(batch, grad_params, rng=rng, critic_only=critic_only, step=step)
 
         new_network, info = self.network.apply_loss_fn(loss_fn=loss_fn)
-
         return self.replace(network=new_network, rng=new_rng), info
 
     @jax.jit
-    def sample_actions(
-        self,
-        observations,
-        goals=None,
-        seed=None,
-        action_stack=None,
-        temperature=1.0,
-    ):
+    def sample_actions(self, observations, goals=None, seed=None, action_stack=None, temperature=1.0):
         chunk_len = int(self.config.get('action_chunk_length', 1))
         akw = actor_action_stack_kwargs_from_value(self.config, action_stack)
         if self.config['use_latent']:
             psi_s, psi_g = self.network.select('psi')(observations), self.network.select('psi')(goals)
-            if len(psi_s.shape) == 2:  # in inference, we don't have batch dimension
+            if len(psi_s.shape) == 2:
                 psi_s = jnp.mean(psi_s, axis=0)
                 psi_g = jnp.mean(psi_g, axis=0)
             dist = self.network.select('actor')(psi_s, psi_g, temperature=temperature, **akw)
@@ -326,30 +408,29 @@ class TMDAgent(flax.struct.PyTreeNode):
                 actions = actions.reshape(*actions.shape[:-1], chunk_len, ad)
                 actions = actions[..., 0, :]
         return actions
-    
+
     @jax.jit
     def get_distance(self, observations, goals, actions):
-        #actions not used, will be used for cmd
         if self.config['use_action_for_distance']:
-            # psi = self.network.select('psi')(observations)
             phi = self.network.select('phi')(observations, actions)
         else:
             phi = self.network.select('psi')(observations)
         psi = self.network.select('psi')(goals)
-        dist = self.distance(phi, psi)
-        # print(dist.shape)
-        return dist
+        return self.distance(phi, psi)
+
+    @jax.jit
+    def get_action_match_score(self, observations, actions):
+        """Q-style score for (s, a): higher means 'action matches state' more."""
+        phi_am = self.network.select('phi_am')(observations, actions)
+        psi_am = self.network.select('psi_am')(observations)
+        return -self.distance(phi_am, psi_am)
+
+    # ------------------------------------------------------------------ #
+    #  Construction                                                       #
+    # ------------------------------------------------------------------ #
 
     @classmethod
-    def create(
-        cls,
-        seed,
-        ex_observations,
-        ex_actions,
-        config,
-        steps=None,
-        ex_action_stack=None,
-    ):
+    def create(cls, seed, ex_observations, ex_actions, config, steps=None, ex_action_stack=None):
         rng = jax.random.PRNGKey(seed)
         rng, init_rng = jax.random.split(rng, 2)
 
@@ -359,12 +440,16 @@ class TMDAgent(flax.struct.PyTreeNode):
         else:
             action_dim = ex_actions.shape[-1]
 
-        # Define encoders.
+        # Encoders: critic-1 and actor share one encoder_modules family; critic-2
+        # gets its *own* state encoder so the two critics learn independent
+        # state representations ("completely different" per design).
         encoders = dict()
         if config['encoder'] is not None:
             encoder_module = encoder_modules[config['encoder']]
             encoders['actor'] = GCEncoder(concat_encoder=encoder_module())
-            encoders['state'] = encoder_module()
+            encoders['state'] = encoder_module()     # shared across phi, psi
+            encoders['state_am'] = encoder_module()  # shared across phi_am, psi_am
+
         if config['discrete']:
             phi_def = DiscreteStateActionRepresentation(
                 hidden_dims=config['value_hidden_dims'],
@@ -382,6 +467,24 @@ class TMDAgent(flax.struct.PyTreeNode):
                 ensemble=True,
                 value_exp=True,
                 state_encoder=encoders.get('state'),
+                action_dim=action_dim,
+            )
+            phi_am_def = DiscreteStateActionRepresentation(
+                hidden_dims=config['value_hidden_dims'],
+                latent_dim=config['latent_dim'],
+                layer_norm=config['layer_norm'],
+                ensemble=True,
+                value_exp=True,
+                state_encoder=encoders.get('state_am'),
+                action_dim=action_dim,
+            )
+            psi_am_def = DiscreteStateActionRepresentation(
+                hidden_dims=config['value_hidden_dims'],
+                latent_dim=config['latent_dim'],
+                layer_norm=config['layer_norm'],
+                ensemble=True,
+                value_exp=True,
+                state_encoder=encoders.get('state_am'),
                 action_dim=action_dim,
             )
             actor_def = GCDiscreteActor(
@@ -406,6 +509,22 @@ class TMDAgent(flax.struct.PyTreeNode):
                 value_exp=True,
                 state_encoder=encoders.get('state'),
             )
+            phi_am_def = StateRepresentation(
+                hidden_dims=config['value_hidden_dims'],
+                latent_dim=config['latent_dim'],
+                layer_norm=config['layer_norm'],
+                ensemble=True,
+                value_exp=True,
+                state_encoder=encoders.get('state_am'),
+            )
+            psi_am_def = StateRepresentation(
+                hidden_dims=config['value_hidden_dims'],
+                latent_dim=config['latent_dim'],
+                layer_norm=config['layer_norm'],
+                ensemble=True,
+                value_exp=True,
+                state_encoder=encoders.get('state_am'),
+            )
             actor_def = GCActor(
                 hidden_dims=config['actor_hidden_dims'],
                 action_dim=action_dim,
@@ -414,11 +533,14 @@ class TMDAgent(flax.struct.PyTreeNode):
                 const_std=config['const_std'],
                 gc_encoder=encoders.get('actor'),
             )
+
         if config['use_iqe']:
             network_info = dict(
                 actor=(actor_def, build_gc_actor_init(ex_observations, ex_goals, ex_action_stack)),
                 phi=(phi_def, (ex_observations, ex_actions)),
                 psi=(psi_def, (ex_goals,)),
+                phi_am=(phi_am_def, (ex_observations, ex_actions)),
+                psi_am=(psi_am_def, (ex_observations,)),
                 alpha_raw=(Param(), ()),
             )
         else:
@@ -428,13 +550,18 @@ class TMDAgent(flax.struct.PyTreeNode):
                     actor=(actor_def, build_gc_actor_init(embed, embed, ex_action_stack)),
                     phi=(phi_def, (ex_observations, ex_actions)),
                     psi=(psi_def, (ex_goals,)),
+                    phi_am=(phi_am_def, (ex_observations, ex_actions)),
+                    psi_am=(psi_am_def, (ex_observations,)),
                 )
             else:
                 network_info = dict(
                     actor=(actor_def, build_gc_actor_init(ex_observations, ex_goals, ex_action_stack)),
                     phi=(phi_def, (ex_observations, ex_actions)),
                     psi=(psi_def, (ex_goals,)),
+                    phi_am=(phi_am_def, (ex_observations, ex_actions)),
+                    psi_am=(psi_am_def, (ex_observations,)),
                 )
+
         networks = {k: v[0] for k, v in network_info.items()}
         network_args = {k: v[1] for k, v in network_info.items()}
 
@@ -449,47 +576,55 @@ class TMDAgent(flax.struct.PyTreeNode):
 def get_config():
     config = ml_collections.ConfigDict(
         dict(
-            # Agent hyperparameters.
-            agent_name='tmd',  # Agent name.
+            # Agent hyperparameters (critic 1: identical to TMD).
+            agent_name='tmd_dc',
             lr=3e-4,
-            components=8,  # Number of components to average in the MRN/IQE distance ensemble.
-            batch_size=512,  # Batch size.
-            actor_hidden_dims=(512, 512, 512),  # Actor network hidden dimensions.
-            value_hidden_dims=(512, 512, 512),  # Value network hidden dimensions.
-            latent_dim=512,  # Latent dimension for phi and psi.
-            layer_norm=True,  # Whether to use layer normalization.
-            discount=0.99,  # Discount factor.
-            alpha=0.1,  # Temperature in AWR or BC coefficient in DDPG+BC.
-            zeta=0.05,  # Weight for TMD backup and invariance losses.
-            t=3.0,  # Clipping threshold for the backup LINEX loss.
-            diag_backup=0.5,  # Weighting of backups on diagonal (i.e., for s,g ~ p(s,g)) vs. off-diagonal (i.e., for s,g ~ p(s)p(g)).
-            stopgrad_psi_backup=False,  # Whether to stop gradient for psi in the backup loss.
-            stopgrad_phi_invariance=False,  # Whether to stop gradient for phi in the invariance loss.
-            encoder=ml_collections.config_dict.placeholder(str),  # Visual encoder name (None, 'impala_small', etc.).
-            actor_log_q=True,  # Whether to maximize log Q (True) or Q itself (False) in the actor loss.
-            const_std=True,  # Whether to use constant standard deviation for the actor.
-            discrete=False,  # Whether the action space is discrete.
+            components=8,
+            batch_size=512,
+            actor_hidden_dims=(512, 512, 512),
+            value_hidden_dims=(512, 512, 512),
+            latent_dim=512,
+            layer_norm=True,
+            discount=0.99,
+            alpha=0.1,
+            zeta=0.05,
+            t=3.0,
+            diag_backup=0.5,
+            stopgrad_psi_backup=False,
+            stopgrad_phi_invariance=False,
+            encoder=ml_collections.config_dict.placeholder(str),
+            actor_log_q=True,
+            const_std=True,
+            discrete=False,
             # Dataset hyperparameters.
-            dataset_class='GCDataset',  # Dataset class name.
-            value_p_curgoal=0.0,  # Probability of using the current state as the value goal.
-            value_p_trajgoal=1.0,  # Probability of using a future state in the same trajectory as the value goal.
-            value_p_randomgoal=0.0,  # Probability of using a random state as the value goal.
-            value_geom_sample=True,  # Whether to use geometric sampling for future value goals.
-            actor_p_curgoal=0.0,  # Probability of using the current state as the actor goal.
-            actor_p_trajgoal=1.0,  # Probability of using a future state in the same trajectory as the actor goal.
-            actor_p_randomgoal=0.0,  # Probability of using a random state as the actor goal.
-            actor_geom_sample=False,  # Whether to use geometric sampling for future actor goals.
-            bc_goal_randomize_prob=0.0,  # Per-row prob. of in-batch shuffled goal for BC log-likelihood only.
-            gc_negative=False,  # Unused (defined for compatibility with GCDataset).
-            p_aug=0.0,  # Probability of applying image augmentation.
-            use_iqe=False,  # Whether to use IQE distance or MRN distance
-            use_latent=False,  # Whether to use latent for policy action sampling
-            freeze_enc_for_actor_grad=False,  # Whether to stop grad for actor when using encoder
-            use_action_for_distance=True,  # Whether to use action for distance computation
-            frame_stack=ml_collections.config_dict.placeholder(int),  # Number of frames to stack.
+            dataset_class='GCDataset',
+            value_p_curgoal=0.0,
+            value_p_trajgoal=1.0,
+            value_p_randomgoal=0.0,
+            value_geom_sample=True,
+            actor_p_curgoal=0.0,
+            actor_p_trajgoal=1.0,
+            actor_p_randomgoal=0.0,
+            actor_geom_sample=False,
+            bc_goal_randomize_prob=0.0,
+            gc_negative=False,
+            p_aug=0.0,
+            use_iqe=False,
+            use_latent=False,
+            freeze_enc_for_actor_grad=False,
+            use_action_for_distance=True,
+            frame_stack=ml_collections.config_dict.placeholder(int),
             dual_descent=False,
-            action_chunk_length=1,  # GCActor outputs chunk_length * action_dim; phi uses first action only.
-            action_stack_length=1,  # >1: concat past L actions to actor (see GCDataset `action_stack`).
+            action_chunk_length=1,
+            # --- Double-critic additions ---
+            # Weight of the action-match critic's loss in total_loss.
+            am_loss_weight=1.0,
+            # Weight of the action-match Q term added to the goal-reaching Q in the actor.
+            q_match_weight=1.0,
         )
     )
     return config
+
+
+# Alias so `train.py --algorithm TMD_DC` resolves to `agents.tmd_dc.TMD_DCAgent`.
+TMD_DCAgent = TMDDCAgent

@@ -8,7 +8,14 @@ import ml_collections
 import optax
 from utils.encoders import GCEncoder, encoder_modules
 from utils.flax_utils import ModuleDict, TrainState, nonpytree_field
-from utils.networks import GCActor, GCDiscreteActor, GCValue
+from utils.networks import (
+    GCActor,
+    GCDiscreteActor,
+    GCValue,
+    actor_action_stack_kwargs_from_batch,
+    actor_action_stack_kwargs_from_value,
+    build_gc_actor_init,
+)
 
 
 class GCIVLAgent(flax.struct.PyTreeNode):
@@ -71,7 +78,10 @@ class GCIVLAgent(flax.struct.PyTreeNode):
         exp_a = jnp.exp(adv * self.config['alpha'])
         exp_a = jnp.minimum(exp_a, 100.0)
 
-        dist = self.network.select('actor')(batch['observations'], batch['actor_goals'], params=grad_params)
+        akw = actor_action_stack_kwargs_from_batch(self.config, batch)
+        dist = self.network.select('actor')(
+            batch['observations'], batch['actor_goals'], params=grad_params, **akw
+        )
         log_prob = dist.log_prob(batch['actions'])
 
         actor_loss = -(exp_a * log_prob).mean()
@@ -137,10 +147,12 @@ class GCIVLAgent(flax.struct.PyTreeNode):
         observations,
         goals=None,
         seed=None,
+        action_stack=None,
         temperature=1.0,
     ):
         """Sample actions from the actor."""
-        dist = self.network.select('actor')(observations, goals, temperature=temperature)
+        akw = actor_action_stack_kwargs_from_value(self.config, action_stack)
+        dist = self.network.select('actor')(observations, goals, temperature=temperature, **akw)
         actions = dist.sample(seed=seed)
         if not self.config['discrete']:
             actions = jnp.clip(actions, -1, 1)
@@ -153,6 +165,7 @@ class GCIVLAgent(flax.struct.PyTreeNode):
         ex_observations,
         ex_actions,
         config,
+        ex_action_stack=None,
     ):
         """Create a new agent.
 
@@ -204,7 +217,7 @@ class GCIVLAgent(flax.struct.PyTreeNode):
         network_info = dict(
             value=(value_def, (ex_observations, ex_goals)),
             target_value=(copy.deepcopy(value_def), (ex_observations, ex_goals)),
-            actor=(actor_def, (ex_observations, ex_goals)),
+            actor=(actor_def, build_gc_actor_init(ex_observations, ex_goals, ex_action_stack)),
         )
         networks = {k: v[0] for k, v in network_info.items()}
         network_args = {k: v[1] for k, v in network_info.items()}
