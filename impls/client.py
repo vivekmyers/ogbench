@@ -537,11 +537,17 @@ def main():
              "round(sim_fps / train_fps) (=6 for 60/10) to recover the old behavior.",
     )
     # ---- Stuck-recovery overrides (policy sometimes just stops; nudge it forward) ----
+    # Unstick recovery is now OFF by default (it can hide real policy failures).
+    # Enable explicitly with --unstick. Keep --no-unstick for backwards compat.
+    ap.add_argument(
+        "--unstick",
+        action="store_true",
+        help="Enable stuck-recovery override (OFF by default).",
+    )
     ap.add_argument(
         "--no-unstick",
         action="store_true",
-        help="Disable stuck-recovery override. Default: enabled (when stationary too long, "
-             "apply a fixed throttle with zero steer/brake until the ego starts moving again).",
+        help="[DEPRECATED] Disable stuck-recovery override (kept for backwards compatibility).",
     )
     ap.add_argument(
         "--unstick-after-sec",
@@ -651,7 +657,8 @@ def main():
 
     # Stuck-recovery: convert wall-clock seconds to sim-tick counts at sim_fps.
     # `stuck_counter` already increments once per sim tick while ego is ~still.
-    unstick_enabled = (not args.no_unstick)
+    # Explicit opt-in; `--no-unstick` wins if someone passes both flags.
+    unstick_enabled = bool(getattr(args, "unstick", False)) and (not args.no_unstick)
     unstick_after_ticks = int(round(max(0.0, args.unstick_after_sec) * float(args.sim_fps)))
     unstick_warmup_ticks = int(round(max(0.0, args.unstick_warmup_sec) * float(args.sim_fps)))
     if unstick_enabled:
@@ -662,7 +669,7 @@ def main():
             f"release_speed={args.unstick_release_speed} m/s."
         )
     else:
-        print("[STUCK] Unstick recovery OFF (--no-unstick).")
+        print("[STUCK] Unstick recovery OFF (default). Enable with --unstick.")
 
     cam_bp = bp.find("sensor.camera.rgb")
     cam_bp.set_attribute("image_size_x", "256")
@@ -723,14 +730,8 @@ def main():
                 client_frame_offsets = tuple(list(client_frame_offsets[:-1]) + [0])
                 client_frame_offsets = tuple(sorted(client_frame_offsets))
 
-            # --- FPS-aware stacking ---
-            # Dataset was collected at 10 Hz. Each unit in `frame_offsets` is a
-            # 10 Hz step, but eval history advances once per sim tick at
-            # `sim_fps`, so scale by `sim_fps / 10` to preserve physical spacing
-            # without holding actions longer. Example: (0, -1) with sim_fps=60
-            # → (0, -6) sim ticks back.
             k = max(1, int(round(float(args.sim_fps) / 10.0)))
-            k = 1
+            #k = 1
             client_frame_offsets_sim = tuple(int(o) * k for o in client_frame_offsets)
 
             max_lag = max(0, max((-o for o in client_frame_offsets_sim if o < 0), default=0))

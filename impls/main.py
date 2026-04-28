@@ -68,7 +68,11 @@ def main(_):
     }[config['dataset_class']]
     train_dataset = dataset_class(Dataset.create(**train_dataset), config)
     if val_dataset is not None:
-        val_dataset = dataset_class(Dataset.create(**val_dataset), config)
+        val_dataset = dataset_class(
+            Dataset.create(**val_dataset),
+            config,
+            sampling_mode="val",
+        )
 
     # Initialize agent.
     random.seed(FLAGS.seed)

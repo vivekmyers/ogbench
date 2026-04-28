@@ -102,6 +102,11 @@ class GCDataset:
     dataset: Dataset
     config: Any
     preprocess_frame_stack: bool = True
+    # Train split uses `upsample_mode` + optional longitudinal rebalancing to build
+    # per-frame importance weights. Val split should *never* resample/upsample
+    # frames, even if a code path calls `sample(..., evaluation=False)` by
+    # mistake, so it sets `sampling_mode="val"` to disable weight construction.
+    sampling_mode: str = "train"
 
     def __post_init__(self):
         self.size = self.dataset.size
@@ -191,7 +196,10 @@ class GCDataset:
             # buffer for per-goal-index temporal gathers.
             self._raw_obs_single_frame = self.dataset['observations']
 
-        self._sampling_weights = self._build_sampling_weights()
+        if str(self.sampling_mode).lower() in ("val", "valid", "eval", "validation"):
+            self._sampling_weights = None
+        else:
+            self._sampling_weights = self._build_sampling_weights()
 
         gk, go = self._resolved_goal_stack_spec()
         if gk is not None:
@@ -494,11 +502,11 @@ class GCDataset:
             batch.pop('next_observations', None)
 
         if self.config['frame_stack'] is not None:
-            # Random offsets are applied to OBS-LIKE sources (current state and
-            # any future-state inputs the encoder sees). Goals stay canonical
-            # because (a) the goal image is meant to look like a clean target,
-            # not a regularised input, and (b) at eval the goal is fed as a
-            # canonical stack regardless of fps.
+            # Random K-of-W stacks apply to current ``observations`` (and other
+            # obs-like keys via ``get_observations``) when ``frame_stack_window >
+            # frame_stack``. ``actor_goals`` stay canonical for clean BC targets;
+            # ``value_goals`` follow the same random stacking as observations during
+            # training so metric / contrastive critics see matched ψ/φ geometry.
             batch['observations'] = self.get_observations(idxs, evaluation=evaluation)
             if not minimal:
                 next_idxs = np.minimum(idxs + 1, self.size - 1)
@@ -564,6 +572,8 @@ class GCDataset:
         L_as = self._action_stack_len()
         if L_as > 1:
             batch['action_stack'] = self._gather_past_action_stack(idxs, L_as)
+            if not evaluation:
+                self.apply_action_stack_noise(batch)
 
         if not minimal:
             # State after executing the first K actions (for K-step / Q-chunk critics).
@@ -774,6 +784,31 @@ class GCDataset:
             if clip:
                 unshaped = np.clip(unshaped, -1.0, 1.0)
             batch['high_value_action_chunks'] = unshaped.reshape(B, H * A)
+
+    def apply_action_stack_noise(self, batch):
+        """Gaussian perturbation of the *input* action history (opt-in).
+
+        Controlled by ``action_stack_noise_std`` (float, default 0.0). Noise is
+        sampled i.i.d. as N(0, s) per element of ``batch['action_stack']``.
+        """
+        if bool(self.config.get('multi_discrete', False)):
+            return
+        std = float(self.config.get('action_stack_noise_std', 0.0) or 0.0)
+        if std <= 0.0:
+            return
+        ast = batch.get('action_stack', None)
+        if ast is None:
+            return
+        noise = (std * np.random.randn(*ast.shape)).astype(np.float32)
+        ast_noised = ast + noise.astype(ast.dtype, copy=False)
+        # If this looks like CARLA actions, clip each channel to its valid range.
+        if ast_noised.ndim >= 2 and ast_noised.shape[-1] == 3:
+            ast_noised[..., 0] = np.clip(ast_noised[..., 0], 0.0, 1.0)
+            ast_noised[..., 1] = np.clip(ast_noised[..., 1], -1.0, 1.0)
+            ast_noised[..., 2] = np.clip(ast_noised[..., 2], 0.0, 1.0)
+        else:
+            ast_noised = np.clip(ast_noised, -1.0, 1.0)
+        batch['action_stack'] = ast_noised
 
     def augment(self, batch, keys):
         """Apply image augmentation — stay in JAX, no round-trip."""

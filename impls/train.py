@@ -91,7 +91,13 @@ def filter_intersection_frames_jax(dataset: Dict[str, jnp.ndarray], throttle_thr
             mark_indices = window_starts_expanded.ravel()
             mark_indices = mark_indices[mark_indices < T]
             intersection_mask = intersection_mask.at[mark_indices].set(True)
-    
+
+    if len(terminal_locs) > 0:
+        terminals_to_remove = int(jnp.sum(intersection_mask[terminal_locs]))
+    else:
+        terminals_to_remove = 0
+    print(f"Terminals that would be removed (before preservation): {terminals_to_remove}")
+
     # Preserve terminals using JAX operations
     terminal_indices = jnp.arange(T)[terminals] if jnp.any(terminals) else jnp.array([], dtype=jnp.int32)
     terminals_preserved = 0
@@ -159,9 +165,10 @@ def filter_intersection_frames_jax(dataset: Dict[str, jnp.ndarray], throttle_thr
 def filter_intersection_frames(dataset: Dict[str, np.ndarray], throttle_threshold: float = 0.05, brake_threshold: float = 0.1,
     window_size: int = 5,
 ) -> Dict[str, np.ndarray]:
-    """Remove frames where the car is stopped/idling (low throttle AND low steer for
-    extended windows). Does NOT remove braking frames that co-occur with turning,
-    because those are exactly the frames we need to learn turns.
+    """Remove intersection / idle-y frames: high brake, or sustained low throttle.
+
+    Downweights ambiguous stationary / crawling modes in BC. Terminal indices are
+    preserved, then remapped after compaction.
     """
     actions = dataset['actions']
     T = len(actions)
@@ -181,28 +188,16 @@ def filter_intersection_frames(dataset: Dict[str, np.ndarray], throttle_threshol
         print(f"Trajectory lengths (stats): min={traj_lengths.min()}, max={traj_lengths.max()}, mean={traj_lengths.mean():.1f}")
     
     throttle = actions[:, 0]
-    steer = actions[:, 1]
     brake = actions[:, 2]
     low_throttle = throttle < throttle_threshold
-    is_turning = np.abs(steer) > 0.03
-    # Only mark as intersection/idle if braking AND not turning.
-    high_brake_idle = (brake > brake_threshold) & (~is_turning)
+    high_brake = brake > brake_threshold
     intersection_mask = np.zeros(T, dtype=bool)
-    intersection_mask = intersection_mask | high_brake_idle
-    from numpy.lib.stride_tricks import sliding_window_view
-    try:
-        windows = sliding_window_view(low_throttle, window_size)
-        all_low_throttle = np.all(windows, axis=1)
-        window_starts = np.where(all_low_throttle)[0]
-        if len(window_starts) > 0:
-            mark_indices = (window_starts[:, None] + np.arange(window_size)[None, :]).ravel()
-            mark_indices = mark_indices[mark_indices < T]
-            intersection_mask[mark_indices] = True
-    except (ImportError, AttributeError):
-        print("WARNING: Using slower loop-based filtering (upgrade NumPy >= 1.20 for faster version)")
-        for i in range(T - window_size + 1):
-            if np.all(low_throttle[i:i+window_size]):
-                intersection_mask[i:i+window_size] = True
+    intersection_mask = intersection_mask | high_brake
+    for i in range(T - window_size + 1):
+        if np.all(low_throttle[i:i+window_size]):
+            intersection_mask[i:i+window_size] = True
+
+    # Count how many terminals would be removed BEFORE preserving them
     terminals_to_remove = np.sum(intersection_mask[terminal_locs])
     print(f"Terminals that would be removed (before preservation): {terminals_to_remove}")
     terminal_indices = np.where(terminals)[0]
@@ -1046,13 +1041,13 @@ def main(args: argparse.Namespace) -> None:
             f"[train] multi_discrete head only supports action_chunk_length=1; "
             f"overriding requested value ({int(args.action_chunk_length)}) to 1."
         )
-    cfg.actor_loss = "huber"
+    cfg.actor_loss = "ddpgbc"
     cfg.discount = args.discount
     cfg.alpha = 0.01
     cfg.encoder = "impala_small"
     cfg.lr = 3e-4
-    cfg.actor_hidden_dims = (512, 512, 512)
-    cfg.value_hidden_dims = (256, 256, 256)
+    cfg.actor_hidden_dims = (2048, 2048, 2048)
+    cfg.value_hidden_dims = (2048, 2048, 2048)
     cfg.latent_dim = 512
     cfg.critic_lr_scale = 1.0
     cfg.actor_lr_scale = 1.0
@@ -1099,12 +1094,13 @@ def main(args: argparse.Namespace) -> None:
         if cfg.goal_frame_stack != len(tuple(cfg.frame_offsets)):
             cfg.goal_frame_offsets = None
     cfg.block_size = args.block_size
-    cfg.p_aug = 0.5
+    cfg.p_aug = 0.8
     # action_noise_std: scalar for shared std, sequence for per-dim stds.
     _ans = list(args.action_noise_std)
     cfg.action_noise_std = float(_ans[0]) if len(_ans) == 1 else tuple(float(x) for x in _ans)
     cfg.action_noise_chunk_corr = float(args.action_noise_chunk_corr)
     cfg.action_noise_clip = not args.no_action_noise_clip
+    cfg.action_stack_noise_std = float(getattr(args, "action_stack_noise_std", 0.0) or 0.0)
     # Downsample high-brake frames: there are many "stopped at light" frames in
     # the dataset that don't matter at eval. Mode picks the target set,
     # `upsample_weight` is literal weight multiplier -- <1 means "pick these
@@ -1118,12 +1114,7 @@ def main(args: argparse.Namespace) -> None:
     cfg.brake_thresh = 0.3
     # delta for Huber loss when actor_loss == "huber".
     cfg.huber_delta = 0.1
-    # Longitudinal balance: multiplicative re-weighting on top of `upsample_mode`
-    # to fight throttle/brake ambiguity. Derives per-frame ego speed from
-    # `position` (see GCDataset._compute_speed_from_position) and up/downsamples
-    # specific (speed, throttle, brake) buckets. Disabled by default; enable
-    # with --longitudinal_balance. Tunables below have sensible starting values.
-    cfg.longitudinal_balance = bool(args.longitudinal_balance)
+    cfg.longitudinal_balance = not bool(getattr(args, "no_longitudinal_balance", False))
     cfg.lb_train_fps = 10.0  # dataset cadence (Hz) used to convert Δposition → m/s
     cfg.lb_stopped_speed_thresh = 0.5  # m/s: "stopped"
     cfg.lb_accel_speed_thresh = 2.0    # m/s: "still low speed" for accel-from-stop
@@ -1244,7 +1235,7 @@ def main(args: argparse.Namespace) -> None:
         pbar.update(1)
     
     # Build datasets
-    def build_gc_dataset(data: Dict) -> GCDataset | CGCDataset | None:
+    def build_gc_dataset(data: Dict, *, for_validation: bool = False) -> GCDataset | CGCDataset | None:
         """Construct a goal-conditioned dataset from raw arrays.
 
         Important: `GCDataset` is written assuming NumPy arrays (like the original
@@ -1267,8 +1258,8 @@ def main(args: argparse.Namespace) -> None:
             dataset_fields["position"] = np.asarray(data["position"])
         ds = Dataset.create(**dataset_fields)
         if args.algorithm.upper() == 'TMD_DQC':
-            return CGCDataset(ds, cfg)
-        return GCDataset(ds, cfg)
+            return CGCDataset(ds, cfg, sampling_mode=("val" if for_validation else "train"))
+        return GCDataset(ds, cfg, sampling_mode=("val" if for_validation else "train"))
 
     _ans_cfg = cfg.action_noise_std
     _noise_on = (isinstance(_ans_cfg, (list, tuple)) and any(float(x) > 0.0 for x in _ans_cfg)) \
@@ -1294,7 +1285,7 @@ def main(args: argparse.Namespace) -> None:
 
     print(f"Building val dataset ({len(val_data['observations']) if val_data else 0} frames)...", flush=True)
     t0 = time.time()
-    val_dataset = build_gc_dataset(val_data) if val_data else None
+    val_dataset = build_gc_dataset(val_data, for_validation=True) if val_data else None
     # print(f"  Done in {time.time() - t0:.1f}s", flush=True)
 
 
@@ -1632,6 +1623,12 @@ if __name__ == "__main__":
         "--action_noise_std", type=float, nargs="+", default=[0.00, 0.00, 0.00],
     )
     parser.add_argument(
+        "--action_stack_noise_std",
+        type=float,
+        default=0.0,
+        help="Stddev of i.i.d. Gaussian noise N(0,s) added to batch['action_stack'] during training (default 0 = off).",
+    )
+    parser.add_argument(
         "--action_noise_chunk_corr", type=float, default=0.3,
     )
     parser.add_argument("--no_action_noise_clip", action="store_true",
@@ -1652,11 +1649,16 @@ if __name__ == "__main__":
         "--longitudinal_balance",
         action="store_true",
         help=(
-            "Apply multiplicative longitudinal rebalancing on top of "
+            "[DEPRECATED: now on by default] Apply multiplicative longitudinal rebalancing on top of "
             "upsample_mode: downsample stopped-with-brake and mixed "
             "throttle+brake frames, upsample accel-from-stop and decisive "
             "deceleration. Requires 'position' in the dataset .npz."
         ),
+    )
+    parser.add_argument(
+        "--no_longitudinal_balance",
+        action="store_true",
+        help="Disable longitudinal rebalancing (enabled by default).",
     )
     parser.add_argument(
         "--multi_discrete",
