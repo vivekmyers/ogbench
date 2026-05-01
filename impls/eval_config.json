@@ -2,7 +2,7 @@
   "frames_per_episode": 3000,
   "max_episodes": 50,
   "goal_xy_mse_threshold": 10.0,
-  "algorithm": "gcbc",
+  "algorithm": "tmd_qc",
   "suite_description": "110k frames (0..109999). Starts are intentionally non-round (no x000) except where the test needs a specific pattern. Horizons: short hops, long jumps, same-start blocks at 44737 and 48127, shared goal 75103, same-same, edge/near-end pairs.",
   "pairs": [
     [4831, 4877],

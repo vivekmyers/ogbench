@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 import time
 from datetime import datetime
 from importlib import import_module
@@ -1006,6 +1007,14 @@ def compute_validation_loss(agent, val_dataset: GCDataset | None, batch_size: in
             metrics["val/critic_logits_pos"] = float(critic_info["logits_pos"])
         if "logits_neg" in critic_info:
             metrics["val/critic_logits_neg"] = float(critic_info["logits_neg"])
+        if "dist_diag_mean" in critic_info:
+            metrics["val/dist_diag_mean"] = float(critic_info["dist_diag_mean"])
+        if "dist_offdiag_mean" in critic_info:
+            metrics["val/dist_offdiag_mean"] = float(critic_info["dist_offdiag_mean"])
+        if "backup_loss" in critic_info:
+            metrics["val/backup_loss"] = float(critic_info["backup_loss"])
+        if "contrastive_loss" in critic_info:
+            metrics["val/contrastive_loss"] = float(critic_info["contrastive_loss"])
         if "dual_descent_val" in critic_info:
             metrics["val/dual_descent_val"] = float(critic_info["dual_descent_val"])
         if "backup_optim_loss" in critic_info:
@@ -1043,8 +1052,8 @@ def main(args: argparse.Namespace) -> None:
         )
     cfg.actor_loss = "ddpgbc"
     cfg.discount = args.discount
-    cfg.alpha = 0.01
-    cfg.encoder = "impala_small"
+    cfg.alpha = 0.1
+    cfg.encoder = "impala_large"
     cfg.lr = 3e-4
     cfg.actor_hidden_dims = (2048, 2048, 2048)
     cfg.value_hidden_dims = (2048, 2048, 2048)
@@ -1062,19 +1071,10 @@ def main(args: argparse.Namespace) -> None:
     cfg.frame_stack_window = (
         int(args.frame_stack_window) if args.frame_stack_window is not None else _default_frame_stack_window
     )
-    if cfg.frame_stack_window > cfg.frame_stack:
-        print(
-            f"[train] frame_stack_window={cfg.frame_stack_window} > frame_stack={cfg.frame_stack}: "
-            f"per-batch random K-of-W offset sampling at train time (current frame always "
-            f"included). Validation uses canonical consecutive stack."
-        )
-    # Saved in config.json so eval server/client match training geometry (no CLI guessing).
+    cfg.p_value_randomize_stack = min(1.0, max(0.0, float(args.p_value_randomize_stack)))
     cfg.obs_h = args.obs_h
     cfg.obs_w = args.obs_w
     cfg.obs_c = args.obs_c
-    # Actor goal images: default to the *same* temporal pattern as observations.
-    # Override with --goal-frame-stack / --goal-frame-offsets only when goals need
-    # a different stack (then GCDataset may retain a raw single-frame buffer).
     cfg.goal_frame_stack = int(cfg.frame_stack)
     cfg.goal_frame_offsets = tuple(cfg.frame_offsets)
     if args.goal_frame_offsets is not None:
@@ -1276,6 +1276,7 @@ def main(args: argparse.Namespace) -> None:
     print(
         f"\nBuilding train dataset ({len(train_data['observations'])} frames, "
         f"frame_stack={cfg.frame_stack}, frame_stack_window={cfg.frame_stack_window}, "
+        f"p_value_randomize_stack={cfg.p_value_randomize_stack}, "
         f"action_stack_length={cfg.action_stack_length})...",
         flush=True,
     )
@@ -1357,11 +1358,31 @@ def main(args: argparse.Namespace) -> None:
     last_val_step = -1
     last_log_step = -1
 
+    def _block_until_ready_info(info: Dict[str, object]) -> None:
+        """Synchronize on one JAX leaf so timing reflects device compute."""
+        try:
+            leaves = jax.tree_util.tree_leaves(info)
+            if leaves:
+                jax.block_until_ready(leaves[0])
+        except Exception:
+            # Best-effort: timing debug should never crash training.
+            return
+
+    if args.timing_debug:
+        print(
+            f"[timing] enabled: printing every {args.timing_debug_every} steps "
+            f"(log_every={args.log_every}, val_every={args.val_every}, ckpt_every={args.ckpt_every})",
+            file=sys.stderr,
+            flush=True,
+        )
+
     for epoch in range(args.epochs):
         # print(f"\nStarting epoch {epoch + 1}/{args.epochs}")
         progress = trange(args.steps, dynamic_ncols=True)
         for step in range(args.steps):
             total_steps += 1
+            wandb_ms = 0.0
+            val_ms = 0.0
             t_progress_start = time.time()
             progress.update(1)
             t_progress_end = time.time()
@@ -1375,6 +1396,8 @@ def main(args: argparse.Namespace) -> None:
 
             t_update_start = time.time()
             agent, info = agent.update(batch)
+            if args.timing_debug:
+                _block_until_ready_info(info)
             t_update_end = time.time()
             update_ms = (t_update_end - t_update_start) * 1000.0
             
@@ -1393,8 +1416,10 @@ def main(args: argparse.Namespace) -> None:
                     ("actor/mse_max", "train/actor_mse_max"),
                     ("actor/mse_first", "train/actor_mse_first"),
                     ("actor/std", "train/actor_std"),
-                    ("critic/contrastive_loss", "train/critic_loss"),
-                    ("critic/critic_loss", "train/critic_loss"),  # TMD uses this key
+                    ("critic/critic_loss", "train/critic_loss"),
+                    ("critic/contrastive_loss", "train/critic_contrastive_loss"),
+                    ("critic/backup_loss", "train/critic_backup_loss"),
+                    ("critic/action_invariance_loss", "train/critic_action_invariance_loss"),
                     ("critic/categorical_accuracy", "train/critic_categorical_accuracy"),
                     # DEBUG: Check if embeddings are collapsed
                     ("critic/phi_psi_similarity_raw", "train/critic_phi_psi_similarity_raw"),
@@ -1466,8 +1491,19 @@ def main(args: argparse.Namespace) -> None:
             # Total step time including everything
             t_step_end = time.time()
             total_step_ms = (t_step_end - t_progress_start) * 1000.0
-            # if total_steps % args.log_every == 0:
-            #     print(f"[Total step time] {total_step_ms:.1f}ms ({1000.0/total_step_ms:.2f} it/s including all overhead)")
+            _do_timing = args.timing_debug and (
+                (total_steps % max(int(args.timing_debug_every), 1) == 0) or total_steps == 1
+            )
+            if _do_timing:
+                print(
+                    f"[timing@{total_steps}] sample={sample_ms:.1f}ms | "
+                    f"update(sync)={update_ms:.1f}ms | "
+                    f"wandb={wandb_ms:.1f}ms | ckpt={ckpt_ms:.1f}ms | "
+                    f"val={val_ms:.1f}ms | total={total_step_ms:.1f}ms "
+                    f"({1000.0/max(total_step_ms,1e-6):.2f} it/s)",
+                    file=sys.stderr,
+                    flush=True,
+                )
 
         # After epoch ends, checkpoint/validate/log if we haven't already this step
         if args.ckpt_every and total_steps != last_ckpt_step:
@@ -1548,6 +1584,17 @@ if __name__ == "__main__":
     parser.add_argument("--chunk_size", type=int, default=50000, help="Process dataset in chunks of ~this many frames (trajectories are kept intact, not split)")
     parser.add_argument("--use_mmap", action="store_true", help="Use memory-mapped file loading (saves RAM but may be slower)")
     parser.add_argument("--val_every", type=int, default=500)
+    parser.add_argument(
+        "--timing_debug",
+        action="store_true",
+        help="Print per-step timing breakdown with device sync (slower; for profiling).",
+    )
+    parser.add_argument(
+        "--timing_debug_every",
+        type=int,
+        default=200,
+        help="Steps between timing debug prints (only used with --timing_debug).",
+    )
     parser.add_argument("--obs_h", type=int, default=64)
     parser.add_argument("--obs_w", type=int, default=64)
     parser.add_argument("--obs_c", type=int, default=3)
@@ -1583,6 +1630,19 @@ if __name__ == "__main__":
             "the default K=3 stack, offset 0 is always the current frame and the other K-1 "
             "history slots are sampled uniformly without replacement from [1, W-1] at train time. "
             "Set equal to frame_stack for canonical consecutive stacking only (no random subsampling)."
+        ),
+    )
+    parser.add_argument(
+        "--p_value_randomize_stack",
+        type=float,
+        default=0.5,
+        dest="p_value_randomize_stack",
+        help=(
+            "When frame_stack_window > frame_stack (K-of-W random stacks available), each training "
+            "batch independently uses a random K-of-W stack with this probability; otherwise that "
+            "batch uses the canonical consecutive stack. 1.0 matches prior behavior (always random "
+            "when supported). 0.0 always uses the canonical stack at train time. Validation always "
+            "uses the canonical stack."
         ),
     )
     parser.add_argument("--action_chunk_length", type=int, default=1, help="Number of consecutive actions to predict (1 = no chunking)")
@@ -1674,4 +1734,10 @@ if __name__ == "__main__":
     args = parser.parse_args()
     if args.project is None:
         args.project = f"{args.algorithm}-training"
+    if getattr(args, "timing_debug", False):
+        print(
+            f"[timing] argv parsed: timing_debug=True, every={getattr(args, 'timing_debug_every', 0)}",
+            file=sys.stderr,
+            flush=True,
+        )
     main(args)

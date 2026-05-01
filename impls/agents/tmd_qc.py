@@ -138,6 +138,7 @@ class TMDQCAgent(TMDAgent):
                 'categorical_accuracy': jnp.mean(correct),
                 'logits_pos': logits_pos,
                 'logits_neg': logits_neg,
+                'logits_pos_neg_diff': logits_pos - logits_neg,
                 'logits': logits.mean(),
                 'dist': dist.mean(),
                 'biggest_diff_in_dist': jnp.max(dist - dist_next),
@@ -196,10 +197,21 @@ class TMDQCAgent(TMDAgent):
             q_flat = jnp.clip(dist.mode(), -1, 1)
         else:
             q_flat = jnp.clip(dist.sample(seed=rng), -1, 1)
+        q_flat = jnp.reshape(q_flat, (q_flat.shape[0], -1))
 
         # Q-chunking: score the full K-step chunk with φ (same input as critic).
-        phi = self.network.select('phi')(batch['observations'], q_flat)
-        psi = self.network.select('psi')(batch['actor_goals'])
+        # phi = self.network.select('phi')(batch['observations'], q_flat)
+        # psi = self.network.select('psi')(batch['actor_goals'])
+        # q1, q2 = -self.distance(phi, psi)
+        #q = jnp.minimum(q1, q2)
+
+        phi_params_sg = jax.tree_util.tree_map(jax.lax.stop_gradient, grad_params)
+        phi = self.network.select('phi')(
+            batch['observations'], q_flat, params=phi_params_sg,
+        )
+        psi = self.network.select('psi')(
+            batch['actor_goals'], params=phi_params_sg,
+        )
         q1, q2 = -self.distance(phi, psi)
         q = jnp.minimum(q1, q2)
 
@@ -209,7 +221,7 @@ class TMDQCAgent(TMDAgent):
             log_prob = dist_bc.log_prob(batch['actions'])
             bc_loss = -(self.config['alpha'] * log_prob).mean()
             actor_loss = q_loss + bc_loss
-            pred = dist.mode()
+            pred = jnp.reshape(dist.mode(), (batch['observations'].shape[0], -1))
             return actor_loss, {
                 'actor_loss': actor_loss,
                 'q_loss': q_loss,
@@ -226,7 +238,7 @@ class TMDQCAgent(TMDAgent):
         bc_loss = -(self.config['alpha'] * log_prob).mean()
         actor_loss = q_loss + bc_loss
 
-        pred = dist.mode()
+        pred = jnp.reshape(dist.mode(), (batch['observations'].shape[0], -1))
         actor_info = {
             'actor_loss': actor_loss,
             'q_loss': q_loss,
@@ -394,8 +406,8 @@ def get_config():
             latent_dim=512,
             layer_norm=True,
             discount=0.99,
-            alpha=0.1,
-            zeta=0.05,
+            alpha=1.0,
+            zeta=0.01,
             t=3.0,
             diag_backup=0.5,
             stopgrad_psi_backup=False,

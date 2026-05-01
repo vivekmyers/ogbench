@@ -129,22 +129,6 @@ class GCDataset:
         assert np.isclose(
             self.config['actor_p_curgoal'] + self.config['actor_p_trajgoal'] + self.config['actor_p_randomgoal'], 1.0
         )
-
-        # --- Random frame-stack offsets (causal-confusion mitigation) ---
-        # Single knob: `frame_stack_window`. Default == `frame_stack` -> canonical
-        # consecutive K-frame stack (existing behaviour, bit-identical revert by
-        # setting window == K). Set strictly greater than K to enable per-batch
-        # random sampling: K-1 distinct offsets drawn uniformly from [1, W-1] +
-        # offset 0 (current frame), sorted oldest-first along the channel axis to
-        # match `_preprocess_frame_stack` and `get_stacked_observations`.
-        # Validation (`evaluation=True`) and goals always use the canonical stack.
-        #
-        # Performance note: even with random stacking on, we ALWAYS pre-stack so
-        # canonical sources (goals, eval, chunk_next when not random) stay at
-        # one-fancy-index-per-gather. The random path reads a zero-copy view of
-        # the per-step "current" frame embedded in the pre-stacked array's last C
-        # channels (`_raw_obs_view` below), so we get random offsets without
-        # paying a separate raw-array allocation.
         if self.config.get('frame_stack') is not None:
             K = int(self.config['frame_stack'])
             W_cfg = self.config.get('frame_stack_window')
@@ -154,23 +138,13 @@ class GCDataset:
                     f"frame_stack_window ({W}) must be >= frame_stack ({K})."
                 )
             self._frame_stack_window = W
-            # Fixed custom offsets (e.g. (0, -20)) imply the user has already
-            # committed to a specific spacing; skip random stacking so every
-            # gather stays on the single-fancy-index pre-stacked fast path.
             custom_offsets = self.config.get('frame_offsets')
             self._frame_stack_random = (W > K) and (custom_offsets is None)
+
         else:
             self._frame_stack_window = 1
             self._frame_stack_random = False
-
-        # Stash the raw obs reference *before* we overwrite the dataset with the
-        # pre-stacked version. We only need it for shape introspection; the
-        # actual random-stack reads use a view of the pre-stacked array (see
-        # `_raw_obs_view`) to avoid double-storing.
         self._raw_obs_view = None
-        # Single-frame observation buffer (H,W,C) retained only when we must
-        # build actor_goals with a *different* temporal pattern than the
-        # pre-stacked training observations (see ``goal_frame_stack``).
         self._raw_obs_single_frame = None
         if self.config['frame_stack'] is not None:
             assert 'next_observations' not in self.dataset
@@ -181,8 +155,6 @@ class GCDataset:
                     self._raw_obs_single_frame = raw_obs
                 stacked_observations = self._preprocess_frame_stack()
                 self.dataset = Dataset(self.dataset.copy(dict(observations=stacked_observations)))
-                # Last C channels of the pre-stacked frame == the current raw frame
-                # at that index (oldest-first channel order). View, not copy.
                 if isinstance(stacked_observations, np.ndarray) and stacked_observations.ndim >= 4:
                     C = int(raw_obs.shape[-1])
                     self._raw_obs_view = stacked_observations.reshape(
@@ -192,8 +164,6 @@ class GCDataset:
                     )[..., -1, :]
 
         elif self._needs_separate_goal_temporal_stack():
-            # Observations are left as raw (H,W,C) on disk; we still need the same
-            # buffer for per-goal-index temporal gathers.
             self._raw_obs_single_frame = self.dataset['observations']
 
         if str(self.sampling_mode).lower() in ("val", "valid", "eval", "validation"):
@@ -483,34 +453,24 @@ class GCDataset:
                 idxs = np.random.choice(self.size, batch_size, replace=True, p=self._sampling_weights)
             else:
                 idxs = self.dataset.get_random_idxs(batch_size)
-
-        # Per-agent batch-key pruning: pure BC (e.g. GCBC) only needs
-        # `observations`, `actor_goals`, `actions`, `action_chunks`. Skipping
-        # the unused gathers (`next_observations`, `value_goals`,
-        # `chunk_next_observations`) cuts gather work by ~half on BC-only runs.
-        # `cfg.minimal_batch=True` opts in. Default stays full so other agents
-        # (CRL, TMD*, GCIQL, ...) keep getting everything they need.
         minimal = bool(self.config.get('minimal_batch', False))
-
+        p_rand = float(self.config.get('p_value_randomize_stack', 0.0) or 0.0)
+        use_random_this_batch = (
+            self._frame_stack_random
+            and not evaluation
+            and p_rand > 0.0
+            and np.random.rand() < p_rand
+        )
         batch = self.dataset.sample(batch_size, idxs)
         final_state_idxs = self.idx_to_terminal[idxs]
-
-        # Dataset.get_subset auto-fills next_observations from raw obs; for the
-        # minimal-batch path (BC) we drop it so the contract stays "this key is
-        # never present" and downstream code can't silently read stale frames.
         if minimal:
             batch.pop('next_observations', None)
 
         if self.config['frame_stack'] is not None:
-            # Random K-of-W stacks apply to current ``observations`` (and other
-            # obs-like keys via ``get_observations``) when ``frame_stack_window >
-            # frame_stack``. ``actor_goals`` stay canonical for clean BC targets;
-            # ``value_goals`` follow the same random stacking as observations during
-            # training so metric / contrastive critics see matched ψ/φ geometry.
-            batch['observations'] = self.get_observations(idxs, evaluation=evaluation)
+            batch['observations'] = self.get_observations(idxs, evaluation=evaluation, randomize=use_random_this_batch,)
             if not minimal:
                 next_idxs = np.minimum(idxs + 1, self.size - 1)
-                batch['next_observations'] = self.get_observations(next_idxs, evaluation=evaluation)
+                batch['next_observations'] = self.get_observations(next_idxs, evaluation=evaluation, randomize=use_random_this_batch,)
 
         actor_goal_idxs, actor_goal_sources = self.sample_goals(
             idxs,
@@ -520,14 +480,10 @@ class GCDataset:
             self.config['actor_geom_sample'],
             return_sources=True,
         )
-        # Only surface source tags on validation batches: they're only consumed
-        # by the hard-val-frames logger, and adding extra int8 keys to training
-        # batches would trigger jit recompiles / pytree shape changes.
         if evaluation:
             batch['actor_goal_sources'] = actor_goal_sources
 
         if minimal:
-            # Single fancy index for the actor-only goal source.
             if self._needs_separate_goal_temporal_stack():
                 batch['actor_goals'] = self._gather_goal_temporal_stack(actor_goal_idxs)
             else:
@@ -535,7 +491,6 @@ class GCDataset:
                     actor_goal_idxs[None, :], evaluation=evaluation, randomize=False,
                 )
                 batch['actor_goals'] = jax.tree_util.tree_map(lambda x: x[0], all_goals)
-            # Reward / mask plumbing still expected by the train loop.
             successes = np.zeros(len(idxs), dtype=np.float32)
         else:
             value_goal_idxs = self.sample_goals(
@@ -545,16 +500,18 @@ class GCDataset:
                 self.config['value_p_randomgoal'],
                 self.config['value_geom_sample'],
             )
-            # --- FIX 2: Batch observation gathering ---
-            # Single indexing pass for all goal observations instead of separate tree_maps.
-            # Goals always use canonical stacking (randomize=False).
-            all_goal_idxs = np.stack([value_goal_idxs, actor_goal_idxs])  # (2, batch_size)
-            all_goals = self._batch_get_observations(all_goal_idxs, evaluation=evaluation, randomize=False)
-            batch['value_goals'] = jax.tree_util.tree_map(lambda x: x[0], all_goals)
+            value_goals_arr = self._batch_get_observations(
+                value_goal_idxs[None, :], evaluation=evaluation, randomize=use_random_this_batch,
+            )
+            batch['value_goals'] = jax.tree_util.tree_map(lambda x: x[0], value_goals_arr)
             if self._needs_separate_goal_temporal_stack():
                 batch['actor_goals'] = self._gather_goal_temporal_stack(actor_goal_idxs)
             else:
-                batch['actor_goals'] = jax.tree_util.tree_map(lambda x: x[1], all_goals)
+                actor_goals_arr = self._batch_get_observations(
+                    actor_goal_idxs[None, :], evaluation=evaluation, randomize=False,
+                )
+                batch['actor_goals'] = jax.tree_util.tree_map(lambda x: x[0], actor_goals_arr)
+
             successes = (idxs == value_goal_idxs).astype(np.float32)
 
         batch['masks'] = 1.0 - successes
@@ -576,9 +533,8 @@ class GCDataset:
                 self.apply_action_stack_noise(batch)
 
         if not minimal:
-            # State after executing the first K actions (for K-step / Q-chunk critics).
             chunk_next_idxs = np.minimum(idxs + chunk_len, final_state_idxs)
-            batch['chunk_next_observations'] = self.get_observations(chunk_next_idxs, evaluation=evaluation)
+            batch['chunk_next_observations'] = self.get_observations(chunk_next_idxs, evaluation=evaluation, randomize=use_random_this_batch,)
 
         if self.config['p_aug'] is not None and not evaluation:
             if np.random.rand() < self.config['p_aug']:
@@ -593,28 +549,12 @@ class GCDataset:
         return batch
 
     def _batch_get_observations(self, idx_sets, evaluation=False, randomize=False):
-        """Gather observations for multiple index arrays in one pass.
-
-        Args:
-            idx_sets: (num_sets, batch_size) array of indices.
-            evaluation: if True, never apply random offsets (validation /
-                eval-time should always see the canonical stack).
-            randomize: if True (and random stacking is enabled in config and
-                ``evaluation=False``), draw fresh random offsets per element.
-                Goal-like sources should pass ``randomize=False``; obs-like
-                sources should pass ``randomize=True``.
-
-        Returns:
-            Tree of arrays with shape (num_sets, batch_size, ...).
-        """
         flat_idxs = idx_sets.ravel()
         if self.config['frame_stack'] is None:
             flat_obs = jax.tree_util.tree_map(lambda arr: arr[flat_idxs], self.dataset['observations'])
         elif randomize and self._frame_stack_random and not evaluation:
             flat_obs = self._random_stacked_observations(flat_idxs)
         elif self.preprocess_frame_stack:
-            # Pre-stacked: single fancy index per source -> fastest path. Used for
-            # all goal sources (always canonical) and for obs at eval time.
             flat_obs = jax.tree_util.tree_map(lambda arr: arr[flat_idxs], self.dataset['observations'])
         else:
             flat_obs = self.get_stacked_observations(flat_idxs)
@@ -671,50 +611,10 @@ class GCDataset:
         return goal_idxs
 
     def apply_action_noise(self, batch):
-        """Gaussian perturbation of action targets (opt-in, default no-op).
-
-        Called only from ``GCDataset.sample(..., evaluation=False)``. Validation
-        and eval passes must use ``evaluation=True`` so metrics are computed on
-        the true stored actions.
-
-        Controlled by three config keys:
-          - ``action_noise_std``  (float OR sequence of ``action_dim`` floats,
-            default 0.0): standard deviation of additive Gaussian noise.  A
-            scalar is broadcast to every action dimension; a per-dim array
-            lets you set different noise levels per channel (e.g. lower std
-            on steering because its action-to-outcome gain is much higher
-            than throttle / brake).  0.0 disables the transform entirely.
-          - ``action_noise_chunk_corr`` (float in [0, 1), default 0.0 if the
-            key is omitted): AR(1) temporal correlation of the noise across the
-            timesteps of an action chunk.  0.0 ⇒ i.i.d. per-step noise (white).
-            Values closer to 1 ⇒ smoother per-chunk noise.  ``train.py`` defaults
-            this to **0.6** so chunk training gets realistic temporal structure
-            without an extra flag.  Marginal per-step variance stays ``std^2``
-            (innovation uses ``√(1-ρ²)``).  No effect when chunk length is 1.
-          - ``action_noise_clip`` (bool, default True): if True, clip the
-            perturbed actions to ``[-1, 1]``.
-
-        Rationale:
-          - Mild regulariser for BC-style loss targets.
-          - Target-policy-smoothing-style regularisation for critic inputs.
-          - Per Bishop-1995, unbiased additive input noise on training targets
-            is approximately equivalent to an L2 penalty on the function —
-            cheap insurance against memorising exact dataset actions.
-
-        The invariant ``batch['actions'] == batch['action_chunks'][:, 0, :]``
-        is preserved: ``action_chunks`` is perturbed once and ``actions`` is
-        rebound to its first slot.  ``high_value_action_chunks`` (used only
-        by the TMD-DQC backup bootstrap) gets its own independent noise draw.
-        """
-        # Categorical-head (multi_discrete) actors use internal binning in
-        # MultiDiscreteDistribution.log_prob; Gaussian-style additive noise
-        # followed by a [-1, 1] clip would mangle throttle/brake (range [0, 1])
-        # and has no regularisation benefit since the loss is cross-entropy.
         if bool(self.config.get('multi_discrete', False)):
             return
 
         std_cfg = self.config.get('action_noise_std', 0.0)
-        # Handle scalar / sequence / ConfigDict tuple transparently.
         if isinstance(std_cfg, (list, tuple)):
             std_vec = np.asarray(std_cfg, dtype=np.float32)
         else:
@@ -870,20 +770,15 @@ class GCDataset:
                         traj_obs[:traj_len - body_start]
         return out
 
-    def get_observations(self, idxs, evaluation=False):
-        """Build the K-frame observation stack for a batch of indices.
-
-        Dispatch order:
-          1. If frame_stack disabled: single fancy index (fastest).
-          2. If random stacking is on and this is a training pass: K-of-W random
-             offsets per element via :py:meth:`_random_stacked_observations`.
-          3. If pre-stacked at __post_init__: single fancy index on the
-             pre-stacked array (canonical consecutive K, fastest).
-          4. Otherwise: canonical K consecutive frames via per-frame gather.
-        """
+    def get_observations(self, idxs, evaluation=False, randomize=None):
         if self.config['frame_stack'] is None:
             return jax.tree_util.tree_map(lambda arr: arr[idxs], self.dataset['observations'])
-        if self._frame_stack_random and not evaluation:
+        if randomize is None:
+            do_random = self._frame_stack_random and not evaluation
+        else:
+            do_random = bool(randomize) and self._frame_stack_random and not evaluation
+        
+        if do_random:
             return self._random_stacked_observations(idxs)
         if self.preprocess_frame_stack:
             return jax.tree_util.tree_map(lambda arr: arr[idxs], self.dataset['observations'])
@@ -1031,10 +926,6 @@ class CGCDataset(GCDataset):
         high_value_next_idxs, high_value_bh = self._compute_high_next_idxs(
             idxs, final_state_idxs, high_value_goal_idxs, backup_horizon,
         )
-
-        # All three sources are goal-like / target-state inputs to psi: keep
-        # them on canonical stacks so psi sees a single distribution that
-        # matches eval-time goal images.
         all_goal_idxs = np.stack([high_value_goal_idxs, actor_goal_idxs,
                                   high_value_next_idxs])
         all_obs = self._batch_get_observations(all_goal_idxs, evaluation=evaluation, randomize=False)

@@ -746,6 +746,7 @@ class StateRepresentation(nn.Module):
             phi_inputs = jnp.concatenate([observations, actions], axis=-1)
 
         phi = self.phi(phi_inputs)
+        phi = phi / (jnp.linalg.norm(phi, axis=-1, keepdims=True) + 1e-6)
 
         return phi
 

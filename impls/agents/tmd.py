@@ -110,7 +110,11 @@ class TMDAgent(flax.struct.PyTreeNode):
         else:
             action_dist = self.distance(psi_s, phi)
 
-        action_invariance_loss = jnp.mean(action_dist)
+        psi_s_to_g = self.distance(psi_s[:, :, None], psi_g[:, None, :])  # (e, B, B)
+        # phi_to_g_already exists as `dist` from earlier
+        violation = jax.nn.relu(psi_s_to_g - dist)  # ψ(s) shouldn't be farther than φ(s,a)
+        action_invariance_loss = jnp.mean(violation)
+        #action_invariance_loss = jnp.mean(action_dist)
 
         dist_next = self.distance(psi_next[:, :, None], psi_g[:, None, :])
 
@@ -157,6 +161,8 @@ class TMDAgent(flax.struct.PyTreeNode):
                 'logits': logits.mean(),
                 'dist': dist.mean(),
                 'biggest_diff_in_dist': jnp.max(dist - dist_next),
+                'dist_diag_mean': jnp.mean(jnp.diagonal(dist.mean(axis=0))),
+                'dist_offdiag_mean': ((dist.mean(axis=0).sum() - jnp.trace(dist.mean(axis=0))) / (batch_size * (batch_size - 1))),
             },
         )
 
@@ -221,8 +227,8 @@ class TMDAgent(flax.struct.PyTreeNode):
         else:
             q_actions = q_flat
 
-        phi = self.network.select('phi')(batch['observations'], q_actions)
-        psi = self.network.select('psi')(batch['actor_goals'])
+        phi = jax.lax.stop_gradient(self.network.select('phi')(batch['observations'], q_actions))
+        psi = jax.lax.stop_gradient(self.network.select('psi')(batch['actor_goals']))
         q1, q2 = -self.distance(phi, psi)
         q = jnp.minimum(q1, q2)
 
@@ -490,6 +496,7 @@ def get_config():
             dual_descent=False,
             action_chunk_length=1,  # GCActor outputs chunk_length * action_dim; phi uses first action only.
             action_stack_length=1,  # >1: concat past L actions to actor (see GCDataset `action_stack`).
+            p_value_randomize_stack=0.5,
         )
     )
     return config
