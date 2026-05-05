@@ -896,50 +896,68 @@ class CGCDataset(GCDataset):
             else:
                 idxs = self.dataset.get_random_idxs(batch_size)
 
+        p_rand = float(self.config.get("p_value_randomize_stack", 0.0) or 0.0)
+        use_random_this_batch = (
+            self._frame_stack_random
+            and not evaluation
+            and p_rand > 0.0
+            and np.random.rand() < p_rand
+        )
+
         batch = self.dataset.sample(batch_size, idxs)
-        if self.config['frame_stack'] is not None:
-            batch['observations'] = self.get_observations(idxs, evaluation=evaluation)
+        if self.config["frame_stack"] is not None:
+            batch["observations"] = self.get_observations(
+                idxs, evaluation=evaluation, randomize=use_random_this_batch,
+            )
             next_idxs = np.minimum(idxs + 1, self.size - 1)
-            batch['next_observations'] = self.get_observations(next_idxs, evaluation=evaluation)
+            batch["next_observations"] = self.get_observations(
+                next_idxs, evaluation=evaluation, randomize=use_random_this_batch,
+            )
 
         final_state_idxs = self.idx_to_terminal[idxs]
-        backup_horizon = int(self.config['backup_horizon'])
+        backup_horizon = int(self.config["backup_horizon"])
+        bsz = len(idxs)
 
         high_value_goal_idxs = self.sample_goals(
             idxs,
-            self.config['value_p_curgoal'],
-            self.config['value_p_trajgoal'],
-            self.config['value_p_randomgoal'],
-            self.config['value_geom_sample'],
+            self.config["value_p_curgoal"],
+            self.config["value_p_trajgoal"],
+            self.config["value_p_randomgoal"],
+            self.config["value_geom_sample"],
         )
         actor_goal_idxs, actor_goal_sources = self.sample_goals(
             idxs,
-            self.config['actor_p_curgoal'],
-            self.config['actor_p_trajgoal'],
-            self.config['actor_p_randomgoal'],
-            self.config['actor_geom_sample'],
+            self.config["actor_p_curgoal"],
+            self.config["actor_p_trajgoal"],
+            self.config["actor_p_randomgoal"],
+            self.config["actor_geom_sample"],
             return_sources=True,
         )
         if evaluation:
-            batch['actor_goal_sources'] = actor_goal_sources
+            batch["actor_goal_sources"] = actor_goal_sources
 
         high_value_next_idxs, high_value_bh = self._compute_high_next_idxs(
             idxs, final_state_idxs, high_value_goal_idxs, backup_horizon,
         )
-        all_goal_idxs = np.stack([high_value_goal_idxs, actor_goal_idxs,
-                                  high_value_next_idxs])
-        all_obs = self._batch_get_observations(all_goal_idxs, evaluation=evaluation, randomize=False)
-        batch['high_value_goals'] = jax.tree_util.tree_map(lambda x: x[0], all_obs)
-        batch['value_goals'] = batch['high_value_goals']
+        # Value / chunk critic ψ: same K-of-W policy as φ(obs); actor goals stay canonical.
+        hv_stack = np.stack([high_value_goal_idxs, high_value_next_idxs])
+        hv_obs = self._batch_get_observations(
+            hv_stack, evaluation=evaluation, randomize=use_random_this_batch,
+        )
+        batch["high_value_goals"] = jax.tree_util.tree_map(lambda x: x[0], hv_obs)
+        batch["value_goals"] = batch["high_value_goals"]
+        batch["high_value_next_observations"] = jax.tree_util.tree_map(lambda x: x[1], hv_obs)
         if self._needs_separate_goal_temporal_stack():
-            batch['actor_goals'] = self._gather_goal_temporal_stack(actor_goal_idxs)
+            batch["actor_goals"] = self._gather_goal_temporal_stack(actor_goal_idxs)
         else:
-            batch['actor_goals'] = jax.tree_util.tree_map(lambda x: x[1], all_obs)
-        batch['high_value_next_observations'] = jax.tree_util.tree_map(lambda x: x[2], all_obs)
+            ag_only = self._batch_get_observations(
+                actor_goal_idxs[None, :], evaluation=evaluation, randomize=False,
+            )
+            batch["actor_goals"] = jax.tree_util.tree_map(lambda x: x[0], ag_only)
 
         chunk_offsets = np.arange(backup_horizon)
         chunk_idxs = np.minimum(idxs[:, None] + chunk_offsets, final_state_idxs[:, None])
-        batch['high_value_action_chunks'] = self.dataset['actions'][chunk_idxs].reshape(batch_size, -1)
+        batch["high_value_action_chunks"] = self.dataset["actions"][chunk_idxs].reshape(bsz, -1)
         batch['valids'] = (idxs[:, None] + chunk_offsets <= final_state_idxs[:, None]).astype(np.float32)
 
         high_value_successes = (high_value_bh < backup_horizon).astype(np.float32)
@@ -983,14 +1001,26 @@ class HGCDataset(GCDataset):
         if idxs is None:
             if self._sampling_weights is not None and not evaluation:
                 idxs = np.random.choice(self.size, batch_size, replace=True, p=self._sampling_weights)
-            else:
-                idxs = self.dataset.get_random_idxs(batch_size)
+        else:
+            idxs = self.dataset.get_random_idxs(batch_size)
+
+        p_rand = float(self.config.get("p_value_randomize_stack", 0.0) or 0.0)
+        use_random_this_batch = (
+            self._frame_stack_random
+            and not evaluation
+            and p_rand > 0.0
+            and np.random.rand() < p_rand
+        )
 
         batch = self.dataset.sample(batch_size, idxs)
         if self.config['frame_stack'] is not None:
-            batch['observations'] = self.get_observations(idxs, evaluation=evaluation)
+            batch['observations'] = self.get_observations(
+                idxs, evaluation=evaluation, randomize=use_random_this_batch,
+            )
             next_idxs = np.minimum(idxs + 1, self.size - 1)
-            batch['next_observations'] = self.get_observations(next_idxs, evaluation=evaluation)
+            batch['next_observations'] = self.get_observations(
+                next_idxs, evaluation=evaluation, randomize=use_random_this_batch,
+            )
 
         value_goal_idxs = self.sample_goals(
             idxs,
@@ -999,8 +1029,10 @@ class HGCDataset(GCDataset):
             self.config['value_p_randomgoal'],
             self.config['value_geom_sample'],
         )
-        # Goals stay canonical (see GCDataset.sample for rationale).
-        batch['value_goals'] = self.get_observations(value_goal_idxs, evaluation=True)
+        # Value ψ: match observation stacking (including K-of-W when enabled); eval stays canonical.
+        batch['value_goals'] = self.get_observations(
+            value_goal_idxs, evaluation=evaluation, randomize=use_random_this_batch,
+        )
 
         successes = (idxs == value_goal_idxs).astype(np.float32)
         batch['masks'] = 1.0 - successes
@@ -1049,7 +1081,9 @@ class HGCDataset(GCDataset):
             batch['action_chunks'] = batch['actions'][:, None, :]
 
         chunk_next_idxs = np.minimum(idxs + chunk_len, final_state_idxs)
-        batch['chunk_next_observations'] = self.get_observations(chunk_next_idxs, evaluation=evaluation)
+        batch['chunk_next_observations'] = self.get_observations(
+            chunk_next_idxs, evaluation=evaluation, randomize=use_random_this_batch,
+        )
 
         L_as = self._action_stack_len()
         if L_as > 1:

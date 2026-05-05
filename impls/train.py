@@ -965,7 +965,11 @@ def compute_validation_loss(agent, val_dataset: GCDataset | None, batch_size: in
 
     # Compute critic loss - check for both contrastive_loss (CRL) and critic_loss (TMD)
     critic_loss = 0.0
-    critic_info = {}
+    critic_info: Dict[str, object] = {}
+    chunk_loss_v: float | None = None
+    action_loss_v: float | None = None
+    chunk_info_d: Dict[str, object] = {}
+    action_info_d: Dict[str, object] = {}
     if hasattr(agent, 'contrastive_loss'):
         # CRL agents
         critic_loss, critic_info = agent.contrastive_loss(batch, agent.network.params)
@@ -978,6 +982,17 @@ def compute_validation_loss(agent, val_dataset: GCDataset | None, batch_size: in
             # Fallback if signature is different
             critic_loss = critic_result[0] if isinstance(critic_result, tuple) else critic_result
             critic_info = critic_result[1] if isinstance(critic_result, tuple) and len(critic_result) > 1 else {}
+    elif hasattr(agent, "chunk_critic_loss"):
+        # TMD_DQC: chunk critic + action critic (no single critic_loss API).
+        cl, chunk_info_d = agent.chunk_critic_loss(batch, agent.network.params)
+        al, action_info_d = agent.action_critic_loss(batch, agent.network.params)
+        chunk_loss_v = float(cl)
+        action_loss_v = float(al)
+        critic_loss = chunk_loss_v + action_loss_v
+        critic_info = dict(chunk_info_d)
+    else:
+        critic_loss = 0.0
+        critic_info = {}
 
     metrics: Dict[str, object] = {}
 
@@ -998,7 +1013,7 @@ def compute_validation_loss(agent, val_dataset: GCDataset | None, batch_size: in
         metrics["val/actor_mse_first"] = float(actor_info["mse_first"])
 
     # Critic metrics: log critic loss and other relevant metrics
-    if hasattr(agent, "contrastive_loss") or hasattr(agent, "critic_loss"):
+    if hasattr(agent, "contrastive_loss") or hasattr(agent, "critic_loss") or hasattr(agent, "chunk_critic_loss"):
         metrics["val/critic_loss"] = float(critic_loss)
         if "categorical_accuracy" in critic_info:
             metrics["val/critic_categorical_accuracy"] = float(critic_info["categorical_accuracy"])
@@ -1015,14 +1030,67 @@ def compute_validation_loss(agent, val_dataset: GCDataset | None, batch_size: in
             metrics["val/backup_loss"] = float(critic_info["backup_loss"])
         if "contrastive_loss" in critic_info:
             metrics["val/contrastive_loss"] = float(critic_info["contrastive_loss"])
+        if "action_invariance_loss" in critic_info:
+            metrics["val/action_invariance_loss"] = float(critic_info["action_invariance_loss"])
         if "dual_descent_val" in critic_info:
             metrics["val/dual_descent_val"] = float(critic_info["dual_descent_val"])
         if "backup_optim_loss" in critic_info:
             metrics["val/backup_optim_loss"] = float(critic_info["backup_optim_loss"])
         if "val_times_contrastive" in critic_info:
             metrics["val/val_times_contrastive"] = float(critic_info["val_times_contrastive"])
-    
+
+    if hasattr(agent, "chunk_critic_loss") and chunk_loss_v is not None:
+        metrics["val/chunk_critic_loss"] = chunk_loss_v
+        metrics["val/action_critic_loss"] = action_loss_v if action_loss_v is not None else 0.0
+        for k, v in chunk_info_d.items():
+            try:
+                metrics[f"val/chunk_critic_{k}"] = float(v)
+            except (TypeError, ValueError):
+                pass
+        for k, v in action_info_d.items():
+            try:
+                metrics[f"val/action_critic_{k}"] = float(v)
+            except (TypeError, ValueError):
+                pass
+
+    # Remaining scalar diagnostics (q_mean, logits, chunk valid_sample_frac, …)
+    def _val_scalars(prefix: str, d: Dict[str, object]) -> None:
+        for k, v in d.items():
+            key = f"{prefix}_{k}"
+            if key in metrics:
+                continue
+            try:
+                x = jnp.asarray(v)
+            except (TypeError, ValueError):
+                continue
+            if x.ndim != 0 and x.size != 1:
+                continue
+            try:
+                metrics[key] = float(x.reshape(()))
+            except Exception:
+                continue
+
+    _val_scalars("val/actor", actor_info)
+    _val_scalars("val/critic", critic_info)
+
     return metrics
+
+
+def _wandb_train_scalars_from_info(info: Dict[str, object], prefix: str = "train") -> Dict[str, float]:
+    """Log every scalar leaf from ``agent.update`` ``info`` (``actor/…``, ``critic/…``, DQC heads, …)."""
+    out: Dict[str, float] = {}
+    for k, v in info.items():
+        try:
+            x = jnp.asarray(v)
+        except (TypeError, ValueError):
+            continue
+        if x.ndim != 0 and x.size != 1:
+            continue
+        try:
+            out[f"{prefix}/{k.replace('/', '_')}"] = float(x.reshape(()))
+        except Exception:
+            continue
+    return out
 
 
 # =============================
@@ -1052,11 +1120,11 @@ def main(args: argparse.Namespace) -> None:
         )
     cfg.actor_loss = "ddpgbc"
     cfg.discount = args.discount
-    cfg.alpha = 0.1
-    cfg.encoder = "impala_large"
+    cfg.alpha = 10.0
+    cfg.encoder = "impala_small"
     cfg.lr = 3e-4
     cfg.actor_hidden_dims = (2048, 2048, 2048)
-    cfg.value_hidden_dims = (2048, 2048, 2048)
+    cfg.value_hidden_dims = (512, 512, 512)
     cfg.latent_dim = 512
     cfg.critic_lr_scale = 1.0
     cfg.actor_lr_scale = 1.0
@@ -1448,6 +1516,38 @@ def main(args: argparse.Namespace) -> None:
                     if src_key in info:
                         log_dict[dst_name] = float(info[src_key])
 
+                # TMD_DQC: critic metrics live under chunk_critic/* and action_critic/* (no critic/*).
+                for k, v in info.items():
+                    if k.startswith("chunk_critic/") or k.startswith("action_critic/"):
+                        dst = "train/" + k.replace("/", "_")
+                        try:
+                            log_dict[dst] = float(v)
+                        except (TypeError, ValueError):
+                            pass
+                if "chunk_critic/critic_loss" in info:
+                    cl = float(info["chunk_critic/critic_loss"])
+                    if "action_critic/distill_loss" in info:
+                        cl += float(info["action_critic/distill_loss"])
+                    log_dict.setdefault("train/critic_loss", cl)
+                if "chunk_critic/contrastive_loss" in info:
+                    log_dict.setdefault(
+                        "train/critic_contrastive_loss",
+                        float(info["chunk_critic/contrastive_loss"]),
+                    )
+                if "chunk_critic/backup_loss" in info:
+                    log_dict.setdefault(
+                        "train/critic_backup_loss",
+                        float(info["chunk_critic/backup_loss"]),
+                    )
+                if "chunk_critic/action_invariance_loss" in info:
+                    log_dict.setdefault(
+                        "train/critic_action_invariance_loss",
+                        float(info["chunk_critic/action_invariance_loss"]),
+                    )
+
+                for kk, vv in _wandb_train_scalars_from_info(info).items():
+                    log_dict.setdefault(kk, vv)
+
                 wandb.log(log_dict, step=total_steps)
                 t_wandb_end = time.time()
                 wandb_ms = (t_wandb_end - t_wandb_start) * 1000.0
@@ -1542,7 +1642,22 @@ def main(args: argparse.Namespace) -> None:
             for metric_key in key_subset:
                 if metric_key in info:
                     log_dict[f"train/{metric_key.replace('/', '_')}"] = float(info[metric_key])
-            
+            for k, v in info.items():
+                if k.startswith("chunk_critic/") or k.startswith("action_critic/"):
+                    dst = "train/" + k.replace("/", "_")
+                    try:
+                        log_dict[dst] = float(v)
+                    except (TypeError, ValueError):
+                        pass
+            if "chunk_critic/critic_loss" in info:
+                cl = float(info["chunk_critic/critic_loss"])
+                if "action_critic/distill_loss" in info:
+                    cl += float(info["action_critic/distill_loss"])
+                log_dict.setdefault("train/critic_loss", cl)
+
+            for kk, vv in _wandb_train_scalars_from_info(info).items():
+                log_dict.setdefault(kk, vv)
+
             wandb.log(log_dict, step=total_steps)
             last_log_step = total_steps
 
@@ -1635,7 +1750,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--p_value_randomize_stack",
         type=float,
-        default=0.5,
+        default=0.8,
         dest="p_value_randomize_stack",
         help=(
             "When frame_stack_window > frame_stack (K-of-W random stacks available), each training "
@@ -1664,7 +1779,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--bc_goal_randomize_prob",
         type=float,
-        default=1.0,
+        default=0.1,
         help="TMD / TMD_QC / TMD_DQC only: per-batch-row probability of replacing the goal with another goal from the same batch for the BC log-likelihood only (critic and Q path unchanged).",
     )
     parser.add_argument(

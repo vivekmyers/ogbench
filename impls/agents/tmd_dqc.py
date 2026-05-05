@@ -137,8 +137,8 @@ class TMDDQCAgent(flax.struct.PyTreeNode):
 
         # --- Contrastive ---
         dist = self.distance(phi[:, :, None], psi_g[:, None, :])
-        logits = -dist / jnp.sqrt(phi.shape[-1])
-
+        # logits = -dist / jnp.sqrt(phi.shape[-1])
+        logits = -dist * 1.5
         I = jnp.eye(batch_size)
         contrastive_per = jax.vmap(
             lambda _logits: optax.softmax_cross_entropy(logits=_logits.T, labels=I),
@@ -147,11 +147,18 @@ class TMDDQCAgent(flax.struct.PyTreeNode):
 
         # --- Action invariance --- (psi(s) ~ phi(s, a) — only meaningful when
         # the chunk represents real executed actions.)
-        if self.config['stopgrad_phi_invariance']:
-            action_dist = self.distance(psi_s, jax.lax.stop_gradient(phi))
-        else:
-            action_dist = self.distance(psi_s, phi)
-        action_invariance_loss = jnp.sum(action_dist * valid_sample[None, :]) / (valid_count * e)
+        #if self.config['stopgrad_phi_invariance']:
+        #    action_dist = self.distance(psi_s, jax.lax.stop_gradient(phi))
+        #else:
+        #    action_dist = self.distance(psi_s, phi)
+        #action_invariance_loss = jnp.sum(action_dist * valid_sample[None, :]) / (valid_count * e)
+
+        phi_for_inv = jax.lax.stop_gradient(phi) if self.config['stopgrad_phi_invariance'] else phi
+        psi_s_to_g = self.distance(psi_s[:, :, None], psi_g[:, None, :])  # (e, B, B)
+        phi_to_g = self.distance(phi_for_inv[:, :, None], psi_g[:, None, :])  # (e, B, B)
+        violation = jax.nn.relu(psi_s_to_g - phi_to_g)  # ψ(s) shouldn't be closer to g than φ(s,a)
+        violation_per_sample = jnp.mean(violation, axis=2)  # (e, B), mean over goals
+        action_invariance_loss = jnp.sum(violation_per_sample * valid_sample[None, :]) / (valid_count * e)
 
         # --- Backup (variable-horizon discount γ^bh per sample) ---
         dist_next = self.distance(psi_next[:, :, None], psi_g[:, None, :])
@@ -177,9 +184,11 @@ class TMDDQCAgent(flax.struct.PyTreeNode):
             + jnp.diagonal(divergence, axis1=1, axis2=2)[..., None] * dw
         )
         # Backup row index (axis 1) is the source sample b: mask invalid b's.
+        # Match TMD / TMD_QC scale: ``jnp.mean(divergence)`` over the (e, B, B)
+        # grid; here we zero invalid rows then mean so padding does not shrink
+        # the denominator (same as QC when every row is valid).
         backup_mask = valid_sample[None, :, None]
-        backup_denom = valid_count * e * batch_size
-        backup_loss = jnp.sum(divergence * backup_mask) / backup_denom
+        backup_loss = jnp.mean(divergence * backup_mask)
 
         if self.config['dual_descent']:
             optim_backup = 1 - jax.lax.stop_gradient(dist_next) + jnp.log(gamma)
@@ -187,7 +196,7 @@ class TMDDQCAgent(flax.struct.PyTreeNode):
                 optim_backup * (1 - dw)
                 + jnp.diagonal(optim_backup, axis1=1, axis2=2)[..., None] * dw
             )
-            backup_optim_loss = jnp.sum((divergence - optim_backup) * backup_mask) / backup_denom
+            backup_optim_loss = jnp.mean((divergence - optim_backup) * backup_mask)
             val = jnp.exp(
                 -(
                     jax.lax.stop_gradient(backup_optim_loss)
@@ -240,10 +249,14 @@ class TMDDQCAgent(flax.struct.PyTreeNode):
         ac_dim = int(self.config['policy_chunk_size']) * action_dim
 
         # Chunk distances (frozen target, per-ensemble-member).
+        critic_params_sg = jax.tree_util.tree_map(jax.lax.stop_gradient, grad_params)
         phi_chunk = self.network.select('phi')(
-            batch['observations'], batch['high_value_action_chunks']
+            batch['observations'], batch['high_value_action_chunks'],
+            params=critic_params_sg,
         )
-        psi_g_frozen = self.network.select('psi')(batch['high_value_goals'])
+        psi_g_frozen = self.network.select('psi')(
+            batch['high_value_goals'], params=critic_params_sg,
+        )
 
         if len(phi_chunk.shape) == 2:
             phi_chunk = phi_chunk[None, ...]
@@ -257,7 +270,7 @@ class TMDDQCAgent(flax.struct.PyTreeNode):
         action_phi_out = self.network.select('action_phi')(
             batch['observations'], action_chunk, params=grad_params
         )
-        psi_g_distill = self.network.select('psi')(batch['high_value_goals'])
+        psi_g_distill = self.network.select('psi')(batch['high_value_goals'], params=critic_params_sg,)
 
         if len(action_phi_out.shape) == 2:
             action_phi_out = action_phi_out[None, ...]
@@ -344,10 +357,13 @@ class TMDDQCAgent(flax.struct.PyTreeNode):
             q_flat = jnp.clip(dist_out.sample(seed=rng), -1, 1)
 
         # Score with action_phi (frozen params — gradient only through actor)
+        critic_params_sg = jax.tree_util.tree_map(jax.lax.stop_gradient, grad_params)
         action_phi_out = self.network.select('action_phi')(
-            batch['observations'], q_flat
+            batch['observations'], q_flat, params=critic_params_sg,
         )
-        psi_g_frozen = self.network.select('psi')(batch['actor_goals'])
+        psi_g_frozen = self.network.select('psi')(
+            batch['actor_goals'], params=critic_params_sg,
+        )
 
         if len(action_phi_out.shape) == 2:
             action_phi_out = action_phi_out[None, ...]
@@ -615,7 +631,7 @@ def get_config():
             frame_stack=ml_collections.config_dict.placeholder(int),
             dual_descent=False,
             # DQC decoupling.
-            backup_horizon=25,
+            backup_horizon=15,
             policy_chunk_size=1,
             action_chunk_length=1,  # Must equal policy_chunk_size; used by CGCDataset.
             distill_method='expectile',
